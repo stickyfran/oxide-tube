@@ -72,6 +72,8 @@ pub struct VideoTab {
     pub channel_name: String,
     #[serde(default)]
     pub saved_pos_ms: u64,
+    #[serde(default)]
+    pub thumbnail_url: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

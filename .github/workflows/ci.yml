@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [ master, main ]
+  pull_request:
+    branches: [ master, main ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check-and-test:
+    name: Check & Test (Linux x86_64)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            pkg-config \
+            libmpv-dev \
+            libwayland-dev \
+            libxkbcommon-dev \
+            libgl1-mesa-dev
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Cargo check (release profile)
+        run: cargo check --release
+
+      - name: Cargo test
+        run: cargo test --release -- --nocapture

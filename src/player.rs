@@ -6,6 +6,7 @@ use std::os::raw::c_char;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
+use crate::power_manager::PowerProfile;
 
 #[derive(Clone, Debug)]
 pub struct VideoFrameBuffer {
@@ -19,6 +20,32 @@ impl VideoFrameBuffer {
     #[allow(dead_code)]
     pub fn as_image_handle(&self) -> iced::widget::image::Handle {
         iced::widget::image::Handle::from_rgba(self.width, self.height, self.data.clone())
+    }
+
+    /// Downscales the current frame to a compact 480x270 RGBA image::Handle so it does not hold
+    /// onto the recycled pool buffer and uses minimal RAM (~518 KB) when cached across tabs.
+    pub fn to_cached_snapshot_handle(&self) -> Option<iced::widget::image::Handle> {
+        let src_w = self.width as usize;
+        let src_h = self.height as usize;
+        if src_w == 0 || src_h == 0 || self.data.len() < src_w * src_h * 4 {
+            return None;
+        }
+        let dst_w = 480usize.min(src_w);
+        let dst_h = 270usize.min(src_h);
+        let mut out = vec![0u8; dst_w * dst_h * 4];
+        let src = self.data.as_ref();
+        for dy in 0..dst_h {
+            let sy = (dy * src_h) / dst_h;
+            let src_row = sy * src_w * 4;
+            let dst_row = dy * dst_w * 4;
+            for dx in 0..dst_w {
+                let sx = (dx * src_w) / dst_w;
+                let s_idx = src_row + sx * 4;
+                let d_idx = dst_row + dx * 4;
+                out[d_idx..d_idx + 4].copy_from_slice(&src[s_idx..s_idx + 4]);
+            }
+        }
+        Some(iced::widget::image::Handle::from_rgba(dst_w as u32, dst_h as u32, out))
     }
 }
 
@@ -99,6 +126,22 @@ pub const MPV_EVENT_PLAYBACK_RESTART: i32 = 21;
 #[allow(dead_code)]
 pub const MPV_EVENT_PROPERTY_CHANGE: i32 = 22;
 
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct MpvEventEndFile {
+    pub reason: i32,
+    pub error: i32,
+    pub playlist_entry_id: i64,
+    pub playlist_insert_id: i64,
+    pub playlist_insert_num_entries: i32,
+}
+
+pub const _MPV_END_FILE_REASON_EOF: i32 = 0;
+pub const _MPV_END_FILE_REASON_STOP: i32 = 2;
+pub const _MPV_END_FILE_REASON_QUIT: i32 = 3;
+pub const MPV_END_FILE_REASON_ERROR: i32 = 4;
+pub const _MPV_END_FILE_REASON_REDIRECT: i32 = 5;
+
 #[allow(dead_code)]
 pub const MPV_FORMAT_NONE: i32 = 0;
 #[allow(dead_code)]
@@ -114,6 +157,7 @@ pub const MPV_RENDER_PARAM_OPENGL_FBO: i32 = 3;
 #[allow(dead_code)]
 pub const MPV_RENDER_PARAM_FLIP_Y: i32 = 4;
 pub const MPV_RENDER_PARAM_WL_DISPLAY: i32 = 9;
+pub const MPV_RENDER_PARAM_SKIP_RENDERING: i32 = 13;
 pub const MPV_RENDER_PARAM_SW_SIZE: i32 = 17;
 pub const MPV_RENDER_PARAM_SW_FORMAT: i32 = 18;
 pub const MPV_RENDER_PARAM_SW_STRIDE: i32 = 19;
@@ -292,9 +336,31 @@ pub struct WaylandZeroCopyPlayer {
     vp_y: Arc<AtomicI32>,
     vp_w: Arc<AtomicI32>,
     vp_h: Arc<AtomicI32>,
+    rendering_active: Arc<AtomicBool>,
+    force_frame_refresh: Arc<AtomicBool>,
     underlay_mode: Arc<AtomicBool>,
     wakeup_tx: Arc<AtomicI32>,
     is_running: Arc<AtomicBool>,
+}
+
+/// Signalled by the render thread each time a new video frame is ready, so the UI can redraw
+/// exactly at the video's frame rate (and not at all while paused) instead of a fixed 60 Hz clock.
+pub static FRAME_NOTIFY: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+/// Lightweight render-path counters (cheap relaxed atomics) used by benchmarks and MITUB_PROFILE.
+pub static STAT_FRAMES: AtomicU64 = AtomicU64::new(0);
+pub static STAT_RENDER_NS: AtomicU64 = AtomicU64::new(0);
+pub static STAT_READ_NS: AtomicU64 = AtomicU64::new(0);
+pub static STAT_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Snapshot of (frames, render_ns, readback_ns, bytes_copied).
+pub fn render_stats() -> (u64, u64, u64, u64) {
+    (
+        STAT_FRAMES.load(Ordering::Relaxed),
+        STAT_RENDER_NS.load(Ordering::Relaxed),
+        STAT_READ_NS.load(Ordering::Relaxed),
+        STAT_BYTES.load(Ordering::Relaxed),
+    )
 }
 
 unsafe impl Send for WaylandZeroCopyPlayer {}
@@ -334,6 +400,8 @@ impl WaylandZeroCopyPlayer {
             vp_y: Arc::new(AtomicI32::new(0)),
             vp_w: Arc::new(AtomicI32::new(0)),
             vp_h: Arc::new(AtomicI32::new(0)),
+            rendering_active: Arc::new(AtomicBool::new(true)),
+            force_frame_refresh: Arc::new(AtomicBool::new(false)),
             underlay_mode: Arc::new(AtomicBool::new(true)),
             wakeup_tx: Arc::new(AtomicI32::new(-1)),
             is_running: Arc::new(AtomicBool::new(true)),
@@ -351,17 +419,27 @@ impl WaylandZeroCopyPlayer {
             }
 
             // High performance options for hardware decoding (VA-API on Intel Arc / Mesa)
+            // Disable unused internal Lua scripts/OSC/OSD VMs to save ~15MB RAM and 6 threads
             let opts = [
                 ("vo\0", "libmpv\0"),
                 ("hwdec\0", "vaapi\0"),
                 ("hwdec-codecs\0", "all\0"),
                 ("keep-open\0", "yes\0"),
                 ("ytdl\0", "no\0"),
+                ("load-scripts\0", "no\0"),
+                ("osc\0", "no\0"),
+                ("osd-level\0", "0\0"),
+                ("osd-bar\0", "no\0"),
+                ("load-stats-overlay\0", "no\0"),
+                ("load-osd-console\0", "no\0"),
+                ("load-auto-profiles\0", "no\0"),
+                ("sub-auto\0", "no\0"),
+                ("audio-file-auto\0", "no\0"),
                 ("network-timeout\0", "15\0"),
-                ("demuxer-max-bytes\0", "67108864\0"),       // 64 MB forward buffer
-                ("demuxer-max-back-bytes\0", "33554432\0"),  // 32 MB backward cache for instant reverse seek
-                ("demuxer-readahead-secs\0", "30\0"),        // 30 seconds readahead
-                ("cache-pause-wait\0", "3\0"),                 // Resume only after 3s buffered to avoid stop/start loops
+                ("demuxer-max-bytes\0", "25165824\0"),       // 24 MB forward buffer (<=1080p default; scales up dynamically for 1440p/4K)
+                ("demuxer-max-back-bytes\0", "8388608\0"),   // 8 MB backward cache for instant reverse seek
+                ("demuxer-readahead-secs\0", "20\0"),        // 20 seconds readahead
+                ("cache-pause-wait\0", "2\0"),               // Resume after 2s buffered
                 ("demuxer-seekable-cache\0", "yes\0"),       // Seek directly in RAM cache without HTTP reconnect
                 ("force-seekable\0", "yes\0"),               // Force HTTP range-request seekability
                 ("hr-seek\0", "default\0"),                  // Accurate seek with fast hardware keyframe decode
@@ -418,10 +496,15 @@ impl WaylandZeroCopyPlayer {
         let buffering_percent = self.buffering_percent.clone();
         let first_frame_rendered = self.first_frame_rendered.clone();
         let eos_detected = self.eos_detected.clone();
-        let _has_error = self.has_error.clone();
-        let _last_error = self.last_error.clone();
+        let has_error = self.has_error.clone();
+        let last_error = self.last_error.clone();
         let current_frame = self.current_frame.clone();
         let video_dims = self.video_dims.clone();
+        let vp_w_atom = self.vp_w.clone();
+        let vp_h_atom = self.vp_h.clone();
+        let vp_y_atom = self.vp_y.clone();
+        let rendering_active_atom = self.rendering_active.clone();
+        let force_frame_refresh_atom = self.force_frame_refresh.clone();
         let wakeup_tx_atomic = self.wakeup_tx.clone();
 
         std::thread::Builder::new()
@@ -605,11 +688,11 @@ impl WaylandZeroCopyPlayer {
                 let mut current_buf_h: u32 = 720;
                 let fmt_rgba = CString::new("rgba").unwrap();
 
-                // Phase 1: Recyclable buffer pool (4 slots to absorb UI jitter)
-                let (pool_tx, pool_rx): (Sender<Vec<u8>>, Receiver<Vec<u8>>) = bounded(4);
-                let initial_size = (current_buf_w * current_buf_h * 4) as usize;
-                for _ in 0..4 {
-                    let _ = pool_tx.send(vec![0u8; initial_size]);
+                // Triple-Buffer recyclable pool (3 slots: 1 in UI, 1 in current_frame, 1 being written by glReadPixels)
+                // Initialized empty so idle startup uses 0 MB until video playback actually begins.
+                let (pool_tx, pool_rx): (Sender<Vec<u8>>, Receiver<Vec<u8>>) = bounded(3);
+                for _ in 0..3 {
+                    let _ = pool_tx.send(Vec::new());
                 }
                 let mut frame_seq: u64 = 0;
 
@@ -628,10 +711,32 @@ impl WaylandZeroCopyPlayer {
                         match ev.event_id {
                             MPV_EVENT_PLAYBACK_RESTART => {
                                 first_frame_rendered.store(true, Ordering::SeqCst);
+                                has_error.store(false, Ordering::SeqCst);
+                                *last_error.safe_lock() = None;
                                 crate::diagnostics::session_first_frame();
                             }
                             MPV_EVENT_END_FILE => {
-                                eos_detected.store(true, Ordering::SeqCst);
+                                let mut is_err = false;
+                                if !ev.data.is_null() {
+                                    let end_file = unsafe { *(ev.data as *const MpvEventEndFile) };
+                                    if end_file.reason == MPV_END_FILE_REASON_ERROR || end_file.error < 0 {
+                                        is_err = true;
+                                        let err_msg = unsafe {
+                                            let p = mpv_error_string(end_file.error);
+                                            if !p.is_null() {
+                                                CStr::from_ptr(p).to_string_lossy().into_owned()
+                                            } else {
+                                                "Unknown MPV playback error".to_string()
+                                            }
+                                        };
+                                        eprintln!("[mitub-mpv] Playback error: {err_msg} (code {})", end_file.error);
+                                        *last_error.safe_lock() = Some(err_msg);
+                                        has_error.store(true, Ordering::SeqCst);
+                                    }
+                                }
+                                if !is_err {
+                                    eos_detected.store(true, Ordering::SeqCst);
+                                }
                                 is_playing.store(false, Ordering::SeqCst);
                             }
                             MPV_EVENT_PROPERTY_CHANGE => {
@@ -698,10 +803,48 @@ impl WaylandZeroCopyPlayer {
 
                     // 2. Check for new video frame to render
                     let flags = unsafe { mpv_render_context_update(r_ctx) };
-                    if flags & MPV_RENDER_UPDATE_FRAME != 0 {
+                    let force_refresh = force_frame_refresh_atom.swap(false, Ordering::SeqCst)
+                        && first_frame_rendered.load(Ordering::Relaxed);
+                    if (flags & MPV_RENDER_UPDATE_FRAME != 0) || force_refresh {
+                        let active = rendering_active_atom.load(Ordering::Relaxed);
+                        let vp_w = vp_w_atom.load(Ordering::Relaxed);
+                        let vp_h = vp_h_atom.load(Ordering::Relaxed);
+                        let vp_y = vp_y_atom.load(Ordering::Relaxed);
+
+                        // If window is minimized/hidden, video scrolled away, or inactive, skip GPU rendering completely!
+                        // mpv updates playback clocks and keeps audio in perfect sync with ZERO GPU/RAM bandwidth.
+                        let should_skip = !active || vp_w <= 16 || vp_h <= 16 || vp_y <= -5000;
+                        if should_skip {
+                            let mut skip: i32 = 1;
+                            let render_params = [
+                                MpvRenderParam {
+                                    type_: MPV_RENDER_PARAM_SKIP_RENDERING,
+                                    data: &mut skip as *mut i32 as *mut std::ffi::c_void,
+                                },
+                                MpvRenderParam {
+                                    type_: MPV_RENDER_PARAM_INVALID,
+                                    data: std::ptr::null_mut(),
+                                },
+                            ];
+                            unsafe {
+                                mpv_render_context_render(r_ctx, render_params.as_ptr());
+                            }
+                            continue;
+                        }
+
                         let (vid_w, vid_h) = *video_dims.safe_lock();
-                        let target_w = vid_w.clamp(320, 1920);
-                        let target_h = vid_h.clamp(180, 1080);
+                        // Render at the size the video is actually displayed at (x1.15 margin for subpixel sharpness),
+                        // never above the source: a 480px PiP or 960px windowed player no longer pays for a full 1080p readback.
+                        let (mut target_w, mut target_h) = (vid_w.clamp(320, 1920), vid_h.clamp(180, 1080));
+                        if vp_w > 16 && vp_h > 16 && vid_w > 0 && vid_h > 0 {
+                            let sx = (vp_w as f32 * 1.15) / vid_w as f32;
+                            let sy = (vp_h as f32 * 1.15) / vid_h as f32;
+                            let scale = sx.min(sy).min(1.0);
+                            if scale < 1.0 {
+                                target_w = ((vid_w as f32 * scale) as u32 & !1).clamp(320, 1920);
+                                target_h = ((vid_h as f32 * scale) as u32 & !1).clamp(180, 1080);
+                            }
+                        }
 
                         if target_w != current_buf_w || target_h != current_buf_h {
                             current_buf_w = target_w;
@@ -752,8 +895,11 @@ impl WaylandZeroCopyPlayer {
                                 },
                             ];
 
+                            let t_render = std::time::Instant::now();
                             let err = unsafe { mpv_render_context_render(r_ctx, render_params.as_ptr()) };
+                            STAT_RENDER_NS.fetch_add(t_render.elapsed().as_nanos() as u64, Ordering::Relaxed);
                             if err >= 0 {
+                                let t_read = std::time::Instant::now();
                                 unsafe {
                                     if let Some(bind_fb) = gl_bind_fb {
                                         bind_fb(GL_FRAMEBUFFER, fbo);
@@ -768,6 +914,9 @@ impl WaylandZeroCopyPlayer {
                                         target_vec.as_mut_ptr() as _,
                                     );
                                 }
+                                STAT_READ_NS.fetch_add(t_read.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                                STAT_BYTES.fetch_add(byte_size as u64, Ordering::Relaxed);
+                                STAT_FRAMES.fetch_add(1, Ordering::Relaxed);
                                 frame_seq += 1;
                                 let owner = RecycledBuf {
                                     buf: target_vec,
@@ -781,6 +930,7 @@ impl WaylandZeroCopyPlayer {
                                     data: byte_buf,
                                 };
                                 *current_frame.safe_lock() = Some(v_frame);
+                                FRAME_NOTIFY.notify_one();
                                 first_frame_rendered.store(true, Ordering::SeqCst);
                             }
                         } else {
@@ -826,6 +976,7 @@ impl WaylandZeroCopyPlayer {
                                     data: byte_buf,
                                 };
                                 *current_frame.safe_lock() = Some(v_frame);
+                                FRAME_NOTIFY.notify_one();
                                 first_frame_rendered.store(true, Ordering::SeqCst);
                             }
                         }
@@ -992,6 +1143,9 @@ impl WaylandZeroCopyPlayer {
             return Err(format!("loadfile command failed: {err_str}").into());
         }
 
+        self.has_error.store(false, Ordering::SeqCst);
+        *self.last_error.safe_lock() = None;
+
         // Unpause to begin immediate playback
         unsafe {
             mpv_set_property_string(ctx, b"pause\0".as_ptr() as _, b"no\0".as_ptr() as _);
@@ -1114,6 +1268,67 @@ impl WaylandZeroCopyPlayer {
         }
     }
 
+    pub fn set_power_profile(&self, profile: PowerProfile) {
+        let (max_bytes, back_bytes, readahead) = match profile {
+            PowerProfile::Battery => ("16777216\0", "6291456\0", "12\0"),
+            PowerProfile::Ac => ("25165824\0", "8388608\0", "20\0"),
+        };
+        if let Some(addr) = *self.mpv.safe_lock() {
+            unsafe {
+                let h = addr as *mut MpvHandle;
+                mpv_set_property_string(h, b"demuxer-max-bytes\0".as_ptr() as _, max_bytes.as_ptr() as _);
+                mpv_set_property_string(h, b"demuxer-max-back-bytes\0".as_ptr() as _, back_bytes.as_ptr() as _);
+                mpv_set_property_string(h, b"demuxer-readahead-secs\0".as_ptr() as _, readahead.as_ptr() as _);
+            }
+        }
+    }
+
+    /// Dynamically scales libmpv demuxer RAM cache according to the selected stream height:
+    /// - <=1080p: 24 MB forward / 8 MB backward (~75s of 1080p AV1/VP9, saving 64 MB of RAM)
+    /// - 1440p (2K): 36 MB forward / 12 MB backward
+    /// - 2160p (4K): 56 MB forward / 16 MB backward (ensuring smooth 4K60 playback)
+    pub fn set_stream_buffer_profile(&self, height: u32, profile: PowerProfile) {
+        let (max_bytes, back_bytes, readahead) = if profile == PowerProfile::Battery {
+            if height >= 2000 {
+                ("41943040\0", "10485760\0", "18\0") // 40 MB / 10 MB on Battery 4K
+            } else if height >= 1300 {
+                ("25165824\0", "8388608\0", "15\0")  // 24 MB / 8 MB on Battery 1440p
+            } else {
+                ("16777216\0", "6291456\0", "12\0")  // 16 MB / 6 MB on Battery <=1080p
+            }
+        } else if height >= 2000 {
+            ("58720256\0", "16777216\0", "25\0")     // 56 MB / 16 MB on AC 4K
+        } else if height >= 1300 {
+            ("37748736\0", "12582912\0", "22\0")     // 36 MB / 12 MB on AC 1440p
+        } else {
+            ("25165824\0", "8388608\0", "20\0")      // 24 MB / 8 MB on AC <=1080p
+        };
+        if let Some(addr) = *self.mpv.safe_lock() {
+            unsafe {
+                let h = addr as *mut MpvHandle;
+                mpv_set_property_string(h, b"demuxer-max-bytes\0".as_ptr() as _, max_bytes.as_ptr() as _);
+                mpv_set_property_string(h, b"demuxer-max-back-bytes\0".as_ptr() as _, back_bytes.as_ptr() as _);
+                mpv_set_property_string(h, b"demuxer-readahead-secs\0".as_ptr() as _, readahead.as_ptr() as _);
+            }
+        }
+    }
+
+    /// Returns an mpv string property (e.g. "hwdec-current"), for diagnostics.
+    pub fn get_property_string(&self, name: &str) -> Option<String> {
+        let guard = self.mpv.safe_lock();
+        let ctx = (*guard)?;
+        let c_name = CString::new(name).ok()?;
+        unsafe {
+            let ptr = mpv_get_property_string(ctx as *mut MpvHandle, c_name.as_ptr());
+            if ptr.is_null() {
+                return None;
+            }
+            let v = CStr::from_ptr(ptr).to_string_lossy().into_owned();
+            mpv_free(ptr as *mut std::ffi::c_void);
+            Some(v)
+        }
+    }
+
     pub fn get_position_ms(&self) -> u64 {
         self.current_pos_ms.load(Ordering::SeqCst)
     }
@@ -1181,10 +1396,28 @@ impl WaylandZeroCopyPlayer {
     }
 
     pub fn set_viewport(&self, x: i32, y: i32, w: i32, h: i32) {
+        let prev_w = self.vp_w.swap(w, Ordering::Relaxed);
+        let prev_h = self.vp_h.swap(h, Ordering::Relaxed);
+        let prev_y = self.vp_y.swap(y, Ordering::Relaxed);
         self.vp_x.store(x, Ordering::Relaxed);
-        self.vp_y.store(y, Ordering::Relaxed);
-        self.vp_w.store(w, Ordering::Relaxed);
-        self.vp_h.store(h, Ordering::Relaxed);
+        let was_hidden = prev_w <= 16 || prev_h <= 16 || prev_y <= -5000;
+        let now_visible = w > 16 && h > 16 && y > -5000;
+        if was_hidden && now_visible && self.rendering_active.load(Ordering::Relaxed) {
+            self.force_frame_refresh.store(true, Ordering::SeqCst);
+            self.trigger_worker_wakeup();
+        }
+    }
+
+    pub fn set_rendering_active(&self, active: bool) {
+        let was_active = self.rendering_active.swap(active, Ordering::SeqCst);
+        if active && !was_active {
+            self.force_frame_refresh.store(true, Ordering::SeqCst);
+            self.trigger_worker_wakeup();
+        }
+    }
+
+    pub fn is_rendering_active(&self) -> bool {
+        self.rendering_active.load(Ordering::Relaxed)
     }
 
     pub fn switch_resolution(&self, video_url: &str, audio_url: Option<&str>) {
@@ -1196,8 +1429,11 @@ impl WaylandZeroCopyPlayer {
 impl Drop for WaylandZeroCopyPlayer {
     fn drop(&mut self) {
         self.is_running.store(false, Ordering::SeqCst);
-        // Give worker thread a moment to cleanly free its OpenGL / EGL context
-        for _ in 0..20 {
+        // Immediately wake up the worker thread from poll() so it doesn't wait up to 350ms
+        self.trigger_worker_wakeup();
+
+        // Give worker thread a moment to cleanly exit and free its OpenGL / EGL context
+        for _ in 0..40 {
             if self.render_ctx.safe_lock().is_none() {
                 break;
             }

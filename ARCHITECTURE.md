@@ -1,56 +1,80 @@
-# Arquitectura del Sistema - Mitub
+# Arquitectura del Sistema - OxideTube (Mitub)
 
-Este documento describe la arquitectura interna, el flujo de datos, la gestion de memoria y el modelo de concurrencia de Mitub.
-
----
-
-## Vision General
-
-Mitub sigue una arquitectura modular en Rust organizada en capas bien definidas:
-
-1. Capa de Presentacion (iced 0.13 + iced_canvas):
-   Gestiona el bucle de eventos, la interfaz grafica reactiva (Model-View-Update), el OSD flotante del reproductor y la sincronizacion de ventanas (principal y Picture-in-Picture).
-
-2. Capa de Reproduccion Multimedia (src/player.rs - libmpv):
-   Proporciona integracion FFI segura con la biblioteca nativa `libmpv`. Gestiona la inicializacion de subsuperficies Wayland, renderizado con aceleracion por hardware (hwdec), conmutacion dinamica de pistas de audio y video desacopladas (DASH) y control de buffering.
-
-3. Capa de Servicios de Red y YouTube API (src/innertube.rs):
-   Cliente asincrono sobre `reqwest` optimizado con HTTP/2, brotli, gzip y deserializacion acelerada con `simd-json` para comunicarse con los endpoints internos de YouTube InnerTube (Android/Web client mocks).
-
-4. Capa de Autenticacion y Sesiones (src/auth.rs):
-   Motor de importacion e interpretacion de cookies de navegadores locales. Soporta perfiles SQLite de Mozilla Firefox y navegadores Chromium (Google Chrome, Chromium, Brave, Microsoft Edge, Vivaldi) en Linux, Windows y macOS. Incluye generacion de cabeceras SAPISIDHASH requeridas para consultas autenticadas de YouTube.
-
-5. Capa de Gestion de Cache y Recursos (src/cache_manager.rs):
-   Controlador de almacenamiento persistente en disco (`~/.cache/mitub/video_cache`) con monitoreo dinamico del tamano y politica de desalojo LRU (Least Recently Used) basada en el limite maximo configurable.
+Este documento describe los componentes fundamentales, el modelo de memoria, la concurrencia y las decisiones de diseño arquitectónico de OxideTube.
 
 ---
 
-## Flujo de Datos y Reproduccion
+## 1. Visión General de la Arquitectura
 
-1. Solicitud de Video:
-   El usuario selecciona un video o introduce un enlace. InnerTubeClient consulta el endpoint `player` y `next` de InnerTube, extrayendo metadatos, streams de video adaptativos, streams de audio independientes, pistas de subtitulos VTT y capitulos.
-
-2. Seleccion Inteligente de Formato (DASH):
-   La funcion `select_best_stream` evalua la resolucion preferida del usuario y el codec deseado (AV1, VP9 o H.264), verificando capacidades de decodificacion de hardware. Si el codec o resolucion no estan disponibles, desciende en cascada sin interrumpir la reproduccion.
-
-3. Inicializacion del Reproductor:
-   Se configura la URL del stream de video y el stream de audio opcional en libmpv (`audio-file`). libmpv establece la conexion directa por red, decodifica frames en GPU y sincroniza audio/video mediante reloj interno maestro de alta precision.
-
-4. Interfaz OSD y Sincronizacion de Superficies:
-   La interfaz iced dibuja una ventana translúcida o bajo-relieve donde libmpv renderiza directamente a la subsuperficie Wayland o mediante el buffer de frames compartido. El OSD (barra de progreso, controles, menus de calidad y subtitulos) se actualiza de manera reactiva mediante `Message::Tick`.
+```
+┌────────────────────────────────────────────────────────┐
+│               Capa de Presentación (iced 0.13)         │
+│  - Event Loop / MVU (Model-View-Update)                │
+│  - Barra de Pestañas con Desplazamiento Zero-Shift     │
+│  - Canvas de Glow Perimétrico en Pestaña Activa        │
+│  - Ventana Principal + Picture-in-Picture Flotante     │
+└──────────────────────────┬─────────────────────────────┘
+                           │
+         ┌─────────────────┴─────────────────┐
+         │                                   │
+┌────────▼────────────────┐         ┌────────▼────────────────┐
+│   Capa de Reproducción  │         │   Capa de Red InnerTube │
+│        (libmpv)         │         │  (reqwest + simd-json)  │
+│  - hwdec (VA-API/NVDEC) │         │  - HTTP/2 + Brotli      │
+│  - Triple-Buffering     │         │  - Deserialización SIMD │
+│  - Demuxer Adaptativo   │         │  - Fallback de Códecs   │
+│  - Suspensión Inactiva  │         │  - Extracción de Streams│
+└─────────────────────────┘         └─────────────────────────┘
+         │                                   │
+         └─────────────────┬─────────────────┘
+                           │
+┌──────────────────────────▼─────────────────────────────┐
+│           Gestión de Memoria y Sistema Operativo       │
+│  - mimalloc (purge_delay = 0, mi_collect)              │
+│  - Tokio Runtime acotado (4 workers)                   │
+│  - Afinidad Dinámica de Cores de Bajo Consumo          │
+│  - D-Bus ScreenSaver Inhibit                           │
+└────────────────────────────────────────────────────────┘
+```
 
 ---
 
-## Modelo de Concurrencia y Rendimiento
+## 2. Componentes Principales
 
-- Asignacion Global de Memoria (mimalloc):
-  Mitub utiliza el asignador de memoria de alto rendimiento `mimalloc` de Microsoft en lugar del allocator por defecto del sistema, reduciendo la fragmentacion y acelerando las operaciones multihilo.
+### 2.1 Interfaz de Usuario y Pestañas (`src/ui/mod.rs`)
+- **Arquitectura Zero-Shift en Pestañas**:
+  El contenedor horizontal de pestañas (`tabs_scrollable`) ocupa de manera constante el 100% del ancho asignado en la capa base de un widget `stack!`. Los botones de navegación izquierda (`<`) y derecha (`>`) flotan en capas superiores como overlays cuando existe desbordamiento real. Esto garantiza que la aparición o desaparición de los botones no desplace el origen de coordenadas X del scrollable, eliminando cualquier stutter o saltos (*wiggle*) al usar la rueda del ratón.
+- **Canvas de Glow Dinámico (`PlayingTabGlowBorder`)**:
+  Dibuja un trazo perimétrico suave con degradado que recorre la pestaña en reproducción. Se actualiza mediante un timer dedicado de ~31 FPS en la suscripción de la aplicación, manteniéndose fluido tanto con el cursor estático como con la ventana sin foco.
 
-- Asincronia Tokio + Hilos Dedicados:
-  Todas las peticiones de red (InnerTube, descarga de miniaturas, polling de chat en vivo) operan sobre un runtime asincrono de Tokio sin bloquear el hilo principal de la interfaz de usuario. Las operaciones bloqueantes de acceso a disco (SQLite de cookies, lectura/escritura de cache) se delegan explicitamente a `tokio::task::spawn_blocking`.
+### 2.2 Motor Multimedia (`src/player.rs`)
+- **libmpv Nativo**: Integración directa mediante enlace FFI C a `libmpv.so.2`.
+- **Triple-Buffering sin Preasignación**: Utiliza exactamente 3 slots de textura RGBA compartidos para presentación continua sin bloqueos de sincronización vertical, evitando consumo estático innecesario.
+- **Caché de Demuxer Adaptativa**:
+  El tamaño del buffer de red se modula dinámicamente según la resolución del video:
+  - 4K / 1440p: 28 MB de demuxer (`demuxer-max-bytes = 28M`, `demuxer-readahead-secs = 15`) para absorber jitter de red de alta tasa de bits.
+  - 1080p / 720p: 12 MB de demuxer (`demuxer-max-bytes = 12M`, `demuxer-readahead-secs = 8`).
+  - < 720p: 4 MB de demuxer (`demuxer-max-bytes = 4M`, `demuxer-readahead-secs = 5`).
+- **Eliminación de Máquinas Virtuales Innecesarias**:
+  Se deshabilitan explícitamente los scripts Lua internos, el menú OSD por defecto y los reproductores de terminal de mpv (`load-scripts=no`, `osc=no`, `osd-bar=no`), reduciendo la huella base del proceso.
 
-- Optimizacion de Memoria RAM en Pestanas y Reproductores:
-  Solo la pestana activa mantiene la reproduccion en curso en el motor mpv. Cuando se cambia de pestana, la posicion de reproduccion se guarda y los buffers no esenciales se suspenden, evitando la acumulacion lineal de memoria por pestanas abiertas.
+### 2.3 Servicios de Red y YouTube API (`src/innertube.rs`)
+- Cliente HTTP asíncrono con compresión HTTP/2, Brotli y Gzip.
+- Deserialización de JSON con aceleración SIMD vía `simd-json`.
+- Búsqueda paralela y no bloqueante de dislikes (Return YouTube Dislike API) y detalles de canal concurrentemente con el manifiesto del reproductor.
 
-- Ahorro de Energia y Protector de Pantalla:
-  `PowerManager` monitorea el estado del sistema y se comunica con D-Bus (`org.freedesktop.ScreenSaver` y `org.freedesktop.UPower`) para inhibir la suspension de pantalla exclusivamente mientras el video se encuentra en estado de reproduccion activa.
+### 2.4 Autenticación y Cookies (`src/auth.rs`)
+- Extracción de cookies directamente de los perfiles SQLite de Mozilla Firefox (con lectura del journal WAL para tokens actualizados) y navegadores Chromium (Google Chrome, Brave, Chromium, Edge, Vivaldi).
+- Generación de firma `SAPISIDHASH` en tiempo de ejecución para consultas autenticadas.
+- Persistencia local de sesión en `~/.config/mitub/cookies.json`.
+
+---
+
+## 3. Estrategia de Optimización de Memoria
+
+1. **mimalloc con Purga Inmediata**:
+   Se configura `purge_delay = 0` para devolver páginas libres inmediatamente al kernel de Linux mediante `MADV_DONTNEED`. Se invoca `mi_collect(true)` periódicamente y al cerrar pestañas o pausar reproducción.
+2. **Workers Tokio Acotados**:
+   El runtime Tokio se limita a 4 hilos de trabajo (`TOKIO_WORKER_THREADS = 4`), evitando la creación excesiva de arenas de memoria locales por hilo en CPUs con alto número de núcleos.
+3. **Caché de Miniaturas con Desalojo**:
+   Las imágenes y portadas se descargan asíncronamente y se mantienen en una estructura LRU con reciclaje proactivo de handles de textura.

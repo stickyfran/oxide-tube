@@ -75,6 +75,11 @@ where
         }
     }
 
+    /// Returns the current title of the [`State`].
+    pub fn title(&self) -> &str {
+        &self.title
+    }
+
     /// Returns the current [`Viewport`] of the [`State`].
     pub fn viewport(&self) -> &Viewport {
         &self.viewport

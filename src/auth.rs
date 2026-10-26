@@ -375,7 +375,10 @@ impl AuthSession {
 
         let cookie_file = match cookie_path {
             Some(p) => p,
-            None => return Err("No se encontró la base de datos de cookies de Chrome / Chromium".into()),
+            None => {
+                // Secondary fallback: attempt extraction via yt-dlp if installed
+                return Self::from_ytdlp_browser("chrome");
+            }
         };
 
         let pid = std::process::id();
@@ -388,9 +391,9 @@ impl AuthSession {
         let conn_res = Connection::open_with_flags(&tmp_db, OpenFlags::SQLITE_OPEN_READ_ONLY);
         let conn = match conn_res {
             Ok(c) => c,
-            Err(e) => {
+            Err(_) => {
                 let _ = fs::remove_dir_all(&tmp_dir);
-                return Err(e.into());
+                return Self::from_ytdlp_browser("chrome");
             }
         };
 
@@ -416,11 +419,44 @@ impl AuthSession {
         let _ = fs::remove_dir_all(&tmp_dir);
 
         if session.cookies.is_empty() || !session.is_authenticated() {
-            return Err("Chrome tiene las cookies cifradas por el llavero del sistema o no hay sesión de YouTube. Usa Firefox o pega tu Cookie header.".into());
+            // Modern Chromium stores encrypted_value (DPAPI on Windows / Secret Service on Linux).
+            // Fallback to yt-dlp which already has native DPAPI / Secret Service decryptors built-in!
+            return Self::from_ytdlp_browser("chrome");
         }
 
         let _ = session.save_to_disk();
         Ok(session)
+    }
+
+    /// Extracts browser cookies by delegating decryption to yt-dlp when available
+    fn from_ytdlp_browser(browser: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let binary = crate::innertube::InnerTubeClient::find_ytdlp_binary_pub();
+        let tmp_cookie_file = std::env::temp_dir().join(format!("mitub_{browser}_export_{}.txt", std::process::id()));
+
+        let status = std::process::Command::new(&binary)
+            .arg("--cookies-from-browser")
+            .arg(browser)
+            .arg("--cookies")
+            .arg(&tmp_cookie_file)
+            .arg("--skip-download")
+            .arg("https://www.youtube.com")
+            .output();
+
+        if let Ok(out) = status {
+            if out.status.success() && tmp_cookie_file.exists() {
+                let session_res = Self::from_netscape_file(&tmp_cookie_file);
+                let _ = fs::remove_file(&tmp_cookie_file);
+                if let Ok(session) = session_res {
+                    if session.is_authenticated() {
+                        let _ = session.save_to_disk();
+                        return Ok(session);
+                    }
+                }
+            }
+        }
+        let _ = fs::remove_file(&tmp_cookie_file);
+
+        Err("No se pudo descifrar la sesión de Chrome/Chromium. Si usas Chrome en Windows o Linux, puedes usar Firefox o pegar el header Cookie.".into())
     }
 
     pub fn clear_from_disk() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {

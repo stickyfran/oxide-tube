@@ -1,1 +1,39 @@
-/target
+# Rust build artifacts
+/target/
+**/*.rs.bk
+*.pdb
+
+# Environment and sensitive data
+.env
+.env.*
+*.cookies
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+cookies.json
+cookies.txt
+tokens.json
+
+# Cache and logs
+*.log
+.cache/
+cache/
+
+# Video and media downloads
+*.mp4
+*.mkv
+*.webm
+*.part
+*.ytdl
+
+# Operating System and IDE files
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+*.sublime-project
+*.sublime-workspace

@@ -1420,13 +1420,21 @@ pub fn view_control_bar<'a, Message: Clone + 'static>(
         );
     }
 
-    let bottom_bar_inner: Element<'a, Message> = container(
+    let bottom_bar_box = container(
         column![interactive_seek_bar, controls_row].spacing(6),
     )
     .style(youtube_player_control_bar)
     .padding([8, 12])
-    .width(Length::Fill)
-    .into();
+    .width(Length::Fill);
+
+    let bottom_bar_inner: Element<'a, Message> = if state.has_open_menu() {
+        iced::widget::mouse_area(bottom_bar_box)
+            .on_press(on_close_menus.clone())
+            .into()
+    } else {
+        iced::widget::mouse_area(bottom_bar_box)
+            .into()
+    };
 
     outer_col = outer_col.push(bottom_bar_inner);
 
@@ -1434,13 +1442,7 @@ pub fn view_control_bar<'a, Message: Clone + 'static>(
         .style(transparent_player_container)
         .width(Length::Fill);
 
-    if state.has_open_menu() {
-        iced::widget::mouse_area(outer_container)
-            .on_press(on_close_menus)
-            .into()
-    } else {
-        outer_container.into()
-    }
+    outer_container.into()
 }
 
 pub fn view_subtitle_overlay<'a, Message: 'static>(

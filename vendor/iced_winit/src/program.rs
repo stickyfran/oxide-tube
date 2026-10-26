@@ -746,7 +746,9 @@ async fn run_instance<P, C>(
                         | event::StartCause::ResumeTimeReached { .. },
                     ) => {
                         for (_id, window) in window_manager.iter_mut() {
-                            window.raw.request_redraw();
+                            if window.raw.is_minimized() != Some(true) {
+                                window.raw.request_redraw();
+                            }
                         }
                     }
                     event::Event::UserEvent(action) => {
@@ -1086,6 +1088,10 @@ async fn run_instance<P, C>(
                                 &mut messages,
                             );
 
+                            let has_pip = window_manager
+                                .iter_mut()
+                                .any(|(_, w)| w.state.title() == "PiP");
+
                             for (id, window) in window_manager.iter_mut() {
                                 window.state.synchronize(
                                     &program,
@@ -1093,7 +1099,22 @@ async fn run_instance<P, C>(
                                     &window.raw,
                                 );
 
-                                window.raw.request_redraw();
+                                if window.raw.is_minimized() == Some(true) {
+                                    continue;
+                                }
+
+                                let is_background_main_during_pip = has_pip
+                                    && window.state.title() != "PiP"
+                                    && !window.raw.has_focus()
+                                    && matches!(
+                                        window.state.cursor(),
+                                        mouse::Cursor::Unavailable
+                                    )
+                                    && !uis_stale;
+
+                                if !is_background_main_during_pip {
+                                    window.raw.request_redraw();
+                                }
                             }
 
                             user_interfaces =

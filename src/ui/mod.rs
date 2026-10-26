@@ -11,10 +11,95 @@ use crate::config::{PreferredAudioLanguage, PreferredCodec, PreferredResolution}
 use crate::power_manager::PowerProfile;
 use crate::ui::icons::*;
 use crate::ui::theme::*;
-use iced::widget::{button, column, container, image, row, slider, text, text_input, Space};
-use iced::{Alignment, Element, Length};
+use iced::widget::{button, canvas, column, container, image, mouse_area, row, slider, stack, text, text_input, Column, Space};
+use iced::{Alignment, Element, Length, Point, Rectangle, Renderer, Theme};
 
 pub use crate::config::VideoTab;
+
+/// Renders a smooth travelling perimeter glow around the tab that is currently playing a video.
+#[derive(Debug, Clone, Copy)]
+struct PlayingTabGlowBorder {
+    phase: f32,
+    is_active_tab: bool,
+}
+
+impl<Message> canvas::Program<Message> for PlayingTabGlowBorder {
+    type State = ();
+
+    fn draw(
+        &self,
+        _state: &Self::State,
+        renderer: &Renderer,
+        _theme: &Theme,
+        bounds: Rectangle,
+        _cursor: iced::mouse::Cursor,
+    ) -> Vec<canvas::Geometry> {
+        let mut frame = canvas::Frame::new(renderer, bounds.size());
+        let w = bounds.width;
+        let h = bounds.height;
+        if w < 4.0 || h < 4.0 {
+            return vec![];
+        }
+
+        let center = Point::new(w * 0.5, h * 0.5);
+        let angle = self.phase * std::f32::consts::TAU;
+        let radius = (w.hypot(h)) * 0.55;
+        let start = Point::new(center.x - angle.cos() * radius, center.y - angle.sin() * radius);
+        let end = Point::new(center.x + angle.cos() * radius, center.y + angle.sin() * radius);
+
+        let base_alpha = if self.is_active_tab { 0.45 } else { 0.25 };
+        let base_color = iced::Color::from_rgba(1.0, 0.20, 0.20, base_alpha);
+        let mid_glow = iced::Color::from_rgba(1.0, 0.28, 0.28, 0.92);
+        let peak_glow = iced::Color::from_rgba(1.0, 0.78, 0.78, 1.0);
+
+        let grad = canvas::gradient::Linear::new(start, end)
+            .add_stop(0.0, base_color)
+            .add_stop(0.32, base_color)
+            .add_stop(0.46, mid_glow)
+            .add_stop(0.50, peak_glow)
+            .add_stop(0.54, mid_glow)
+            .add_stop(0.68, base_color)
+            .add_stop(1.0, base_color);
+
+        // Soft outer halo stroke
+        let outer_halo = canvas::gradient::Linear::new(start, end)
+            .add_stop(0.0, iced::Color::TRANSPARENT)
+            .add_stop(0.35, iced::Color::TRANSPARENT)
+            .add_stop(0.50, iced::Color::from_rgba(1.0, 0.22, 0.22, 0.42))
+            .add_stop(0.65, iced::Color::TRANSPARENT)
+            .add_stop(1.0, iced::Color::TRANSPARENT);
+
+        let halo_path = canvas::Path::rounded_rectangle(
+            Point::new(0.75, 0.75),
+            iced::Size::new((w - 1.5).max(1.0), (h - 1.5).max(1.0)),
+            6.0.into(),
+        );
+        frame.stroke(
+            &halo_path,
+            canvas::Stroke {
+                style: canvas::Style::Gradient(canvas::Gradient::Linear(outer_halo)),
+                width: 3.2,
+                ..canvas::Stroke::default()
+            },
+        );
+
+        let border_path = canvas::Path::rounded_rectangle(
+            Point::new(1.0, 1.0),
+            iced::Size::new((w - 2.0).max(1.0), (h - 2.0).max(1.0)),
+            6.0.into(),
+        );
+        frame.stroke(
+            &border_path,
+            canvas::Stroke {
+                style: canvas::Style::Gradient(canvas::Gradient::Linear(grad)),
+                width: 1.8,
+                ..canvas::Stroke::default()
+            },
+        );
+
+        vec![frame.into_geometry()]
+    }
+}
 
 pub fn view_header_bar<'a, Message: Clone + 'static>(
     search_query: &'a str,
@@ -29,10 +114,13 @@ pub fn view_header_bar<'a, Message: Clone + 'static>(
     is_home: bool,
     tabs: &'a [VideoTab],
     active_tab_idx: Option<usize>,
-    newly_opened_tab: Option<usize>,
+    playing_video_id: Option<&'a str>,
+    is_video_playing: bool,
+    newly_opened_tab: Option<(usize, f32)>,
     shaking_tab: Option<(usize, f32)>,
     window_width: f32,
     tabs_scroll_x: f32,
+    tabs_max_scroll_x: f32,
     on_search_input: impl Fn(String) -> Message + 'static,
     on_search_submit: Message,
     _on_select_suggestion: impl Fn(String) -> Message + 'static,
@@ -112,10 +200,22 @@ pub fn view_header_bar<'a, Message: Clone + 'static>(
         .align_y(Alignment::Center);
 
     // 3. Center/Horizontal Tabs section: Pestañas de video abiertas con middle-click
+    let glow_phase = (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        % 2200) as f32
+        / 2200.0;
+
     let mut tabs_row = row![].spacing(6).align_y(Alignment::Center);
+    let mut sum_tabs_width: f32 = 0.0;
+
     for (idx, tab) in tabs.iter().enumerate() {
         let is_active = active_tab_idx == Some(idx);
-        let is_newly_opened = newly_opened_tab == Some(idx);
+        let is_playing_this_tab =
+            is_video_playing && !tab.video_id.is_empty() && playing_video_id == Some(tab.video_id.as_str());
+        let open_elapsed = newly_opened_tab.and_then(|(n_idx, el)| if n_idx == idx { Some(el) } else { None });
+        let is_newly_opened = open_elapsed.is_some();
         let shake_elapsed = shaking_tab.and_then(|(s_idx, el)| if s_idx == idx { Some(el) } else { None });
 
         let tab_title = if tab.title.chars().count() > 20 {
@@ -128,14 +228,33 @@ pub fn view_header_bar<'a, Message: Clone + 'static>(
             tab.title.clone()
         };
 
-        let select_btn = button(
+        let char_count = tab_title.chars().count() as f32;
+        let est_this_tab_w = (char_count * 6.4 + if is_playing_this_tab { 46.0 } else { 32.0 }).clamp(88.0, 175.0);
+        sum_tabs_width += est_this_tab_w + if idx > 0 { 6.0 } else { 0.0 };
+
+        let label_content: Element<'a, Message> = if is_playing_this_tab {
+            row![
+                icon_play(10.0),
+                text(tab_title)
+                    .size(11)
+                    .wrapping(text::Wrapping::None)
+                    .color(iced::Color::WHITE),
+            ]
+            .spacing(5)
+            .align_y(Alignment::Center)
+            .into()
+        } else {
             text(tab_title)
                 .size(11)
-                .color(if is_active { iced::Color::WHITE } else { COLOR_TEXT_SECONDARY }),
-        )
-        .style(ghost_button)
-        .padding([4, 6])
-        .on_press(on_select_tab(idx));
+                .wrapping(text::Wrapping::None)
+                .color(if is_active { iced::Color::WHITE } else { COLOR_TEXT_SECONDARY })
+                .into()
+        };
+
+        let select_btn = button(label_content)
+            .style(ghost_button)
+            .padding([4, 6])
+            .on_press(on_select_tab(idx));
 
         let close_btn = button(icon_close(10.0))
             .style(ghost_button)
@@ -147,6 +266,8 @@ pub fn view_header_bar<'a, Message: Clone + 'static>(
             let offset = (el * 38.0).sin() * 5.0 * decay;
             let c = iced::Color::from_rgba(0.9, 0.3, 0.3, 0.2 + 0.8 * decay);
             (offset, c, 1.5)
+        } else if is_playing_this_tab {
+            (0.0, iced::Color::TRANSPARENT, 0.0)
         } else if is_active {
             (0.0, iced::Color::from_rgb8(0xff, 0x33, 0x33), 1.5)
         } else if is_newly_opened {
@@ -158,34 +279,60 @@ pub fn view_header_bar<'a, Message: Clone + 'static>(
         let pad_l = (4.0 + shake_offset).max(0.0);
         let pad_r = (4.0 - shake_offset).max(0.0);
 
-        let tab_pill = iced::widget::mouse_area(
-            container(
-                row![select_btn, close_btn]
-                    .align_y(Alignment::Center)
-                    .spacing(2),
-            )
-            .style(move |_t| container::Style {
-                // Al vibrar una pestaña inactiva se mantiene estrictamente en el tono inactivo (0x18, 0x18, 0x18)
-                background: Some(if is_active {
-                    iced::Color::from_rgb8(0xcc, 0x00, 0x00).into()
-                } else if is_newly_opened {
-                    iced::Color::from_rgb8(0x44, 0x11, 0x11).into()
-                } else {
-                    iced::Color::from_rgb8(0x18, 0x18, 0x18).into()
-                }),
-                border: iced::border::rounded(6)
-                    .color(border_color)
-                    .width(border_width),
-                ..container::Style::default()
-            })
-            .padding(iced::Padding {
-                top: 1.0,
-                bottom: 1.0,
-                left: pad_l,
-                right: pad_r,
-            }),
+        let inner_pill = container(
+            row![select_btn, close_btn]
+                .align_y(Alignment::Center)
+                .spacing(2),
         )
-        .on_middle_press(on_close_tab(idx));
+        .style(move |_t| container::Style {
+            background: Some(if is_active {
+                iced::Color::from_rgb8(0xcc, 0x00, 0x00).into()
+            } else if is_playing_this_tab {
+                iced::Color::from_rgb8(0x2b, 0x10, 0x10).into()
+            } else if is_newly_opened {
+                iced::Color::from_rgb8(0x44, 0x11, 0x11).into()
+            } else {
+                iced::Color::from_rgb8(0x18, 0x18, 0x18).into()
+            }),
+            border: iced::border::rounded(6)
+                .color(border_color)
+                .width(border_width),
+            ..container::Style::default()
+        })
+        .padding(iced::Padding {
+            top: 1.0,
+            bottom: 1.0,
+            left: pad_l,
+            right: pad_r,
+        });
+
+        let mut tab_container: container::Container<'a, Message> = if is_playing_this_tab {
+            let glow_canvas = canvas(PlayingTabGlowBorder {
+                phase: glow_phase,
+                is_active_tab: is_active,
+            })
+            .width(Length::Fill)
+            .height(Length::Fill);
+
+            container(stack![inner_pill, glow_canvas])
+        } else {
+            inner_pill
+        };
+
+        // Firefox-style slide-in expansion from left to right when a tab is newly opened (220ms cubic ease-out)
+        if let Some(el) = open_elapsed {
+            if el < 0.22 {
+                let t = (el / 0.22).clamp(0.0, 1.0);
+                let ease = 1.0 - (1.0 - t).powi(3);
+                let target_w = 154.0;
+                tab_container = tab_container
+                    .width(Length::Fixed((target_w * ease).max(2.0)))
+                    .clip(true);
+            }
+        }
+
+        let tab_pill = mouse_area(tab_container)
+            .on_middle_press(on_close_tab(idx));
 
         tabs_row = tabs_row.push(tab_pill);
     }
@@ -219,94 +366,102 @@ pub fn view_header_bar<'a, Message: Clone + 'static>(
         .id(iced::widget::scrollable::Id::new("tabs_scrollable"))
         .on_scroll(on_scroll_tabs);
 
-    let available_tabs_width = (window_width - 720.0).max(80.0);
-    let estimated_tabs_width = tabs.len() as f32 * 145.0;
-    let can_scroll_left = tabs_scroll_x > 10.0;
-    let can_scroll_right = tabs.len() > 1 && (estimated_tabs_width - tabs_scroll_x) > (available_tabs_width - 20.0);
+    // Chrome-like overflow detection:
+    // Real occupied width by non-tab elements in header:
+    // left_section (~116) + search_container (~366) + margins/spacings (~52) + right_section (~160) ≈ 694px
+    let right_account_width = if is_authenticated && user_name.is_some() { 160.0 } else { 125.0 };
+    let non_tabs_width = 540.0 + right_account_width;
+    let available_tabs_width = (window_width - non_tabs_width).max(80.0);
+    let heuristic_max_scroll = (sum_tabs_width - available_tabs_width).max(0.0);
+    let effective_max_scroll = tabs_max_scroll_x.max(heuristic_max_scroll);
+    let clamped_scroll_x = tabs_scroll_x.clamp(0.0, effective_max_scroll);
+
+    // Only show scroll controls when tabs actually exceed the viewport
+    let has_overflow = effective_max_scroll > 8.0;
+    let can_scroll_left = has_overflow && clamped_scroll_x > 4.0;
+    let can_scroll_right = has_overflow && (clamped_scroll_x + 6.0) < effective_max_scroll;
 
     let tabs_section: Element<'a, Message> = {
-        let now_ms = (std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() % 1400) as f32 / 1400.0;
-        let wave = (now_ms * std::f32::consts::TAU).sin() * 0.5 + 0.5; // 0.0 .. 1.0
-        let bounce_x = wave * 3.0;
+        let base_scrollable = container(tabs_scrollable)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .align_y(iced::alignment::Vertical::Center);
 
-        let left_btn = if can_scroll_left {
-            let border_c = iced::Color::from_rgba(0.9, 0.2, 0.2, 0.35 + wave * 0.45);
-            Some(
-                button(
-                    container(icon_chevron_left(13.0))
-                        .padding(iced::Padding {
-                            top: 1.0,
-                            right: 2.0,
-                            bottom: 1.0,
-                            left: 2.0 + bounce_x,
-                        })
-                        .align_x(iced::alignment::Horizontal::Center)
-                        .align_y(iced::alignment::Vertical::Center),
-                )
-                .style(move |_t, status| match status {
-                    button::Status::Hovered => button::Style {
-                        background: Some(iced::Color::from_rgba8(0x38, 0x18, 0x18, 0.95).into()),
-                        border: iced::border::rounded(14).color(COLOR_ACCENT_RED).width(1.5),
-                        ..button::Style::default()
-                    },
-                    _ => button::Style {
-                        background: Some(iced::Color::from_rgba8(0x22, 0x22, 0x22, 0.85).into()),
-                        border: iced::border::rounded(14).color(border_c).width(1.0),
-                        ..button::Style::default()
-                    },
-                })
-                .padding([3, 5])
-                .on_press(on_scroll_tabs_left),
+        let mut layers: Vec<Element<'a, Message>> = vec![base_scrollable.into()];
+
+        if can_scroll_left {
+            let left_btn = button(
+                container(icon_chevron_left(13.0))
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .align_x(iced::alignment::Horizontal::Center)
+                    .align_y(iced::alignment::Vertical::Center),
             )
-        } else {
-            None
-        };
+            .width(Length::Fixed(24.0))
+            .height(Length::Fixed(24.0))
+            .padding(0)
+            .style(|_t, status| match status {
+                button::Status::Hovered | button::Status::Pressed => button::Style {
+                    background: Some(iced::Color::from_rgba(0.24, 0.24, 0.24, 0.95).into()),
+                    border: iced::border::rounded(12)
+                        .color(iced::Color::from_rgb8(0x80, 0x80, 0x80))
+                        .width(1.0),
+                    ..button::Style::default()
+                },
+                _ => button::Style {
+                    background: Some(iced::Color::from_rgba(0.12, 0.12, 0.12, 0.90).into()),
+                    border: iced::border::rounded(12).color(COLOR_BORDER).width(1.0),
+                    ..button::Style::default()
+                },
+            })
+            .on_press(on_scroll_tabs_left);
 
-        let right_btn = if can_scroll_right {
-            let border_c = iced::Color::from_rgba(0.9, 0.2, 0.2, 0.35 + wave * 0.45);
-            Some(
-                button(
-                    container(icon_chevron_right(13.0))
-                        .padding(iced::Padding {
-                            top: 1.0,
-                            right: 2.0 + bounce_x,
-                            bottom: 1.0,
-                            left: 2.0,
-                        })
-                        .align_x(iced::alignment::Horizontal::Center)
-                        .align_y(iced::alignment::Vertical::Center),
-                )
-                .style(move |_t, status| match status {
-                    button::Status::Hovered => button::Style {
-                        background: Some(iced::Color::from_rgba8(0x38, 0x18, 0x18, 0.95).into()),
-                        border: iced::border::rounded(14).color(COLOR_ACCENT_RED).width(1.5),
-                        ..button::Style::default()
-                    },
-                    _ => button::Style {
-                        background: Some(iced::Color::from_rgba8(0x22, 0x22, 0x22, 0.85).into()),
-                        border: iced::border::rounded(14).color(border_c).width(1.0),
-                        ..button::Style::default()
-                    },
-                })
-                .padding([3, 5])
-                .on_press(on_scroll_tabs_right),
+            let overlay_left = container(left_btn)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .align_x(iced::alignment::Horizontal::Left)
+                .align_y(iced::alignment::Vertical::Center);
+
+            layers.push(overlay_left.into());
+        }
+
+        if can_scroll_right {
+            let right_btn = button(
+                container(icon_chevron_right(13.0))
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .align_x(iced::alignment::Horizontal::Center)
+                    .align_y(iced::alignment::Vertical::Center),
             )
-        } else {
-            None
-        };
+            .width(Length::Fixed(24.0))
+            .height(Length::Fixed(24.0))
+            .padding(0)
+            .style(|_t, status| match status {
+                button::Status::Hovered | button::Status::Pressed => button::Style {
+                    background: Some(iced::Color::from_rgba(0.24, 0.24, 0.24, 0.95).into()),
+                    border: iced::border::rounded(12)
+                        .color(iced::Color::from_rgb8(0x80, 0x80, 0x80))
+                        .width(1.0),
+                    ..button::Style::default()
+                },
+                _ => button::Style {
+                    background: Some(iced::Color::from_rgba(0.12, 0.12, 0.12, 0.90).into()),
+                    border: iced::border::rounded(12).color(COLOR_BORDER).width(1.0),
+                    ..button::Style::default()
+                },
+            })
+            .on_press(on_scroll_tabs_right);
 
-        let mut row_el = row![].spacing(4).align_y(Alignment::Center);
-        if let Some(lb) = left_btn {
-            row_el = row_el.push(lb);
+            let overlay_right = container(right_btn)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .align_x(iced::alignment::Horizontal::Right)
+                .align_y(iced::alignment::Vertical::Center);
+
+            layers.push(overlay_right.into());
         }
-        row_el = row_el.push(container(tabs_scrollable).width(Length::Fill));
-        if let Some(rb) = right_btn {
-            row_el = row_el.push(rb);
-        }
-        row_el.into()
+
+        stack(layers).width(Length::Fill).height(Length::Fill).into()
     };
 
     // 4. Right section: Account & Reload
@@ -632,10 +787,6 @@ pub fn view_auth_modal<'a, Message: Clone + 'static>(
     .color(COLOR_TEXT_SECONDARY);
 
     // Ventana Flotante PiP Automática (Multitarea)
-    let auto_pip_heading = text("Ventana Flotante PiP Automática (Multitarea)")
-        .size(13)
-        .color(COLOR_TEXT_PRIMARY);
-
     let auto_pip_btn = button(
         row![
             if auto_pip_on_unfocus {
@@ -665,10 +816,6 @@ pub fn view_auth_modal<'a, Message: Clone + 'static>(
     .color(COLOR_TEXT_SECONDARY);
 
     // Modo Pestañas con Buffer Completo
-    let buffer_tabs_heading = text("Modo Pestañas con Buffer Completo (Precarga de Sesión)")
-        .size(13)
-        .color(COLOR_TEXT_PRIMARY);
-
     let buffer_tabs_btn = button(
         row![
             if full_buffer_tabs {
@@ -848,44 +995,98 @@ pub fn view_auth_modal<'a, Message: Clone + 'static>(
     let close_btn = button(text("Cerrar").size(12))
         .style(ghost_button)
         .padding([6, 14])
-        .on_press(on_close_modal);
+        .on_press(on_close_modal.clone());
 
     let status = text(status_msg).size(12).color(COLOR_TEXT_SECONDARY);
+
+    let section_card = |content: Column<'a, Message>| -> Element<'a, Message> {
+        container(content)
+            .style(|_t| container::Style {
+                background: Some(iced::Color::from_rgb8(0x18, 0x18, 0x1b).into()),
+                border: iced::border::rounded(12)
+                    .color(iced::Color::from_rgba(1.0, 1.0, 1.0, 0.08))
+                    .width(1.0),
+                ..container::Style::default()
+            })
+            .padding(14)
+            .width(Length::Fill)
+            .into()
+    };
+
+    let card_nav = section_card(
+        column![
+            nav_heading,
+            nav_row,
+        ]
+        .spacing(10),
+    );
+
+    let card_playback = section_card(
+        column![
+            defaults_heading,
+            row![
+                text("Calidad:").size(12).color(COLOR_TEXT_SECONDARY).width(Length::Fixed(80.0)),
+                res_row,
+            ]
+            .spacing(10)
+            .align_y(Alignment::Center),
+            row![
+                text("Códec:").size(12).color(COLOR_TEXT_SECONDARY).width(Length::Fixed(80.0)),
+                codec_row,
+            ]
+            .spacing(10)
+            .align_y(Alignment::Center),
+            row![
+                text("Audio:").size(12).color(COLOR_TEXT_SECONDARY).width(Length::Fixed(80.0)),
+                audio_row,
+            ]
+            .spacing(10)
+            .align_y(Alignment::Center),
+            fallback_hint,
+        ]
+        .spacing(10),
+    );
+
+    let card_features = section_card(
+        column![
+            text("Multitarea y Pestañas").size(13).color(COLOR_TEXT_PRIMARY),
+            auto_pip_btn,
+            auto_pip_hint,
+            Space::with_height(Length::Fixed(4.0)),
+            buffer_tabs_btn,
+            buffer_tabs_hint,
+        ]
+        .spacing(8),
+    );
+
+    let card_cache = section_card(
+        column![
+            cache_heading,
+            cache_controls_row,
+            cache_hint,
+        ]
+        .spacing(8),
+    );
+
+    let card_auth = section_card(
+        column![
+            auth_heading,
+            auth_action_row,
+        ]
+        .spacing(10),
+    );
 
     let modal_content = iced::widget::scrollable(
         column![
             profile_header,
-            Space::with_height(Length::Fixed(6.0)),
-            nav_heading,
-            nav_row,
-            Space::with_height(Length::Fixed(6.0)),
-            defaults_heading,
-            text("Calidad por defecto:").size(12).color(COLOR_TEXT_SECONDARY),
-            res_row,
-            text("Códec por defecto:").size(12).color(COLOR_TEXT_SECONDARY),
-            codec_row,
-            text("Idioma de Audio por defecto:").size(12).color(COLOR_TEXT_SECONDARY),
-            audio_row,
-            fallback_hint,
-            Space::with_height(Length::Fixed(6.0)),
-            auto_pip_heading,
-            auto_pip_btn,
-            auto_pip_hint,
-            Space::with_height(Length::Fixed(6.0)),
-            buffer_tabs_heading,
-            buffer_tabs_btn,
-            buffer_tabs_hint,
-            Space::with_height(Length::Fixed(6.0)),
-            cache_heading,
-            cache_controls_row,
-            cache_hint,
-            Space::with_height(Length::Fixed(6.0)),
-            auth_heading,
-            auth_action_row,
-            row![Space::with_width(Length::Fill), close_btn].align_y(Alignment::Center),
-            status,
+            card_nav,
+            card_playback,
+            card_features,
+            card_cache,
+            card_auth,
+            row![status, Space::with_width(Length::Fill), close_btn].align_y(Alignment::Center),
         ]
-        .spacing(10),
+        .spacing(14),
     )
     .height(Length::Shrink);
 
@@ -895,15 +1096,21 @@ pub fn view_auth_modal<'a, Message: Clone + 'static>(
         .max_height(720.0)
         .width(Length::Fixed(680.0));
 
-    container(modal_box)
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .align_x(iced::alignment::Horizontal::Center)
-        .align_y(iced::alignment::Vertical::Center)
-        .style(|_t| container::Style {
-            background: Some(iced::Color::from_rgba(0.0, 0.0, 0.0, 0.7).into()),
-            ..container::Style::default()
-        })
-        .into()
+    let clickable_modal = mouse_area(modal_box);
+
+    let backdrop = mouse_area(
+        container(clickable_modal)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .align_x(iced::alignment::Horizontal::Center)
+            .align_y(iced::alignment::Vertical::Center)
+            .style(|_t| container::Style {
+                background: Some(iced::Color::from_rgba(0.0, 0.0, 0.0, 0.7).into()),
+                ..container::Style::default()
+            })
+    )
+    .on_press(on_close_modal);
+
+    backdrop.into()
 }
 

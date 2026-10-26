@@ -79,6 +79,7 @@ fn read_only_text_editor_bindings<Message>(event: text_editor::KeyPress) -> Opti
     }
 }
 
+#[allow(dead_code)]
 pub fn render_rich_text_with_links<'a, Message: Clone + 'static>(
     raw_text: &str,
     font_size: f32,
@@ -145,6 +146,7 @@ pub fn view_watch_page<'a, Message: Clone + 'static>(
     thumbnail_cache: &'a std::collections::HashMap<String, iced::widget::image::Handle>,
     blurred_cache: &'a std::collections::HashMap<String, iced::widget::image::Handle>,
     blurred_poster: Option<&'a iced::widget::image::Handle>,
+    sharp_poster_override: Option<&'a iced::widget::image::Handle>,
     video_frame: Option<crate::player::VideoFrameBuffer>,
     blur_amount: f32,
     theater_mode: bool,
@@ -152,8 +154,7 @@ pub fn view_watch_page<'a, Message: Clone + 'static>(
     is_pip_active: bool,
     description_expanded: bool,
     chat_collapsed: bool,
-    _description_content: &'a iced::widget::text_editor::Content,
-    comment_contents: &'a [iced::widget::text_editor::Content],
+    description_content: &'a iced::widget::text_editor::Content,
     player_viewport_width: u16,
     player_viewport_height: u16,
     _window_height: f32,
@@ -190,11 +191,12 @@ pub fn view_watch_page<'a, Message: Clone + 'static>(
     on_clear_queue: Message,
     on_toggle_autoplay: Message,
     on_open_url: impl Fn(String) -> Message + Copy + 'static,
-    on_copy_text: impl Fn(String) -> Message + Copy + 'static,
+    on_copy_share_url: Message,
+    on_copy_description: Message,
+    on_copy_comment: impl Fn(usize) -> Message + Copy + 'static,
     on_toggle_description: Message,
     on_toggle_chat: Message,
-    _on_description_action: impl Fn(iced::widget::text_editor::Action) -> Message + Copy + 'static,
-    on_comment_action: impl Fn(usize, iced::widget::text_editor::Action) -> Message + Copy + 'static,
+    on_description_action: impl Fn(iced::widget::text_editor::Action) -> Message + Copy + 'static,
     on_scroll: impl Fn(iced::widget::scrollable::Viewport) -> Message + Copy + 'static,
 ) -> Element<'a, Message> {
     let col_w = player_viewport_width as f32;
@@ -242,20 +244,19 @@ pub fn view_watch_page<'a, Message: Clone + 'static>(
 
     let show_poster = video_frame.is_none() || !osd_state.first_frame_rendered;
     let thumb_key = format!("https://i.ytimg.com/vi/{}/hqdefault.jpg", &details.video_id);
-    let poster_img = blurred_poster
-        .or_else(|| blurred_cache.get(&thumb_key))
+    // Prioritize crisp thumbnail/cached frame first when displaying inactive tabs or initial poster,
+    // falling back to blurred poster only when no sharp image is in memory yet.
+    let poster_img = sharp_poster_override
         .or_else(|| thumbnail_cache.get(&thumb_key))
         .or_else(|| {
             details
                 .recommended_videos
                 .iter()
                 .find(|v| v.video_id == details.video_id)
-                .and_then(|v| {
-                    blurred_cache
-                        .get(&v.thumbnail_url)
-                        .or_else(|| thumbnail_cache.get(&v.thumbnail_url))
-                })
-        });
+                .and_then(|v| thumbnail_cache.get(&v.thumbnail_url))
+        })
+        .or(blurred_poster)
+        .or_else(|| blurred_cache.get(&thumb_key));
 
     let loading_badge = mouse_area(
         container(
@@ -758,21 +759,50 @@ pub fn view_watch_page<'a, Message: Clone + 'static>(
         .spacing(6)
         .align_y(Alignment::Center),
     )
-    .style(secondary_button)
+    .style(move |_theme, status| {
+        let bg = match status {
+            button::Status::Hovered => COLOR_SURFACE_HOVER,
+            button::Status::Pressed => iced::Color::from_rgb8(0x35, 0x35, 0x35),
+            _ => if is_liked { iced::Color::from_rgba(0.9, 0.15, 0.15, 0.15) } else { COLOR_SURFACE },
+        };
+        let border_color = if is_liked { COLOR_ACCENT_RED } else { iced::Color::TRANSPARENT };
+        button::Style {
+            background: Some(bg.into()),
+            border: iced::border::rounded(18).color(border_color).width(if is_liked { 1.2 } else { 0.0 }),
+            ..button::Style::default()
+        }
+    })
     .padding([8, 14])
     .on_press(on_like);
 
+    let dislike_label = if !details.dislikes_str.is_empty() {
+        details.dislikes_str.clone()
+    } else {
+        "No me gusta".to_string()
+    };
     let dislike_btn = button(
         row![
             icon_thumb_down(14.0),
-            text(if is_disliked { "No me gusta" } else { "" })
+            text(dislike_label)
                 .size(13)
                 .color(if is_disliked { COLOR_ACCENT_RED } else { COLOR_TEXT_PRIMARY })
         ]
-        .spacing(4)
+        .spacing(6)
         .align_y(Alignment::Center),
     )
-    .style(secondary_button)
+    .style(move |_theme, status| {
+        let bg = match status {
+            button::Status::Hovered => COLOR_SURFACE_HOVER,
+            button::Status::Pressed => iced::Color::from_rgb8(0x35, 0x35, 0x35),
+            _ => if is_disliked { iced::Color::from_rgba(0.9, 0.15, 0.15, 0.15) } else { COLOR_SURFACE },
+        };
+        let border_color = if is_disliked { COLOR_ACCENT_RED } else { iced::Color::TRANSPARENT };
+        button::Style {
+            background: Some(bg.into()),
+            border: iced::border::rounded(18).color(border_color).width(if is_disliked { 1.2 } else { 0.0 }),
+            ..button::Style::default()
+        }
+    })
     .padding([8, 12])
     .on_press(on_dislike);
 
@@ -830,7 +860,6 @@ pub fn view_watch_page<'a, Message: Clone + 'static>(
     .padding([8, 14])
     .on_press(on_trigger_full_buffer);
 
-    let share_url = format!("https://youtu.be/{}", details.video_id);
     let share_btn = button(
         row![
             icon_share(14.0),
@@ -843,7 +872,7 @@ pub fn view_watch_page<'a, Message: Clone + 'static>(
     )
     .style(secondary_button)
     .padding([8, 14])
-    .on_press(on_copy_text(share_url));
+    .on_press(on_copy_share_url);
 
     // Channel action row: clean, with Compartir placed to the left of Me gusta!
     let channel_row = row![
@@ -893,7 +922,7 @@ pub fn view_watch_page<'a, Message: Clone + 'static>(
         )
         .style(ghost_button)
         .padding([2, 6])
-        .on_press(on_copy_text(details.description.clone()));
+        .on_press(on_copy_description);
 
         let desc_toggle_btn = button(
             text(if description_expanded { "Mostrar menos" } else { "Mostrar más" })
@@ -904,8 +933,15 @@ pub fn view_watch_page<'a, Message: Clone + 'static>(
         .padding([4, 8])
         .on_press(on_toggle_description);
 
+        let meta_label = match (!details.views_str.is_empty(), !details.published_date.is_empty()) {
+            (true, true) => format!("{} • {}", details.views_str, details.published_date),
+            (true, false) => details.views_str.clone(),
+            (false, true) => details.published_date.clone(),
+            (false, false) => "Descripción".to_string(),
+        };
+
         let desc_header = row![
-            text("Descripción").size(13).color(COLOR_TEXT_SECONDARY),
+            text(meta_label).size(13).color(COLOR_TEXT_SECONDARY),
             Space::with_width(Length::Fill),
             copy_desc_btn,
         ]
@@ -957,23 +993,18 @@ pub fn view_watch_page<'a, Message: Clone + 'static>(
             desc_col = desc_col.push(ch_scroll);
         }
 
-        let desc_text = if description_expanded || details.description.chars().count() <= 240 {
-            details.description.clone()
-        } else {
-            let truncated: String = details.description.chars().take(240).collect();
-            format!("{truncated}...")
-        };
-        let desc_widget = text(desc_text)
+        let desc_widget: Element<'a, Message> = text_editor(description_content)
+            .style(selectable_text_editor)
+            .padding(0)
             .size(13)
-            .color(COLOR_TEXT_PRIMARY);
+            .key_binding(read_only_text_editor_bindings)
+            .on_action(on_description_action)
+            .into();
         desc_col = desc_col.push(desc_widget);
 
-        let desc_urls = extract_unique_urls(&details.description);
-        let desc_timestamps = extract_timestamps(&details.description);
-
-        if !desc_timestamps.is_empty() || !desc_urls.is_empty() {
+        if !details.parsed_desc_timestamps.is_empty() || !details.parsed_desc_urls.is_empty() {
             let mut chip_row = row![].spacing(6).align_y(Alignment::Center);
-            for (label, secs) in desc_timestamps.into_iter().take(12) {
+            for (label, secs) in details.parsed_desc_timestamps.iter().take(12) {
                 let ts_btn = button(
                     row![
                         icon_play(9.0),
@@ -984,10 +1015,10 @@ pub fn view_watch_page<'a, Message: Clone + 'static>(
                 )
                 .style(secondary_button)
                 .padding([3, 8])
-                .on_press(on_seek(secs * 1000));
+                .on_press(on_seek(*secs));
                 chip_row = chip_row.push(ts_btn);
             }
-            for url in desc_urls.into_iter().take(12) {
+            for url in details.parsed_desc_urls.iter().take(12) {
                 let display_label = if url.len() > 36 {
                     let mut s: String = url.chars().take(34).collect();
                     s.push_str("..");
@@ -1005,7 +1036,7 @@ pub fn view_watch_page<'a, Message: Clone + 'static>(
                 )
                 .style(secondary_button)
                 .padding([3, 8])
-                .on_press(on_open_url(url));
+                .on_press(on_open_url(url.clone()));
                 chip_row = chip_row.push(link_btn);
             }
             let chip_scroll = scrollable(chip_row).direction(scrollable::Direction::Horizontal(
@@ -1046,66 +1077,54 @@ pub fn view_watch_page<'a, Message: Clone + 'static>(
             let copy_comment_btn = button(icon_copy(11.0))
                 .style(ghost_button)
                 .padding([2, 4])
-                .on_press(on_copy_text(c.text.clone()));
+                .on_press(on_copy_comment(c_idx));
 
-            let comment_text_widget: Element<'a, Message> = if let Some(content) = comment_contents.get(c_idx) {
-                let comment_urls = extract_unique_urls(&c.text);
-                let comment_timestamps = extract_timestamps(&c.text);
-                let ed = text_editor(content)
-                    .style(selectable_text_editor)
-                    .padding(0)
-                    .size(13)
-                    .key_binding(read_only_text_editor_bindings)
-                    .on_action(move |a| on_comment_action(c_idx, a));
-
-                if comment_urls.is_empty() && comment_timestamps.is_empty() {
-                    ed.into()
-                } else {
-                    let mut col = column![ed].spacing(4);
-                    let mut chip_row = row![].spacing(6).align_y(Alignment::Center);
-                    for (label, secs) in comment_timestamps.into_iter().take(6) {
-                        let ts_btn = button(
-                            row![
-                                icon_play(9.0),
-                                text(label).size(11).color(COLOR_TEXT_PRIMARY),
-                            ]
-                            .spacing(3)
-                            .align_y(Alignment::Center),
-                        )
-                        .style(secondary_button)
-                        .padding([2, 6])
-                        .on_press(on_seek(secs * 1000));
-                        chip_row = chip_row.push(ts_btn);
-                    }
-                    for url in comment_urls.into_iter().take(6) {
-                        let display_label = if url.len() > 32 {
-                            let mut s: String = url.chars().take(30).collect();
-                            s.push_str("..");
-                            s
-                        } else {
-                            url.clone()
-                        };
-                        let link_btn = button(
-                            row![
-                                icon_link(10.0),
-                                text(display_label).size(11).color(iced::Color::from_rgb8(0x3e, 0xa6, 0xff)),
-                            ]
-                            .spacing(4)
-                            .align_y(Alignment::Center),
-                        )
-                        .style(secondary_button)
-                        .padding([2, 6])
-                        .on_press(on_open_url(url));
-                        chip_row = chip_row.push(link_btn);
-                    }
-                    let chip_scroll = scrollable(chip_row).direction(scrollable::Direction::Horizontal(
-                        scrollable::Scrollbar::new().width(0.0).scroller_width(0.0),
-                    ));
-                    col = col.push(chip_scroll);
-                    col.into()
-                }
+            let comment_text_widget: Element<'a, Message> = if c.parsed_urls.is_empty() && c.parsed_timestamps.is_empty() {
+                text(&c.text).size(13).color(COLOR_TEXT_PRIMARY).into()
             } else {
-                render_rich_text_with_links(&c.text, 13.0, COLOR_TEXT_PRIMARY, on_open_url)
+                let ed = text(&c.text).size(13).color(COLOR_TEXT_PRIMARY);
+                let mut col = column![ed].spacing(4);
+                let mut chip_row = row![].spacing(6).align_y(Alignment::Center);
+                for (label, secs) in c.parsed_timestamps.iter().take(6) {
+                    let ts_btn = button(
+                        row![
+                            icon_play(9.0),
+                            text(label).size(11).color(COLOR_TEXT_PRIMARY),
+                        ]
+                        .spacing(3)
+                        .align_y(Alignment::Center),
+                    )
+                    .style(secondary_button)
+                    .padding([2, 6])
+                    .on_press(on_seek(*secs));
+                    chip_row = chip_row.push(ts_btn);
+                }
+                for url in c.parsed_urls.iter().take(6) {
+                    let display_label = if url.len() > 32 {
+                        let mut s: String = url.chars().take(30).collect();
+                        s.push_str("..");
+                        s
+                    } else {
+                        url.clone()
+                    };
+                    let link_btn = button(
+                        row![
+                            icon_link(10.0),
+                            text(display_label).size(11).color(iced::Color::from_rgb8(0x3e, 0xa6, 0xff)),
+                        ]
+                        .spacing(4)
+                        .align_y(Alignment::Center),
+                    )
+                    .style(secondary_button)
+                    .padding([2, 6])
+                    .on_press(on_open_url(url.clone()));
+                    chip_row = chip_row.push(link_btn);
+                }
+                let chip_scroll = scrollable(chip_row).direction(scrollable::Direction::Horizontal(
+                    scrollable::Scrollbar::new().width(0.0).scroller_width(0.0),
+                ));
+                col = col.push(chip_scroll);
+                col.into()
             };
 
             let mut comment_body = column![

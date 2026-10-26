@@ -1,0 +1,120 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-x86_64:
+    name: Build Linux x86_64
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            pkg-config \
+            libmpv-dev \
+            libwayland-dev \
+            libxkbcommon-dev \
+            libgl1-mesa-dev
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release --bin mitub
+
+      - name: Package tarball
+        run: |
+          VERSION="${GITHUB_REF_NAME:-v0.99.0}"
+          PKG_NAME="oxidetube-${VERSION}-linux-x86_64"
+          mkdir -p "${PKG_NAME}"
+          cp target/release/mitub "${PKG_NAME}/"
+          cp README.md "${PKG_NAME}/"
+          cp BUILD.md "${PKG_NAME}/"
+          cp ARCHITECTURE.md "${PKG_NAME}/"
+          tar -czvf "${PKG_NAME}.tar.gz" "${PKG_NAME}"
+          echo "ASSET_TAR=${PKG_NAME}.tar.gz" >> $GITHUB_ENV
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: oxidetube-linux-x86_64
+          path: ${{ env.ASSET_TAR }}
+
+  build-aarch64:
+    name: Build Linux aarch64
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Build inside ARM64 Ubuntu Container
+        run: |
+          docker run --rm -v "${{ github.workspace }}:/workspace" -w /workspace arm64v8/ubuntu:22.04 bash -c '
+            set -e
+            apt-get update
+            apt-get install -y --no-install-recommends \
+              build-essential \
+              pkg-config \
+              libmpv-dev \
+              libwayland-dev \
+              libxkbcommon-dev \
+              libgl1-mesa-dev \
+              curl \
+              ca-certificates
+            curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+            source $HOME/.cargo/env
+            cargo build --release --bin mitub
+            VERSION="${GITHUB_REF_NAME:-v0.99.0}"
+            PKG_NAME="oxidetube-${VERSION}-linux-aarch64"
+            mkdir -p "${PKG_NAME}"
+            cp target/release/mitub "${PKG_NAME}/"
+            cp README.md "${PKG_NAME}/"
+            cp BUILD.md "${PKG_NAME}/"
+            cp ARCHITECTURE.md "${PKG_NAME}/"
+            tar -czvf "${PKG_NAME}.tar.gz" "${PKG_NAME}"
+          '
+          VERSION="${GITHUB_REF_NAME:-v0.99.0}"
+          echo "ASSET_TAR=oxidetube-${VERSION}-linux-aarch64.tar.gz" >> $GITHUB_ENV
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: oxidetube-linux-aarch64
+          path: ${{ env.ASSET_TAR }}
+
+  create-release:
+    name: Create GitHub Release
+    needs: [build-x86_64, build-aarch64]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+
+      - name: Publish Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            oxidetube-linux-x86_64/*.tar.gz
+            oxidetube-linux-aarch64/*.tar.gz
+          draft: false
+          prerelease: false
+          generate_release_notes: true

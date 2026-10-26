@@ -149,22 +149,21 @@ impl PowerManager {
         Ok(())
     }
 
-    /// Pins thread execution to Intel Core Ultra 7 155H Low-Power Island E-Cores (CPUs 20 and 21)
-    /// and invokes memory trims.
+    /// Pins thread execution to energy-efficient CPU cores and invokes memory trims.
     pub fn apply_battery_profile() {
-        println!("[PowerManager] Switching to BATTERY mode: Pinning to LP E-Cores (20, 21), codec priority AV1/VP9, trims active.");
+        println!("[PowerManager] Switching to BATTERY mode: Pinning to efficiency cores, codec priority AV1/VP9, trims active.");
         pin_to_lp_ecores();
         trim_process_memory();
     }
 
-    /// Restores thread execution to all available cores (0..21) on Meteor Lake.
+    /// Restores thread execution to all available CPU cores.
     pub fn apply_ac_profile() {
-        println!("[PowerManager] Switching to AC mode: Unpinning cores (0..21), enabling high-performance scheduler.");
+        println!("[PowerManager] Switching to AC mode: Unpinning cores, enabling high-performance scheduler.");
         unpin_all_cores();
     }
 }
 
-/// Safely pins background execution to power-efficient cores (LP E-Cores or standard E-Cores)
+/// Safely pins background execution to power-efficient cores
 /// based on dynamic topology detection.
 pub fn pin_to_lp_ecores() {
     unsafe {
@@ -172,12 +171,8 @@ pub fn pin_to_lp_ecores() {
         let mut set: libc::cpu_set_t = std::mem::zeroed();
         libc::CPU_ZERO(&mut set);
 
-        // On Meteor Lake 155H with 22 threads, cores 20 & 21 are LP E-Cores.
-        // On other topologies, pick the highest index efficiency cores.
-        if num_cpus >= 22 {
-            libc::CPU_SET(20, &mut set);
-            libc::CPU_SET(21, &mut set);
-        } else if num_cpus >= 8 {
+        // For multi-core systems, target the highest-index efficiency cores.
+        if num_cpus >= 8 {
             libc::CPU_SET(num_cpus - 2, &mut set);
             libc::CPU_SET(num_cpus - 1, &mut set);
         } else {
@@ -190,8 +185,8 @@ pub fn pin_to_lp_ecores() {
         let ret = libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set);
         if ret != 0 {
             if let Some(core_ids) = core_affinity::get_core_ids() {
-                if core_ids.len() > 20 {
-                    let _ = core_affinity::set_for_current(core_ids[20]);
+                if core_ids.len() >= 2 {
+                    let _ = core_affinity::set_for_current(core_ids[core_ids.len() - 1]);
                 }
             }
         }
@@ -213,6 +208,20 @@ pub fn unpin_all_cores() {
 
 extern "C" {
     fn mi_collect(force: bool);
+    fn mi_option_set(option: i32, value: isize);
+}
+
+/// Configures mimalloc to return freed memory pages to the OS kernel immediately
+/// instead of retaining large 32MB per-thread arenas indefinitely.
+pub fn configure_allocator_low_memory() {
+    unsafe {
+        // mi_option_page_reset = 3, mi_option_abandoned_page_purge = 4, mi_option_purge_delay = 15 (v2) / 6 (v1)
+        // Setting purge_delay to 0 forces immediate MADV_DONTNEED purging on freed segments.
+        mi_option_set(3, 1);
+        mi_option_set(4, 1);
+        mi_option_set(6, 0);
+        mi_option_set(15, 0);
+    }
 }
 
 /// Safely trims unused heap memory. Invokes mimalloc's mi_collect(true) to force

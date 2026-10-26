@@ -1,4 +1,4 @@
-use iced::widget::{container, svg, text};
+use iced::widget::{container, image, svg, text};
 use iced::{Element, Length};
 
 use crate::ui::theme::{COLOR_SURFACE_HOVER, COLOR_TEXT_PRIMARY};
@@ -23,20 +23,21 @@ pub fn icon_back<'a, Message: 'static>(size: f32) -> Element<'a, Message> {
     render_cached_svg(&HANDLE, SVG, size)
 }
 
-pub fn icon_youtube_logo<'a, Message: 'static>(size: f32, is_active: bool) -> Element<'a, Message> {
-    static RED_HANDLE: OnceLock<svg::Handle> = OnceLock::new();
-    static WHITE_HANDLE: OnceLock<svg::Handle> = OnceLock::new();
-    const SVG_RED: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 28 20"><rect x="1" y="1" width="26" height="18" rx="5" fill="#ff0000"/><polygon points="11,6 19,10 11,14" fill="#ffffff"/></svg>"##;
-    const SVG_WHITE: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 28 20"><rect x="1" y="1" width="26" height="18" rx="5" fill="#ffffff"/><polygon points="11,6 19,10 11,14" fill="#0f0f0f"/></svg>"##;
-    let handle = if is_active {
-        RED_HANDLE.get_or_init(|| svg::Handle::from_memory(SVG_RED))
-    } else {
-        WHITE_HANDLE.get_or_init(|| svg::Handle::from_memory(SVG_WHITE))
-    };
-    svg(handle.clone())
-        .width(Length::Fixed(size * 1.35))
+pub fn icon_app_logo<'a, Message: 'static>(size: f32) -> Element<'a, Message> {
+    static LOGO_HANDLE: OnceLock<image::Handle> = OnceLock::new();
+    let handle = LOGO_HANDLE.get_or_init(|| {
+        const ICON_BYTES: &[u8] = include_bytes!("../../assets/icon.png");
+        image::Handle::from_bytes(ICON_BYTES)
+    });
+    image(handle.clone())
+        .width(Length::Fixed(size))
         .height(Length::Fixed(size))
+        .content_fit(iced::ContentFit::Contain)
         .into()
+}
+
+pub fn icon_youtube_logo<'a, Message: 'static>(size: f32, _is_active: bool) -> Element<'a, Message> {
+    icon_app_logo(size)
 }
 
 pub fn icon_search<'a, Message: 'static>(size: f32) -> Element<'a, Message> {

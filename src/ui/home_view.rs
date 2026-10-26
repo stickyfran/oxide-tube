@@ -171,25 +171,9 @@ pub fn view_video_card<'a, Message: Clone + 'static>(
     .padding(0)
     .on_press(on_open_channel(chan_id));
 
-    let mut parts: Vec<&str> = Vec::new();
-    if !video.views_str.is_empty() {
-        parts.push(&video.views_str);
-    }
-    if !video.duration_str.is_empty() {
-        parts.push(&video.duration_str);
-    } else if !video.published_str.is_empty() {
-        parts.push(&video.published_str);
-    }
-
-    let meta_suffix = if parts.is_empty() {
-        String::new()
-    } else {
-        format!(" • {}", parts.join(" • "))
-    };
-
     let meta_row = row![
         channel_btn,
-        text(meta_suffix)
+        text(&video.meta_suffix)
             .size(11)
             .color(secondary_color),
     ]
@@ -311,9 +295,11 @@ pub fn view_home_grid<'a, Message: Clone + 'static>(
     blurred_cache: &'a HashMap<String, image::Handle>,
     blur_amount: f32,
     window_width: f32,
+    is_loading_more: bool,
     on_open_video: impl Fn(String) -> Message + Copy + 'static,
     on_open_video_new_tab: impl Fn(String) -> Message + Copy + 'static,
     on_open_channel: impl Fn(String) -> Message + Copy + 'static,
+    on_scroll: impl Fn(iced::widget::scrollable::Viewport) -> Message + 'static,
 ) -> Element<'a, Message> {
     let chunk_size = if window_width < 700.0 {
         1
@@ -364,6 +350,13 @@ pub fn view_home_grid<'a, Message: Clone + 'static>(
             }
             grid = grid.push(row_cards);
         }
+        if is_loading_more {
+            let mut skeleton_row = row![].spacing(20).width(Length::Fill);
+            for _ in 0..chunk_size {
+                skeleton_row = skeleton_row.push(view_skeleton_card());
+            }
+            grid = grid.push(skeleton_row);
+        }
     }
 
     container(
@@ -372,10 +365,12 @@ pub fn view_home_grid<'a, Message: Clone + 'static>(
                 .padding([20, 24])
                 .width(Length::Fill),
         )
+        .on_scroll(on_scroll)
         .height(Length::Fill),
     )
     .width(Length::Fill)
     .height(Length::Fill)
+    .clip(true)
     .style(main_container)
     .into()
 }

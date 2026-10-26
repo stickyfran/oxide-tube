@@ -1,4 +1,5 @@
 use crate::auth::AuthSession;
+use crate::ui::watch_view::{extract_timestamps, extract_unique_urls};
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, COOKIE, ORIGIN, USER_AGENT};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -25,6 +26,7 @@ pub struct VideoCard {
     pub duration_str: String,
     pub thumbnail_url: String,
     pub is_live: bool,
+    pub meta_suffix: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -94,6 +96,10 @@ pub struct CommentItem {
     pub text: String,
     pub published_time: String,
     pub likes_count: String,
+    #[serde(default)]
+    pub parsed_urls: Vec<String>,
+    #[serde(default)]
+    pub parsed_timestamps: Vec<(String, u64)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -111,7 +117,13 @@ pub struct WatchDetails {
     pub channel_avatar: String,
     pub subscriber_count: String,
     pub likes_str: String,
+    #[serde(default)]
+    pub dislikes_str: String,
     pub description: String,
+    #[serde(default)]
+    pub published_date: String,
+    #[serde(default)]
+    pub views_str: String,
     pub is_live: bool,
     pub is_subscribed: bool,
     pub like_status: String, // "LIKE", "DISLIKE", or "INDIFFERENT"
@@ -123,6 +135,10 @@ pub struct WatchDetails {
     pub caption_tracks: Vec<CaptionTrack>,
     #[serde(default)]
     pub chapters: Vec<VideoChapter>,
+    #[serde(default)]
+    pub parsed_desc_urls: Vec<String>,
+    #[serde(default)]
+    pub parsed_desc_timestamps: Vec<(String, u64)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -149,7 +165,8 @@ pub struct InnerTubeClient {
     session: Arc<RwLock<AuthSession>>,
     visitor_data: Arc<RwLock<String>>,
     bot_detected: Arc<AtomicBool>,
-    watch_cache: Arc<RwLock<HashMap<String, (Instant, WatchDetails)>>>,
+    watch_cache: Arc<RwLock<HashMap<String, (Instant, Arc<WatchDetails>)>>>,
+    feed_continuation: Arc<RwLock<Option<(String, String)>>>,
 }
 
 impl InnerTubeClient {
@@ -176,6 +193,7 @@ impl InnerTubeClient {
             visitor_data: Arc::new(RwLock::new(initial_vd)),
             bot_detected: Arc::new(AtomicBool::new(false)),
             watch_cache: Arc::new(RwLock::new(HashMap::new())),
+            feed_continuation: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -211,10 +229,10 @@ impl InnerTubeClient {
 
     async fn resp_simd_json(resp: reqwest::Response) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
         let bytes = resp.bytes().await?;
-        let mut buf = bytes.to_vec();
+        let mut buf = Vec::from(bytes);
         match simd_json::serde::from_slice::<Value>(&mut buf) {
             Ok(v) => Ok(v),
-            Err(_) => Ok(serde_json::from_slice::<Value>(&bytes)?),
+            Err(_) => Ok(serde_json::from_slice::<Value>(&buf)?),
         }
     }
 
@@ -540,13 +558,33 @@ impl InnerTubeClient {
                 .and_then(|tv| tv.get("image"))
                 .and_then(|img| img.get("sources"))
                 .and_then(|arr| arr.as_array())
-                .and_then(|arr| arr.last())
+                .and_then(|arr| {
+                    arr.iter()
+                        .filter(|item| item.get("width").and_then(|w| w.as_u64()).map(|w| w <= 480).unwrap_or(false))
+                        .last()
+                        .or_else(|| arr.last())
+                })
                 .and_then(|src| src.get("url"))
                 .and_then(|s| s.as_str())
                 .unwrap_or("")
                 .to_string();
 
             let is_live = duration_str.to_lowercase().contains("en vivo") || duration_str.to_lowercase().contains("live");
+
+            let mut parts: Vec<&str> = Vec::with_capacity(2);
+            if !views_str.is_empty() {
+                parts.push(&views_str);
+            }
+            if !published_str.is_empty() {
+                parts.push(&published_str);
+            } else if !duration_str.is_empty() {
+                parts.push(&duration_str);
+            }
+            let meta_suffix = if parts.is_empty() {
+                String::new()
+            } else {
+                format!(" • {}", parts.join(" • "))
+            };
 
             return Some(VideoCard {
                 video_id,
@@ -559,6 +597,7 @@ impl InnerTubeClient {
                 duration_str,
                 thumbnail_url,
                 is_live,
+                meta_suffix,
             });
         }
 
@@ -614,7 +653,13 @@ impl InnerTubeClient {
             .and_then(|t| t.get("thumbnail"))
             .and_then(|th| th.get("thumbnails"))
             .and_then(|arr| arr.as_array())
-            .and_then(|arr| arr.last())
+            .and_then(|arr| {
+                // Prefer avatar size around 68-88px over 176+px to save download bandwidth & RAM
+                arr.iter()
+                    .filter(|item| item.get("width").and_then(|w| w.as_u64()).map(|w| w <= 100).unwrap_or(false))
+                    .last()
+                    .or_else(|| arr.first())
+            })
             .and_then(|t| t.get("url"))
             .and_then(|u| u.as_str())
             .unwrap_or("")
@@ -654,7 +699,13 @@ impl InnerTubeClient {
         let thumbnail_url = renderer.get("thumbnail")
             .and_then(|th| th.get("thumbnails"))
             .and_then(|arr| arr.as_array())
-            .and_then(|arr| arr.last())
+            .and_then(|arr| {
+                // Select a thumbnail <= 480px width (e.g. hqdefault/mqdefault) instead of maxresdefault (1280x720)
+                arr.iter()
+                    .filter(|item| item.get("width").and_then(|w| w.as_u64()).map(|w| w <= 480).unwrap_or(false))
+                    .last()
+                    .or_else(|| arr.last())
+            })
             .and_then(|t| t.get("url"))
             .and_then(|u| u.as_str())
             .unwrap_or("")
@@ -673,6 +724,21 @@ impl InnerTubeClient {
             })
             .unwrap_or(false);
 
+        let mut parts: Vec<&str> = Vec::with_capacity(2);
+        if !views_str.is_empty() {
+            parts.push(&views_str);
+        }
+        if !published_str.is_empty() {
+            parts.push(&published_str);
+        } else if !duration_str.is_empty() {
+            parts.push(&duration_str);
+        }
+        let meta_suffix = if parts.is_empty() {
+            String::new()
+        } else {
+            format!(" • {}", parts.join(" • "))
+        };
+
         Some(VideoCard {
             video_id,
             title,
@@ -684,6 +750,7 @@ impl InnerTubeClient {
             duration_str,
             thumbnail_url,
             is_live,
+            meta_suffix,
         })
     }
 
@@ -719,6 +786,7 @@ impl InnerTubeClient {
         let has_auth = self.session.read().await.is_authenticated();
 
         let mut videos = Vec::new();
+        let mut next_token: Option<String> = None;
 
         if has_auth {
             let body = serde_json::json!({
@@ -734,6 +802,7 @@ impl InnerTubeClient {
                         if let Ok(json_val) = Self::resp_simd_json(resp).await {
                             self.capture_visitor_data(&json_val).await;
                             Self::collect_video_cards(&json_val, &mut videos);
+                            next_token = Self::extract_feed_continuation_token(&json_val);
                         }
                     }
                 }
@@ -756,6 +825,7 @@ impl InnerTubeClient {
                     if let Ok(val) = Self::resp_simd_json(r).await {
                         self.capture_visitor_data(&val).await;
                         Self::collect_video_cards(&val, &mut videos);
+                        next_token = Self::extract_feed_continuation_token(&val);
                     }
                 }
             }
@@ -764,9 +834,11 @@ impl InnerTubeClient {
         // Secondary fallback to popular search if trending also returned nothing
         if videos.is_empty() {
             if let Ok(fallback_search) = self.search("tendencias").await {
-                videos = fallback_search;
+                return Ok(fallback_search);
             }
         }
+
+        *self.feed_continuation.write().await = next_token.map(|t| ("browse".to_string(), t));
 
         Ok(videos)
     }
@@ -779,6 +851,7 @@ impl InnerTubeClient {
         });
 
         let mut videos = Vec::new();
+        let mut next_token: Option<String> = None;
         for attempt in 0..2 {
             let headers = self.build_headers().await;
             let resp = self.client.post(&url).headers(headers).json(&body).send().await?;
@@ -786,11 +859,14 @@ impl InnerTubeClient {
             let json_val: Value = Self::resp_simd_json(resp).await?;
             self.capture_visitor_data(&json_val).await;
             Self::collect_video_cards(&json_val, &mut videos);
+            next_token = Self::extract_feed_continuation_token(&json_val);
 
             if !videos.is_empty() || attempt == 1 || !self.try_refresh_firefox_session().await {
                 break;
             }
         }
+
+        *self.feed_continuation.write().await = next_token.map(|t| ("browse".to_string(), t));
 
         Ok(videos)
     }
@@ -841,6 +917,7 @@ impl InnerTubeClient {
         });
 
         let mut videos = Vec::new();
+        let mut next_token: Option<String> = None;
         for attempt in 0..2 {
             let headers = self.build_headers().await;
             let resp = self.client.post(&url).headers(headers).json(&body).send().await?;
@@ -848,11 +925,14 @@ impl InnerTubeClient {
             let json_val: Value = Self::resp_simd_json(resp).await?;
             self.capture_visitor_data(&json_val).await;
             Self::collect_video_cards(&json_val, &mut videos);
+            next_token = Self::extract_feed_continuation_token(&json_val);
 
             if !videos.is_empty() || attempt == 1 || !self.try_refresh_firefox_session().await {
                 break;
             }
         }
+
+        *self.feed_continuation.write().await = next_token.map(|t| ("browse".to_string(), t));
 
         Ok(videos)
     }
@@ -1102,8 +1182,83 @@ impl InnerTubeClient {
         self.capture_visitor_data(&json_val).await;
         let mut results = Vec::new();
         Self::collect_video_cards(&json_val, &mut results);
+        let next_token = Self::extract_feed_continuation_token(&json_val);
+        *self.feed_continuation.write().await = next_token.map(|t| ("search".to_string(), t));
 
         Ok(results)
+    }
+
+    /// Extracts the last continuation token from a feed/search response
+    fn extract_feed_continuation_token(val: &Value) -> Option<String> {
+        let mut last_token = None;
+        Self::collect_continuation_tokens_recursive(val, &mut last_token);
+        last_token
+    }
+
+    fn collect_continuation_tokens_recursive(val: &Value, out: &mut Option<String>) {
+        if Self::is_shorts_object(val) {
+            return;
+        }
+        if let Some(obj) = val.as_object() {
+            if let Some(cir) = obj.get("continuationItemRenderer") {
+                if let Some(tok) = cir
+                    .get("continuationEndpoint")
+                    .and_then(|ep| ep.get("continuationCommand"))
+                    .and_then(|cmd| cmd.get("token"))
+                    .and_then(|t| t.as_str())
+                {
+                    if !tok.is_empty() {
+                        *out = Some(tok.to_string());
+                    }
+                }
+            }
+            if let Some(ncd) = obj.get("nextContinuationData") {
+                if let Some(tok) = ncd.get("continuation").and_then(|t| t.as_str()) {
+                    if !tok.is_empty() {
+                        *out = Some(tok.to_string());
+                    }
+                }
+            }
+            for (_, v) in obj {
+                Self::collect_continuation_tokens_recursive(v, out);
+            }
+        } else if let Some(arr) = val.as_array() {
+            for item in arr {
+                Self::collect_continuation_tokens_recursive(item, out);
+            }
+        }
+    }
+
+    pub async fn has_feed_continuation(&self) -> bool {
+        self.feed_continuation.read().await.is_some()
+    }
+
+    /// Fetches the next batch of videos for infinite scrolling in Home/Subscriptions/History/Search
+    pub async fn fetch_more_feed(&self) -> Result<Vec<VideoCard>, Box<dyn std::error::Error + Send + Sync>> {
+        let current = self.feed_continuation.read().await.clone();
+        let Some((endpoint, token)) = current else {
+            return Ok(Vec::new());
+        };
+
+        let url = format!("{YOUTUBE_ORIGIN}/youtubei/v1/{endpoint}?prettyPrint=false");
+        let headers = self.build_headers().await;
+        let body = serde_json::json!({
+            "context": Self::innertube_context(),
+            "continuation": token
+        });
+
+        let resp = self.client.post(&url).headers(headers).json(&body).send().await?;
+        self.capture_set_cookies(resp.headers()).await;
+        let json_val: Value = Self::resp_simd_json(resp).await?;
+        self.capture_visitor_data(&json_val).await;
+
+        let mut videos = Vec::new();
+        Self::collect_video_cards(&json_val, &mut videos);
+        let next_token = Self::extract_feed_continuation_token(&json_val);
+
+        *self.feed_continuation.write().await = next_token.map(|t| (endpoint, t));
+
+        Ok(videos)
     }
 
     pub async fn invalidate_watch_cache(&self, video_id: &str) {
@@ -1111,12 +1266,12 @@ impl InnerTubeClient {
     }
 
     /// Fetches player streams, adaptive formats, captions, and details for a video
-    pub async fn get_watch_details(&self, video_id: &str) -> Result<WatchDetails, Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn get_watch_details(&self, video_id: &str) -> Result<Arc<WatchDetails>, Box<dyn std::error::Error + Send + Sync>> {
         {
             let cache = self.watch_cache.read().await;
             if let Some((inserted, details)) = cache.get(video_id) {
                 if !details.is_live && inserted.elapsed() < Duration::from_secs(3600) && !details.video_streams.is_empty() {
-                    return Ok(details.clone());
+                    return Ok(Arc::clone(details));
                 }
             }
         }
@@ -1124,6 +1279,37 @@ impl InnerTubeClient {
         let headers = self.build_headers().await;
         let visitor_data = self.visitor_data.read().await.clone();
         let is_bot = self.bot_detected.load(Ordering::Relaxed);
+
+        // Fetch dislikes (and fallback likes count) concurrently in background with a tight timeout
+        let ryd_client = self.client.clone();
+        let ryd_vid = video_id.to_string();
+        let ryd_handle = tokio::spawn(async move {
+            let ryd_url = format!("https://returnyoutubedislikeapi.com/votes?videoId={ryd_vid}");
+            if let Ok(Ok(ryd_resp)) = tokio::time::timeout(
+                Duration::from_millis(1000),
+                ryd_client.get(&ryd_url).header(USER_AGENT, USER_AGENT_STR).send(),
+            )
+            .await
+            {
+                if ryd_resp.status().is_success() {
+                    if let Ok(ryd_json) = Self::resp_simd_json(ryd_resp).await {
+                        let d_str = ryd_json
+                            .get("dislikes")
+                            .and_then(|v| v.as_u64())
+                            .map(Self::format_compact_count)
+                            .unwrap_or_default();
+                        let l_str = ryd_json
+                            .get("likes")
+                            .and_then(|v| v.as_u64())
+                            .filter(|&l| l > 0)
+                            .map(Self::format_compact_count)
+                            .unwrap_or_default();
+                        return (d_str, l_str);
+                    }
+                }
+            }
+            (String::new(), String::new())
+        });
 
         let next_url = format!("{YOUTUBE_ORIGIN}/youtubei/v1/next?prettyPrint=false");
         let next_body = serde_json::json!({
@@ -1494,8 +1680,15 @@ impl InnerTubeClient {
         }
 
         // Extract Title, Channel, Likes, Description from next_json & player_json
-        let (title, channel_name, channel_id, channel_avatar, subscriber_count, likes_str, description, is_live, is_subscribed, like_status) =
+        let (title, channel_name, channel_id, channel_avatar, subscriber_count, mut likes_str, description, is_live, is_subscribed, like_status, published_date, views_str) =
             Self::parse_video_metadata(&next_json, &player_json);
+
+        // Await the concurrent dislikes/likes lookup started earlier
+        let (ryd_dislikes, ryd_likes) = ryd_handle.await.unwrap_or_default();
+        let dislikes_str = ryd_dislikes;
+        if (likes_str.is_empty() || likes_str == "Me gusta") && !ryd_likes.is_empty() {
+            likes_str = ryd_likes;
+        }
 
         // Extract Live Chat continuation token
         let live_chat_continuation = next_json
@@ -1521,11 +1714,16 @@ impl InnerTubeClient {
             Self::collect_video_cards(secondary, &mut recommended_videos);
         }
 
-        // Extract top comments (try direct first, fallback to continuation token)
+        // Extract top comments (try direct first, fallback to continuation token with timeout)
         let mut comments = Self::parse_comments(&next_json);
         if comments.is_empty() {
             if let Some(token) = Self::extract_comment_continuation(&next_json) {
-                if let Ok(fetched) = self.get_comments_by_continuation(&token).await {
+                if let Ok(Ok(fetched)) = tokio::time::timeout(
+                    Duration::from_millis(750),
+                    self.get_comments_by_continuation(&token),
+                )
+                .await
+                {
                     comments = fetched;
                 }
             }
@@ -1542,20 +1740,10 @@ impl InnerTubeClient {
             }
         }
 
-        // On-demand probe initRange & indexRange for MP4 streams if not already provided
-        for s in video_streams.iter_mut() {
-            if s.mime_type == "video/mp4" && s.init_range.is_none() {
-                s.ensure_ranges(&self.client).await;
-            }
-        }
-        for s in audio_streams.iter_mut() {
-            if s.mime_type == "audio/mp4" && s.init_range.is_none() {
-                s.ensure_ranges(&self.client).await;
-                break;
-            }
-        }
+        let parsed_desc_urls = extract_unique_urls(&description);
+        let parsed_desc_timestamps = extract_timestamps(&description);
 
-        let details = WatchDetails {
+        let details = Arc::new(WatchDetails {
             video_id: video_id.to_string(),
             title,
             channel_name,
@@ -1563,7 +1751,10 @@ impl InnerTubeClient {
             channel_avatar,
             subscriber_count,
             likes_str,
+            dislikes_str,
             description,
+            published_date,
+            views_str,
             is_live,
             is_subscribed,
             like_status,
@@ -1574,12 +1765,18 @@ impl InnerTubeClient {
             audio_streams,
             caption_tracks,
             chapters,
-        };
+            parsed_desc_urls,
+            parsed_desc_timestamps,
+        });
 
         if !details.is_live {
-            self.watch_cache.write().await.insert(video_id.to_string(), (Instant::now(), details.clone()));
+            self.watch_cache.write().await.insert(video_id.to_string(), (Instant::now(), Arc::clone(&details)));
         }
         Ok(details)
+    }
+
+    pub fn find_ytdlp_binary_pub() -> std::path::PathBuf {
+        Self::find_ytdlp_binary()
     }
 
     fn find_ytdlp_binary() -> std::path::PathBuf {
@@ -2120,7 +2317,7 @@ impl InnerTubeClient {
         Ok(cues)
     }
 
-    fn parse_video_metadata(next_json: &Value, player_json: &Value) -> (String, String, String, String, String, String, String, bool, bool, String) {
+    fn parse_video_metadata(next_json: &Value, player_json: &Value) -> (String, String, String, String, String, String, String, bool, bool, String, String, String) {
         let video_details = player_json.get("videoDetails");
 
         let mut title = video_details
@@ -2155,6 +2352,8 @@ impl InnerTubeClient {
         let mut avatar = String::new();
         let mut subs = String::new();
         let mut likes = "Me gusta".to_string();
+        let mut published_date = String::new();
+        let mut views_str = String::new();
 
         let mut is_subscribed = false;
         let mut like_status = "INDIFFERENT".to_string();
@@ -2170,6 +2369,15 @@ impl InnerTubeClient {
         {
             for item in results {
                 if let Some(primary) = item.get("videoPrimaryInfoRenderer") {
+                    if let Some(dt) = primary.get("dateText").and_then(|d| d.get("simpleText")).and_then(|s| s.as_str()) {
+                        published_date = dt.to_string();
+                    }
+                    if let Some(vc) = primary.get("viewCount").and_then(|v| v.get("videoViewCountRenderer")).and_then(|r| r.get("viewCount")).and_then(|v| v.get("simpleText")).and_then(|s| s.as_str()) {
+                        views_str = vc.to_string();
+                    } else if let Some(vc) = primary.get("viewCount").and_then(|v| v.get("videoViewCountRenderer")).and_then(|r| r.get("shortViewCount")).and_then(|v| v.get("simpleText")).and_then(|s| s.as_str()) {
+                        views_str = vc.to_string();
+                    }
+
                     if title.is_empty() {
                         if let Some(runs) = primary.get("title").and_then(|t| t.get("runs")).and_then(|r| r.as_array()) {
                             let joined: String = runs
@@ -2183,37 +2391,7 @@ impl InnerTubeClient {
                     }
 
                     // Try to find like button text & likeStatus
-                    let primary_str = primary.to_string();
-                    if primary_str.contains("\"likeStatus\":\"LIKE\"") {
-                        like_status = "LIKE".to_string();
-                    } else if primary_str.contains("\"likeStatus\":\"DISLIKE\"") {
-                        like_status = "DISLIKE".to_string();
-                    }
-
-                    if let Some(actions) = primary.get("videoActions") {
-                        let act_str = actions.to_string();
-                        if let Some(pos) = act_str.find("\"defaultText\":{\"simpleText\":\"") {
-                            let sub = &act_str[pos + 29..];
-                            if let Some(end) = sub.find('"') {
-                                let val = &sub[..end];
-                                if !val.is_empty() && val != "dis" && !val.starts_with("dis") {
-                                    likes = val.to_string();
-                                }
-                            }
-                        }
-                        if likes.is_empty() || likes == "dis" {
-                            if let Some(pos) = act_str.find("\"accessibilityData\":{\"label\":\"") {
-                                let sub = &act_str[pos + 30..];
-                                if let Some(end) = sub.find('"') {
-                                    let label = &sub[..end];
-                                    let first_token = label.split_whitespace().next().unwrap_or("");
-                                    if !first_token.is_empty() && first_token.chars().any(|c| c.is_numeric()) {
-                                        likes = first_token.to_string();
-                                    }
-                                }
-                            }
-                        }
-                    }
+                    Self::extract_likes_and_status_recursive(primary, &mut likes, &mut like_status);
                     if likes.is_empty() || likes == "dis" || likes == "dislike" {
                         likes = "Me gusta".to_string();
                     }
@@ -2298,7 +2476,104 @@ impl InnerTubeClient {
             channel_name = "Canal de YouTube".to_string();
         }
 
-        (title, channel_name, channel_id, avatar, subs, likes, description, is_live, is_subscribed, like_status)
+        // Also check modern frameworkUpdates for likeStatusEntity if not found in primary
+        if like_status == "INDIFFERENT" || likes == "Me gusta" {
+            if let Some(fw) = next_json.get("frameworkUpdates") {
+                Self::extract_likes_and_status_recursive(fw, &mut likes, &mut like_status);
+            }
+        }
+
+        (title, channel_name, channel_id, avatar, subs, likes, description, is_live, is_subscribed, like_status, published_date, views_str)
+    }
+
+    pub fn format_compact_count(count: u64) -> String {
+        if count >= 1_000_000 {
+            let m = count as f64 / 1_000_000.0;
+            if m >= 10.0 {
+                format!("{:.0} M", m)
+            } else {
+                format!("{:.1} M", m).replace(".0 ", " ")
+            }
+        } else if count >= 1_000 {
+            let k = count as f64 / 1_000.0;
+            if k >= 10.0 {
+                format!("{:.0} K", k)
+            } else {
+                format!("{:.1} K", k).replace(".0 ", " ")
+            }
+        } else {
+            count.to_string()
+        }
+    }
+
+    fn extract_likes_and_status_recursive(val: &Value, likes: &mut String, like_status: &mut String) {
+        if let Some(obj) = val.as_object() {
+            if let Some(st) = obj.get("likeStatus").and_then(|s| s.as_str()) {
+                if st == "LIKE" || st == "DISLIKE" {
+                    *like_status = st.to_string();
+                }
+            }
+            if let Some(lvm) = obj.get("likeButtonViewModel") {
+                if let Some(st) = lvm
+                    .get("likeStatusEntity")
+                    .and_then(|e| e.get("likeStatus"))
+                    .and_then(|s| s.as_str())
+                {
+                    if st == "LIKE" || st == "DISLIKE" {
+                        *like_status = st.to_string();
+                    }
+                }
+                let title_opt = lvm
+                    .get("toggleButtonViewModel")
+                    .and_then(|t| t.get("toggleButtonViewModel").or(Some(t)))
+                    .and_then(|t| t.get("defaultButtonViewModel"))
+                    .and_then(|d| d.get("buttonViewModel"))
+                    .and_then(|b| b.get("title"))
+                    .and_then(|s| s.as_str());
+                if let Some(t_str) = title_opt {
+                    let clean = t_str.trim();
+                    if !clean.is_empty() && clean.chars().any(|c| c.is_ascii_digit()) {
+                        *likes = clean.to_string();
+                    }
+                }
+                if likes.is_empty() || *likes == "Me gusta" {
+                    let acc_opt = lvm
+                        .get("toggleButtonViewModel")
+                        .and_then(|t| t.get("toggleButtonViewModel").or(Some(t)))
+                        .and_then(|t| t.get("defaultButtonViewModel"))
+                        .and_then(|d| d.get("buttonViewModel"))
+                        .and_then(|b| b.get("accessibilityText"))
+                        .and_then(|s| s.as_str());
+                    if let Some(acc) = acc_opt {
+                        for tok in acc.split_whitespace() {
+                            if tok.chars().any(|c| c.is_ascii_digit()) {
+                                *likes = tok.trim_matches(&[',', '.'][..]).to_string();
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            if (likes.is_empty() || *likes == "Me gusta") && obj.contains_key("defaultText") {
+                if let Some(dt) = obj
+                    .get("defaultText")
+                    .and_then(|d| d.get("simpleText"))
+                    .and_then(|s| s.as_str())
+                {
+                    let clean = dt.trim();
+                    if !clean.is_empty() && clean.chars().any(|c| c.is_ascii_digit()) {
+                        *likes = clean.to_string();
+                    }
+                }
+            }
+            for (_, v) in obj {
+                Self::extract_likes_and_status_recursive(v, likes, like_status);
+            }
+        } else if let Some(arr) = val.as_array() {
+            for item in arr {
+                Self::extract_likes_and_status_recursive(item, likes, like_status);
+            }
+        }
     }
 
     fn parse_comments(next_json: &Value) -> Vec<CommentItem> {
@@ -2360,12 +2635,16 @@ impl InnerTubeClient {
                                         .unwrap_or("0")
                                         .to_string();
 
+                                    let parsed_urls = extract_unique_urls(&text);
+                                    let parsed_timestamps = extract_timestamps(&text);
                                     comments.push(CommentItem {
                                         author,
                                         author_avatar,
                                         text,
                                         published_time,
                                         likes_count,
+                                        parsed_urls,
+                                        parsed_timestamps,
                                     });
                                 }
                             }
@@ -2497,12 +2776,16 @@ impl InnerTubeClient {
                             .to_string();
 
                         if !text.is_empty() {
+                            let parsed_urls = extract_unique_urls(&text);
+                            let parsed_timestamps = extract_timestamps(&text);
                             comments.push(CommentItem {
                                 author,
                                 author_avatar,
                                 text,
                                 published_time,
                                 likes_count: String::new(),
+                                parsed_urls,
+                                parsed_timestamps,
                             });
                         }
                     }
@@ -2528,7 +2811,9 @@ impl InnerTubeClient {
                                     }).unwrap_or_default();
                                     let published_time = renderer.get("publishedTimeText").and_then(|p| p.get("runs")).and_then(|a| a.as_array()).and_then(|a| a.first()).and_then(|f| f.get("text")).and_then(|s| s.as_str()).unwrap_or("").to_string();
                                     let likes_count = renderer.get("voteCount").and_then(|v| v.get("simpleText")).and_then(|s| s.as_str()).unwrap_or("0").to_string();
-                                    comments.push(CommentItem { author, author_avatar, text, published_time, likes_count });
+                                    let parsed_urls = extract_unique_urls(&text);
+                                    let parsed_timestamps = extract_timestamps(&text);
+                                    comments.push(CommentItem { author, author_avatar, text, published_time, likes_count, parsed_urls, parsed_timestamps });
                                 }
                             }
                         }

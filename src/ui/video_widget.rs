@@ -184,6 +184,7 @@ impl shader::Primitive for VideoPrimitive {
             video_pipe.texture = Some(tex);
             video_pipe.bind_group = Some(bg);
             video_pipe.current_size = (self.frame.width, self.frame.height);
+            video_pipe.uploaded_frame_id = 0;
         }
 
         // 2. Upload frame data to the persistent texture ONLY if it's a new frame

@@ -1,85 +1,84 @@
-# Guia de Compilacion e Instalacion de Mitub
+# Guía de Compilación e Instalación - OxideTube (Mitub)
 
-Este documento describe los requisitos previos, las herramientas de desarrollo y los pasos necesarios para compilar, probar e instalar Mitub en sistemas operativos compatibles.
+Este documento detalla los requisitos del sistema y el proceso de construcción de OxideTube.
 
 ---
 
-## Requisitos de Compilacion
+## 1. Requisitos Previos
 
-### 1. Toolchain de Rust
-Se requiere Rust 1.80 o superior con Cargo:
+Se requiere el toolchain oficial de Rust (versión 1.80 o superior):
+
 ```bash
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 rustup default stable
 ```
 
-### 2. Dependencias del Sistema
+---
 
-#### En distribuciones basadas en Arch Linux / Manjaro:
+## 2. Dependencias del Sistema
+
+### Arch Linux / Manjaro
 ```bash
 sudo pacman -S --needed base-devel git mpv wayland libxkbcommon mesa vulkan-intel vulkan-radeon wl-clipboard
 ```
 
-#### En distribuciones basadas en Debian / Ubuntu:
+### Debian / Ubuntu (22.04, 24.04+)
 ```bash
 sudo apt update
 sudo apt install -y build-essential pkg-config libmpv-dev libwayland-dev libxkbcommon-dev mesa-va-drivers wl-clipboard
 ```
 
-#### En distribuciones basadas en Fedora:
+### Fedora (39, 40+)
 ```bash
 sudo dnf install -y gcc gcc-c++ mpv-libs-devel wayland-devel libxkbcommon-devel mesa-va-drivers wl-clipboard
 ```
 
 ---
 
-## Proceso de Compilacion
+## 3. Compilación
 
-### Compilacion en Modo Debug
-Para desarrollo y depuracion rapida:
+### Modo Debug (desarrollo rápido)
 ```bash
 cargo build
 ```
 
-### Compilacion en Modo Release Optimizada
-El perfil release en Cargo.toml incluye Link-Time Optimization (LTO thin), optimizacion de nivel 3 (opt-level 3), strip de simbolos y eliminacion de desempaquetado de panicos para maxima eficiencia y menor huella binaria:
+### Modo Release (máxima optimización)
+El perfil release utiliza LTO delgado (`lto = "thin"`), optimización nivel 3 (`opt-level = 3`), despojo de símbolos de depuración (`strip = true`) y un único codegen unit para máxima velocidad y mínima huella binaria:
+
 ```bash
 cargo build --release
 ```
 
-El binario ejecutable compilado se ubicara en:
+El binario ejecutable compilado se genera en:
 `target/release/mitub`
 
 ---
 
-## Verificacion y Pruebas
+## 4. Instalación
 
-Para ejecutar el analizador de sintaxis y la suite de pruebas unitarias:
-```bash
-cargo check
-cargo test
-```
-
----
-
-## Instalacion en el Sistema
-
-### Instalacion Local para el Usuario Actual
-Para instalar el binario en la ruta estandar de binarios del usuario (`~/.local/bin`):
+### En el directorio del usuario (`~/.local/bin`)
 ```bash
 install -m 755 target/release/mitub ~/.local/bin/mitub
 ```
 
-Asegurate de que `~/.local/bin` este presente en tu variable de entorno PATH (`export PATH="$HOME/.local/bin:$PATH"`).
+Asegúrate de que `~/.local/bin` esté incluido en tu variable de entorno `PATH`:
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+```
 
-### Instalacion Global para Todo el Sistema
+### Instalación en todo el sistema (`/usr/local/bin`)
 ```bash
 sudo install -m 755 target/release/mitub /usr/local/bin/mitub
 ```
 
 ---
 
-## Variables de Entorno Utiles
+## 5. Pruebas y Validación
 
-- RUST_LOG: Permite ajustar el nivel de diagnostico (ej. `RUST_LOG=mitub=debug`).
-- WAYLAND_DISPLAY: Utilizado por libwayland-client e iced para detectar el compositor activo (ej. `wayland-0`).
+```bash
+# Comprobación de sintaxis y tipos
+cargo check --release
+
+# Ejecución de tests unitarios
+cargo test --release
+```

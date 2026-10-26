@@ -1,71 +1,91 @@
-# Mitub
+# OxideTube (Mitub)
 
-Mitub es un cliente de escritorio nativo, ligero y de alto rendimiento para YouTube, desarrollado en Rust con una interfaz gráfica basada en iced y un motor de renderizado de video acelerado por hardware basado en libmpv.
+<p align="center">
+  <strong>Cliente nativo de YouTube en 100% Rust, ultraligero y de alto rendimiento.</strong><br>
+  Sin Electron. Sin Chromium embebido. Sin sobrecarga de runtime web.
+</p>
 
-Disenado para ofrecer un consumo minimo de recursos (CPU y memoria RAM), arranque instantaneo, soporte completo de Wayland, reproduccion multiventana Picture-in-Picture (PiP), gestion de pestanas inteligentes con precarga y sincronizacion de sesiones con navegadores locales.
-
----
-
-## Caracteristicas Principales
-
-- Motor Multimedia Nativo libmpv: Reproduccion fluida de video y audio desacoplados (DASH) mediante libmpv con decodificacion acelerada por hardware (Intel VA-API / QuickSync, NVIDIA NVDEC, AMD VAAPI).
-- Interfaz Grafica Nativa en Rust (iced 0.13): Diseno moderno, minimalista y responsivo sin el sobrecosto de un runtime web o Electron.
-- Sistema de Pestanas Inteligentes: Navegacion multi-pestana inspirada en navegadores web. Permite abrir videos con click medio o boton secundario, con desplazamiento bidireccional y restauracion de hasta 5 pestanas cerradas recientemente (Ctrl+Shift+T).
-- Modo Picture-in-Picture (PiP): Miniventana flotante siempre visible (KWin rules integradas), con boton de cierre y reacoplamiento integrado directamente sobre el video.
-- Sincronizacion de Cuenta Multiplataforma: Inicio y cierre de sesion con importacion automatica de cookies desde Firefox y navegadores basados en Chromium (Google Chrome, Chromium, Brave, Microsoft Edge, Vivaldi) en Linux, Windows y macOS.
-- Control de Calidad y Codec Flexible: Selector de resolucion con indicador predeterminado directamente desde el reproductor OSD, soporte para AV1, VP9 y H.264 con cascada de fallback automatico.
-- Gestion Inteligente de Cache: Almacenamiento local configurable con limite ajustable (1 GB, 2 GB, 5 GB, 10 GB, 20 GB o Ilimitado) y desalojo automatico LRU para evitar saturacion de disco.
-- Optimizacion de Memoria RAM: Politica activa de liberacion de memoria en background para instancias mpv inactivas y reciclaje de texturas de video.
-- Integracion de Sistema: Inhibicion automatica del protector de pantalla via D-Bus org.freedesktop.ScreenSaver durante la reproduccion.
+<p align="center">
+  <img src="https://img.shields.io/badge/version-v0.99.0-red.svg" alt="Versión">
+  <img src="https://img.shields.io/badge/language-Rust-orange.svg" alt="Lenguaje Rust">
+  <img src="https://img.shields.io/badge/gui-iced%200.13-blue.svg" alt="Iced GUI">
+  <img src="https://img.shields.io/badge/video-libmpv-darkgreen.svg" alt="libmpv">
+  <img src="https://img.shields.io/badge/license-MIT-green.svg" alt="Licencia MIT">
+</p>
 
 ---
 
-## Requisitos del Sistema
+## Descripción
 
-### Linux
-- Sistema operativo Linux con servidor grafico Wayland (KDE Plasma 6+, GNOME 40+, Sway o Hyprland) o X11.
-- Bibliotecas del sistema:
-  - libmpv (version 2 / libmpv-dev o mpv-devel)
-  - wayland-client (libwayland-client)
-  - libxkbcommon
-  - mesa / controladores graficos con soporte VA-API o Vulkan
-- Herramientas CLI auxiliares opcionales:
-  - wl-clipboard (para comando wl-copy al copiar enlaces)
-  - xdg-utils (para abrir enlaces externos)
+**OxideTube** es un reproductor de escritorio nativo para YouTube desarrollado desde cero en Rust. Combina una interfaz gráfica reactiva acelerada por GPU sobre **iced 0.13** con el motor multimedia **libmpv**, logrando un consumo mínimo de recursos (CPU y RAM), inicio instantáneo y reproducción fluida en resoluciones hasta 4K60 HDR.
+
+Diseñado con enfoque de ingeniería en eficiencia de memoria, soporte nativo de Wayland/X11, reproducción Picture-in-Picture (PiP), navegación por pestañas inteligentes con indicador visual de reproducción en tiempo real y sincronización segura de cookies locales.
 
 ---
 
-## Inicio Rapido
+## Características Principales
 
-### Compilar y Ejecutar en Desarrollo
-```bash
-cargo run --release
-```
-
-Para mas detalles sobre instalacion de dependencias y empaquetado, consulta BUILD.md.
-Para detalles sobre la arquitectura interna del reproductor y concurrencia, consulta ARCHITECTURE.md.
+- **Motor Multimedia libmpv de Alto Rendimiento**: Decodificación acelerada por hardware (VA-API, NVDEC) con triple-buffering y perfiles adaptativos de demuxer según resolución y red.
+- **Interfaz 100% Rust (iced 0.13)**: Sin navegadores web integrados ni JavaScript en la UI. Huella de memoria mínima (~180–350 MB en reproducción activa).
+- **Pestañas Inteligentes**: Pestañas de video con apertura en segundo plano (clic central), cierre rápido, restauración de historial (Ctrl+Shift+T) y desplazamiento horizontal sin saltos de layout (*zero layout shift*).
+- **Indicador Perimetral de Reproducción**: Borde iluminado (*glow*) dinámico y suave alrededor de la pestaña que está emitiendo video, visible sin necesidad de mover el cursor.
+- **Picture-in-Picture (PiP) Multiventana**: Miniventana flotante siempre visible desacoplada de la interfaz principal.
+- **Importación de Cookies de Navegador**: Soporte multiplataforma para perfiles de Firefox y Chromium (Chrome, Brave, Edge, Vivaldi), habilitando historial, suscripciones y contenido autenticado.
+- **Selector de Calidad y Códec**: Control directo sobre formatos DASH (AV1, VP9, H.264) con fallback automático.
+- **Gestión Inteligente de Caché**: Límite ajustable de almacenamiento local con política LRU y limpieza automática.
+- **Integración con el Sistema**: Inhibición automática de protector de pantalla vía D-Bus (`org.freedesktop.ScreenSaver`).
 
 ---
 
 ## Atajos de Teclado
 
-- Espacio: Reproducir / Pausar
-- Izquierda / Derecha: Retroceder / Avanzar 5 segundos
-- J / L: Retroceder / Avanzar 10 segundos
-- Arriba / Abajo: Subir / Bajar volumen
-- M: Silenciar / Activar sonido
-- F: Pantalla completa
-- T: Modo cine
-- I o P: Activar / Desactivar Picture-in-Picture (PiP)
-- C: Activar / Desactivar subtitulos
-- Ctrl+T: Abrir nueva pestana
-- Ctrl+W: Cerrar pestana activa
-- Ctrl+Shift+T: Reabrir la ultima pestana cerrada (hasta 5 pestanas)
-- Ctrl+Tab / Ctrl+Shift+Tab: Navegar entre pestanas abiertas
-- Escape: Cerrar modales, sugerencias, menus flotantes o salir de pantalla completa
+| Tecla | Acción |
+| :--- | :--- |
+| `Espacio` | Reproducir / Pausar |
+| `←` / `→` | Retroceder / Avanzar 5 segundos |
+| `J` / `L` | Retroceder / Avanzar 10 segundos |
+| `↑` / `↓` | Subir / Bajar volumen |
+| `M` | Silenciar / Restaurar volumen |
+| `F` | Pantalla completa |
+| `T` | Modo cine |
+| `I` o `P` | Activar / Desactivar Picture-in-Picture (PiP) |
+| `C` | Activar / Desactivar subtítulos |
+| `Ctrl + T` | Abrir nueva pestaña |
+| `Ctrl + W` | Cerrar pestaña activa |
+| `Ctrl + Shift + T` | Reabrir última pestaña cerrada |
+| `Ctrl + Tab` | Siguiente pestaña |
+| `Ctrl + Shift + Tab` | Pestaña anterior |
+| `Escape` | Salir de pantalla completa o cerrar modales |
+
+---
+
+## Compilación Rápida
+
+Consulta [`BUILD.md`](file:///home/kes/Documentos/Programando/Mitub/BUILD.md) para la guía completa de dependencias por distribución.
+
+```bash
+# Compilar binario optimizado
+cargo build --release
+
+# Instalar localmente en ~/.local/bin
+install -m 755 target/release/mitub ~/.local/bin/mitub
+```
+
+---
+
+## Agradecimientos y Créditos
+
+Este proyecto es posible gracias al trabajo y dedicación de las siguientes comunidades y proyectos de código abierto:
+
+- **[iced](https://github.com/iced-rs/iced)**: Framework reactivo GUI en Rust que hace posible una interfaz moderna, limpia y ligera.
+- **[mpv / libmpv](https://mpv.io/)**: El motor de reproducción de video más versátil y eficiente del ecosistema de software libre.
+- **Comunidad InnerTube / [yt-dlp](https://github.com/yt-dlp/yt-dlp) / [NewPipe](https://github.com/TeamNewPipe/NewPipe)**: Por documentar y mantener accesible la API interna de YouTube de forma abierta y sin publicidad invasiva.
+- **[Tokio](https://tokio.rs/) & [reqwest](https://github.com/seanmonstar/reqwest)**: Por el runtime asíncrono y la infraestructura de red de alto rendimiento en Rust.
+- **[mimalloc](https://github.com/microsoft/mimalloc)**: Por su asignador de memoria ultrarrápido y con baja fragmentación.
+- **Comunidad de Rust**: Por proporcionar un lenguaje con garantías de seguridad de memoria, concurrencia sin miedo y rendimiento bare-metal.
 
 ---
 
 ## Licencia
 
-Este proyecto esta licenciado bajo los terminos de la licencia MIT.
+Distribuido bajo la Licencia MIT. Consulta el archivo `LICENSE` para más información.
