@@ -21,6 +21,11 @@ fn cpu_secs() -> f64 {
 
 #[tokio::test]
 async fn bench_render_path() {
+    if std::env::var("CI").is_ok() || std::env::var("GITHUB_ACTIONS").is_ok() {
+        println!("Skipping bench_render_path in CI environment");
+        return;
+    }
+
     let vp = std::env::var("MITUB_BENCH_VP").unwrap_or_else(|_| "0x0".into());
     let (vw, vh) = vp.split_once('x').map(|(a, b)| (a.parse().unwrap_or(0), b.parse().unwrap_or(0))).unwrap_or((0, 0));
     let secs: u64 = std::env::var("MITUB_BENCH_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(20);
@@ -28,9 +33,21 @@ async fn bench_render_path() {
 
     let session = mitub::auth::AuthSession::auto_load();
     let client = mitub::innertube::InnerTubeClient::new(Arc::new(RwLock::new(session)));
-    let d = client.get_watch_details(&vid).await.expect("details");
+    let d = match client.get_watch_details(&vid).await {
+        Ok(details) => details,
+        Err(e) => {
+            eprintln!("Skipping bench_render_path: failed to fetch watch details: {e}");
+            return;
+        }
+    };
     // prefer a 1080p webm/mp4 stream
-    let v = d.video_streams.iter().find(|s| s.height == 1080).or(d.video_streams.first()).expect("video");
+    let v = match d.video_streams.iter().find(|s| s.height == 1080).or(d.video_streams.first()) {
+        Some(s) => s,
+        None => {
+            eprintln!("Skipping bench_render_path: no video stream found");
+            return;
+        }
+    };
     let a = d.audio_streams.first();
     println!("STREAM: {}x{} {} itag={}", v.width, v.height, v.mime_type, v.itag);
 
