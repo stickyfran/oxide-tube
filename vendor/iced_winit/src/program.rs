@@ -1301,6 +1301,8 @@ fn run_action<P, C>(
                             height: size.height,
                         },
                     );
+                    window.state.synchronize(program, id, &window.raw);
+                    window.raw.request_redraw();
                 }
             }
             window::Action::GetSize(id, channel) => {

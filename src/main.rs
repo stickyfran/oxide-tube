@@ -119,6 +119,7 @@ pub enum Message {
     ToggleFullscreen,
     TogglePip,
     OpenUrl(String),
+    IpcUrlReceived(String),
     CopyToClipboard(String),
     CopyShareUrl,
     CopyDescription,
@@ -240,6 +241,7 @@ pub struct MitubApp {
     pip_window_id: Option<Id>,
     pip_watch_details: Option<Arc<innertube::WatchDetails>>,
     pip_window_size: (f32, f32),
+    last_pip_resize_edge: Option<PipResizeEdge>,
     pip_cursor_hovered: bool,
     pip_cursor_pos: Option<iced::Point>,
     main_window_handles: (usize, usize),
@@ -275,6 +277,48 @@ pub struct MitubApp {
     is_window_minimized: bool,
 }
 
+static IPC_RX: std::sync::OnceLock<tokio::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<String>>>> = std::sync::OnceLock::new();
+
+fn get_ipc_port() -> u16 {
+    use std::hash::{Hash, Hasher};
+    let username = std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .unwrap_or_else(|_| "default".to_string());
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    username.hash(&mut hasher);
+    let hash = hasher.finish();
+    45000 + (hash % 10000) as u16
+}
+
+fn try_send_to_existing_instance(arg: &str) -> bool {
+    use std::io::Write;
+    let port = get_ipc_port();
+    if let Ok(mut stream) = std::net::TcpStream::connect_timeout(
+        &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+        std::time::Duration::from_millis(300),
+    ) {
+        let msg = format!("{}\n", arg.trim());
+        if stream.write_all(msg.as_bytes()).is_ok() {
+            let _ = stream.flush();
+            return true;
+        }
+    }
+    false
+}
+
+fn ipc_url_stream() -> impl iced::futures::Stream<Item = Message> {
+    iced::futures::stream::unfold((), |_| async {
+        let mutex = IPC_RX.get_or_init(|| tokio::sync::Mutex::new(None));
+        let mut lock = mutex.lock().await;
+        if let Some(rx) = lock.as_mut() {
+            if let Some(url) = rx.recv().await {
+                return Some((Message::IpcUrlReceived(url), ()));
+            }
+        }
+        None
+    })
+}
+
 fn frame_ready_stream() -> impl iced::futures::Stream<Item = Message> {
     iced::futures::stream::unfold((), |_| async {
         crate::player::FRAME_NOTIFY.notified().await;
@@ -282,7 +326,7 @@ fn frame_ready_stream() -> impl iced::futures::Stream<Item = Message> {
     })
 }
 
-fn ensure_kwin_pip_rule(saved_pos: Option<(f32, f32)>, saved_size: Option<(f32, f32)>) {
+fn ensure_kwin_pip_rule(saved_pos: Option<(f32, f32)>, _saved_size: Option<(f32, f32)>) {
     let Some(home) = dirs::home_dir() else { return };
     let path = home.join(".config/kwinrulesrc");
     let content = fs::read_to_string(&path).unwrap_or_default();
@@ -292,10 +336,7 @@ fn ensure_kwin_pip_rule(saved_pos: Option<(f32, f32)>, saved_size: Option<(f32, 
         Some((x, y)) => format!("position={},{}\npositionrule=3\n", x.round() as i32, y.round() as i32),
         None => "positionrule=3\n".to_string(),
     };
-    let size_line = match saved_size {
-        Some((w, h)) => format!("size={},{}\nsizerule=3\n", w.round() as i32, h.round() as i32),
-        None => "".to_string(),
-    };
+    let size_line = "";
 
     let rule_body = format!("\
 [mitub-pip]
@@ -1082,6 +1123,7 @@ impl MitubApp {
             pip_window_id: None,
             pip_watch_details: None,
             pip_window_size: saved_pip_size.unwrap_or((480.0, 270.0)),
+            last_pip_resize_edge: None,
             pip_cursor_hovered: true,
             pip_cursor_pos: None,
             main_window_handles: (0, 0),
@@ -1238,6 +1280,46 @@ impl MitubApp {
             }
             if let Some(blur_task) = app.queue_blurred_poster(&vid) {
                 initial_tasks.push(blur_task);
+            }
+        }
+
+        // Check if a direct video URL or ID was passed as a CLI argument on launch
+        let cli_video_id = std::env::args().nth(1).and_then(|arg| {
+            extract_youtube_video_id(&arg).or_else(|| {
+                let trimmed = arg.trim();
+                if trimmed.len() >= 10 && trimmed.len() <= 12 && trimmed.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+                    Some(trimmed.to_string())
+                } else {
+                    None
+                }
+            })
+        });
+
+        if let Some(vid) = cli_video_id {
+            let new_tab = ui::VideoTab {
+                video_id: vid.clone(),
+                title: "Cargando...".to_string(),
+                channel_name: String::new(),
+                saved_pos_ms: 0,
+                thumbnail_url: format!("https://i.ytimg.com/vi/{}/hqdefault.jpg", &vid),
+            };
+            app.tabs.push(new_tab);
+            let new_idx = app.tabs.len() - 1;
+            app.active_tab_idx = Some(new_idx);
+            app.current_view = ViewMode::Watch(vid.clone());
+            app.save_session();
+
+            let it_watch = innertube.clone();
+            let vid_copy = vid.clone();
+            app.current_request_id = app.current_request_id.wrapping_add(1);
+            let req_id = app.current_request_id;
+            initial_tasks.push(Task::perform(
+                async move { it_watch.get_watch_details(&vid_copy).await.map_err(|e| e.to_string()) },
+                move |res| Message::WatchDetailsLoaded(req_id, res),
+            ));
+            let poster_url = format!("https://i.ytimg.com/vi/{}/hqdefault.jpg", &vid);
+            if let Some(poster_task) = app.queue_thumbnail_download(&poster_url) {
+                initial_tasks.push(poster_task);
             }
         }
 
@@ -1406,6 +1488,81 @@ impl MitubApp {
         ))
     }
 
+    fn current_video_aspect_ratio(&self) -> f32 {
+        if let Some(player) = &self.player {
+            let (vw, vh) = player.get_video_dims();
+            if vw > 0 && vh > 0 {
+                let r = vw as f32 / vh as f32;
+                if r.is_finite() && r > 0.1 && r < 10.0 {
+                    return r;
+                }
+            }
+        }
+        if let Some(details) = self.pip_watch_details.as_ref().or(self.watch_details.as_ref()) {
+            let stream_opt = details
+                .video_streams
+                .iter()
+                .find(|s| s.itag == self.osd_state.selected_quality_itag && s.width > 0 && s.height > 0)
+                .or_else(|| details.video_streams.iter().find(|s| s.width > 0 && s.height > 0));
+            if let Some(stream) = stream_opt {
+                let r = stream.width as f32 / stream.height as f32;
+                if r.is_finite() && r > 0.1 && r < 10.0 {
+                    return r;
+                }
+            }
+        }
+        16.0 / 9.0
+    }
+
+    fn compute_pip_aspect_size(&self, raw_w: f32, raw_h: f32, edge: Option<PipResizeEdge>) -> (f32, f32) {
+        let ratio = self.current_video_aspect_ratio();
+        let min_short = 135.0_f32;
+        let max_w = 1920.0_f32;
+        let max_h = 1080.0_f32;
+
+        let drive_by_height = matches!(edge, Some(PipResizeEdge::Top | PipResizeEdge::Bottom));
+        let (mut w, mut h) = if drive_by_height {
+            let h = raw_h.max(min_short).min(max_h);
+            let w = h * ratio;
+            (w, h)
+        } else {
+            let min_w = if ratio < 1.0 { min_short } else { (min_short * ratio).max(220.0) };
+            let w = raw_w.max(min_w).min(max_w);
+            let h = w / ratio;
+            (w, h)
+        };
+
+        if w > max_w {
+            w = max_w;
+            h = w / ratio;
+        }
+        if h > max_h {
+            h = max_h;
+            w = h * ratio;
+        }
+        let min_h = if ratio >= 1.0 { min_short } else { (min_short / ratio).max(220.0) };
+        if h < min_h {
+            h = min_h;
+            w = h * ratio;
+        }
+        (w.round().max(1.0), h.round().max(1.0))
+    }
+
+    fn reset_watch_scroll_task(&mut self) -> Task<Message> {
+        self.watch_scroll_y = 0.0;
+        iced::widget::scrollable::scroll_to(
+            iced::widget::scrollable::Id::new("watch_scrollable"),
+            iced::widget::scrollable::AbsoluteOffset { x: 0.0, y: 0.0 },
+        )
+    }
+
+    fn reset_home_scroll_task(&self) -> Task<Message> {
+        iced::widget::scrollable::scroll_to(
+            iced::widget::scrollable::Id::new("home_scrollable"),
+            iced::widget::scrollable::AbsoluteOffset { x: 0.0, y: 0.0 },
+        )
+    }
+
     pub fn title(&self, id: Id) -> String {
         if Some(id) == self.pip_window_id || (self.main_window_id.is_some() && Some(id) != self.main_window_id) {
             return "Oxide tube - PiP".to_string();
@@ -1507,7 +1664,7 @@ impl MitubApp {
                     }
                 }
                 if surf_ptr != 0 {
-                    enforce_kwin_pip_keep_above(self.config.pip_position, self.config.pip_size);
+                    enforce_kwin_pip_keep_above(self.config.pip_position, Some(self.pip_window_size));
                 }
                 Task::none()
             }
@@ -1572,6 +1729,17 @@ impl MitubApp {
                         if player.is_first_frame_rendered() {
                             self.osd_state.first_frame_rendered = true;
                         }
+                    }
+                }
+                if let Some(pip_id) = self.pip_window_id {
+                    let (cur_w, cur_h) = self.pip_window_size;
+                    let (tw, th) = self.compute_pip_aspect_size(cur_w, cur_h, None);
+                    if (cur_w - tw).abs() > 1.5 || (cur_h - th).abs() > 1.5 {
+                        self.pip_window_size = (tw, th);
+                        if let Some(player) = &self.player {
+                            player.set_viewport(0, 0, tw as i32, th as i32);
+                        }
+                        return window::resize(pip_id, Size::new(tw, th));
                     }
                 }
                 Task::none()
@@ -2115,7 +2283,7 @@ impl MitubApp {
                     move |res| Message::WatchDetailsLoaded(req_id, res),
                 );
 
-                let mut tasks = vec![watch_task];
+                let mut tasks = vec![watch_task, self.reset_watch_scroll_task()];
                 if let Some(pip_id) = self.pip_window_id.take() {
                     self.pip_watch_details = None;
                     let (_main_disp, main_surf) = self.main_window_handles;
@@ -2424,11 +2592,16 @@ impl MitubApp {
                 self.sync_player_viewport();
                 power_manager::trim_process_memory();
 
+                let scroll_top = iced::widget::scrollable::scroll_to(
+                    iced::widget::scrollable::Id::new("channel_scrollable"),
+                    iced::widget::scrollable::AbsoluteOffset { x: 0.0, y: 0.0 },
+                );
                 let it = self.innertube.clone();
-                Task::perform(
+                let ch_task = Task::perform(
                     async move { it.get_channel(&channel_id).await.map_err(|e| e.to_string()) },
                     Message::ChannelLoaded,
-                )
+                );
+                Task::batch([ch_task, scroll_top])
             }
 
             Message::ChannelLoaded(res) => {
@@ -2513,6 +2686,7 @@ impl MitubApp {
                 self.sync_player_viewport();
                 power_manager::trim_process_memory();
 
+                let scroll_top = self.reset_home_scroll_task();
                 if !self.cached_home_feed.is_empty() {
                     self.home_videos = self.cached_home_feed.clone();
                     self.trigger_unblur_transition();
@@ -2521,7 +2695,7 @@ impl MitubApp {
                         .iter()
                         .map(|v| (v.thumbnail_url.clone(), v.channel_avatar.clone()))
                         .collect();
-                    let mut tasks = Vec::new();
+                    let mut tasks = vec![scroll_top];
                     for (t_url, a_url) in urls {
                         if let Some(t) = self.queue_thumbnail_download(&t_url) {
                             tasks.push(t);
@@ -2532,19 +2706,17 @@ impl MitubApp {
                             }
                         }
                     }
-                    if !tasks.is_empty() {
-                        return Task::batch(tasks);
-                    }
+                    return Task::batch(tasks);
                 } else {
                     self.home_videos.clear();
                     self.trigger_blur_loading();
                     let it = self.innertube.clone();
-                    return Task::perform(
+                    let feed_task = Task::perform(
                         async move { it.get_home_feed().await.map_err(|e| e.to_string()) },
                         Message::HomeFeedLoaded,
                     );
+                    return Task::batch([feed_task, scroll_top]);
                 }
-                Task::none()
             }
 
             Message::GoBack => {
@@ -2622,11 +2794,13 @@ impl MitubApp {
                 self.trigger_blur_loading();
                 self.sync_player_viewport();
 
+                let scroll_top = self.reset_home_scroll_task();
                 let it = self.innertube.clone();
-                Task::perform(
+                let search_task = Task::perform(
                     async move { it.search(&query).await.map_err(|e| e.to_string()) },
                     Message::SearchResultsLoaded,
-                )
+                );
+                Task::batch([search_task, scroll_top])
             }
 
             Message::SearchResultsLoaded(res) => {
@@ -2678,9 +2852,9 @@ impl MitubApp {
                         if matches!(self.current_view, ViewMode::Home) {
                             self.home_videos = videos;
                             self.trigger_unblur_transition();
-                            if !tasks.is_empty() {
-                                return Task::batch(tasks);
-                            }
+                        }
+                        if !tasks.is_empty() {
+                            return Task::batch(tasks);
                         }
                     }
                     Err(e) => {
@@ -2871,6 +3045,7 @@ impl MitubApp {
             }
 
             Message::StartPipDrag => {
+                self.last_pip_resize_edge = None;
                 let now = std::time::Instant::now();
                 if let Some(prev) = self.osd_state.last_click_time {
                     if now.duration_since(prev).as_millis() < 350 {
@@ -2887,6 +3062,7 @@ impl MitubApp {
 
             Message::StartPipEdgeResize(edge) => {
                 // Native compositor-driven resize (xdg_toplevel.resize), like Firefox PiP.
+                self.last_pip_resize_edge = Some(edge);
                 if let Some(pip_id) = self.pip_window_id {
                     use iced::window::ResizeEdge as E;
                     let e = match edge {
@@ -3294,28 +3470,24 @@ impl MitubApp {
                 };
 
                 self.pip_watch_details = Some(details.clone());
+                self.last_pip_resize_edge = None;
 
-                let (pip_w, pip_h) = if let Some(stream) = details.video_streams.iter().find(|s| s.itag == self.osd_state.selected_quality_itag).or_else(|| details.video_streams.first()) {
-                    if stream.width > 0 && stream.height > 0 {
-                        let ratio = stream.width as f32 / stream.height as f32;
-                        if ratio < 1.0 {
-                            // Vertical video (Shorts / Reels)
-                            (240.0, 426.0)
-                        } else {
-                            (480.0, (480.0 / ratio).round())
-                        }
+                let ratio = self.current_video_aspect_ratio();
+                let (base_w, base_h) = if let Some((saved_w, saved_h)) = self.config.pip_size {
+                    if ratio < 1.0 {
+                        let h = saved_h.max(saved_w).clamp(240.0, 1080.0);
+                        (h * ratio, h)
                     } else {
-                        (480.0, 270.0)
+                        let w = saved_w.max(saved_h).clamp(240.0, 1920.0);
+                        (w, w / ratio)
                     }
+                } else if ratio < 1.0 {
+                    (240.0, (240.0 / ratio).round())
                 } else {
-                    (480.0, 270.0)
+                    (480.0, (480.0 / ratio).round())
                 };
 
-                let (final_pip_w, final_pip_h) = if let Some((w, h)) = self.config.pip_size {
-                    (w.max(240.0), h.max(140.0))
-                } else {
-                    (pip_w, pip_h)
-                };
+                let (final_pip_w, final_pip_h) = self.compute_pip_aspect_size(base_w, base_h, None);
 
                 self.pip_window_size = (final_pip_w, final_pip_h);
                 self.pip_cursor_hovered = true;
@@ -3334,7 +3506,7 @@ impl MitubApp {
                         window::Position::Centered
                     },
                     size: Size::new(final_pip_w, final_pip_h),
-                    min_size: Some(Size::new(240.0, 140.0)),
+                    min_size: Some(Size::new(135.0, 135.0)),
                     transparent: true,
                     resizable: true,
                     decorations: false,
@@ -3390,11 +3562,13 @@ impl MitubApp {
                 self.show_suggestions = false;
                 self.sync_player_viewport();
 
+                let scroll_top = self.reset_home_scroll_task();
                 let it = self.innertube.clone();
-                return Task::perform(
+                let sub_task = Task::perform(
                     async move { it.get_subscriptions_feed().await.map_err(|e| e.to_string()) },
                     Message::SubscriptionsLoaded,
                 );
+                return Task::batch([sub_task, scroll_top]);
             }
 
             Message::SubscriptionsLoaded(res) => {
@@ -3452,11 +3626,13 @@ impl MitubApp {
                 self.show_suggestions = false;
                 self.sync_player_viewport();
 
+                let scroll_top = self.reset_home_scroll_task();
                 let it = self.innertube.clone();
-                return Task::perform(
+                let hist_task = Task::perform(
                     async move { it.get_history().await.map_err(|e| e.to_string()) },
                     Message::HistoryLoaded,
                 );
+                return Task::batch([hist_task, scroll_top]);
             }
 
             Message::HistoryLoaded(res) => {
@@ -3560,11 +3736,13 @@ impl MitubApp {
                 self.show_suggestions = false;
                 self.sync_player_viewport();
 
+                let scroll_top = self.reset_home_scroll_task();
                 let it = self.innertube.clone();
-                return Task::perform(
+                let pl_task = Task::perform(
                     async move { it.get_playlists_feed().await.map_err(|e| e.to_string()) },
                     Message::PlaylistsLoaded,
                 );
+                return Task::batch([pl_task, scroll_top]);
             }
 
             Message::PlaylistsLoaded(res) => {
@@ -3726,9 +3904,9 @@ impl MitubApp {
 
             Message::ScalePip(scale) => {
                 if let Some(pip_id) = self.pip_window_id {
+                    self.last_pip_resize_edge = None;
                     let (cur_w, cur_h) = self.pip_window_size;
-                    let new_w = (cur_w * scale).clamp(240.0, 1920.0).round();
-                    let new_h = (cur_h * scale).clamp(135.0, 1080.0).round();
+                    let (new_w, new_h) = self.compute_pip_aspect_size(cur_w * scale, cur_h * scale, None);
                     self.pip_window_size = (new_w, new_h);
                     self.config.pip_size = Some((new_w, new_h));
                     self.config.save_async();
@@ -3742,22 +3920,41 @@ impl MitubApp {
             }
 
             Message::OpenUrl(url) => {
-                let video_id_opt = if url.contains("youtu.be/") {
-                    url.split("youtu.be/").nth(1).and_then(|s| s.split(&['?', '&', '#'][..]).next())
-                } else if url.contains("youtube.com/watch") {
-                    url.split("v=").nth(1).and_then(|s| s.split(&['&', '#'][..]).next())
-                } else {
-                    None
-                };
+                let video_id_opt = extract_youtube_video_id(&url);
 
                 if let Some(vid) = video_id_opt {
                     if !vid.is_empty() {
-                        return self.update(Message::OpenVideo(vid.to_string()));
+                        return self.update(Message::OpenVideo(vid));
                     }
                 }
 
                 let _ = std::process::Command::new("xdg-open").arg(&url).spawn();
                 Task::none()
+            }
+
+            Message::IpcUrlReceived(raw_url) => {
+                let video_id_opt = extract_youtube_video_id(&raw_url).or_else(|| {
+                    let trimmed = raw_url.trim();
+                    if trimmed.len() >= 10 && trimmed.len() <= 12 && trimmed.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+                        Some(trimmed.to_string())
+                    } else {
+                        None
+                    }
+                });
+
+                let mut tasks = Vec::new();
+                if let Some(main_id) = self.main_window_id {
+                    self.focused_window = Some(main_id);
+                    self.is_window_focused = true;
+                    self.is_window_minimized = false;
+                    tasks.push(window::minimize(main_id, false));
+                    tasks.push(window::gain_focus(main_id));
+                }
+
+                if let Some(vid) = video_id_opt {
+                    tasks.push(self.update(Message::OpenVideoInNewTab(vid)));
+                }
+                Task::batch(tasks)
             }
 
             Message::CopyToClipboard(text) => {
@@ -4146,12 +4343,14 @@ impl MitubApp {
                         self.show_suggestions = false;
                         self.sync_player_viewport();
                         let focus_task = iced::widget::text_input::focus(iced::widget::text_input::Id::new("main_search_input"));
-                        return Task::batch([auto_pip_task, focus_task]);
+                        let scroll_top = self.reset_home_scroll_task();
+                        return Task::batch([auto_pip_task, focus_task, scroll_top]);
                     } else {
                         // Si es el video que ya está reproduciéndose (ej. en background o PiP), retornar fluidamente
                         if self.playing_video_id.as_deref() == Some(vid.as_str()) {
+                            let scroll_reset_task = self.reset_watch_scroll_task();
                             if self.pip_window_id.is_some() {
-                                return self.update(Message::ClosePip);
+                                return Task::batch([self.update(Message::ClosePip), scroll_reset_task]);
                             } else {
                                 self.previous_view = self.current_view.clone();
                                 self.current_view = ViewMode::Watch(vid.clone());
@@ -4159,14 +4358,14 @@ impl MitubApp {
                                     self.watch_details = Some(Arc::clone(cached));
                                 }
                                 self.sync_player_viewport();
-                                return Task::none();
+                                return scroll_reset_task;
                             }
                         } else if let Some(cached) = self.tab_details_cache.get(&vid).cloned() {
                             // Video en caché: restaurar de forma 100% síncrona en el mismo frame (0ms)
                             self.previous_view = self.current_view.clone();
                             self.current_view = ViewMode::Watch(vid.clone());
                             self.show_suggestions = false;
-                            self.watch_scroll_y = 0.0;
+                            let scroll_reset_task = self.reset_watch_scroll_task();
                             self.active_subtitles.clear();
 
                             let desc_text = if self.description_expanded || cached.description.chars().count() <= 240 {
@@ -4201,14 +4400,14 @@ impl MitubApp {
 
                             self.watch_details = Some(cached);
                             self.sync_player_viewport();
-                            return Task::none();
+                            return scroll_reset_task;
                         } else {
                             // Video diferente: NO poner pausa al anterior ni reproducir automáticamente este,
                             // ni abrir ventana PiP forzada al cambiar de pestañas.
                             self.previous_view = self.current_view.clone();
                             self.current_view = ViewMode::Watch(vid.clone());
                             self.show_suggestions = false;
-                            self.watch_scroll_y = 0.0;
+                            let scroll_reset_task = self.reset_watch_scroll_task();
                             self.active_subtitles.clear();
 
                             // Restaurar o preparar detalles para esta pestaña pasivamente
@@ -4253,7 +4452,7 @@ impl MitubApp {
                                 parsed_desc_timestamps: Vec::new(),
                             }));
 
-                            let mut tasks = Vec::new();
+                            let mut tasks = vec![scroll_reset_task];
                             if !tab_info.thumbnail_url.is_empty() {
                                 if let Some(tt) = self.queue_thumbnail_download(&tab_info.thumbnail_url) {
                                     tasks.push(tt);
@@ -4937,13 +5136,18 @@ impl MitubApp {
                             self.is_window_minimized = false;
                         }
                         if Some(win_id) == self.pip_window_id {
-                            self.pip_window_size = (size.width, size.height);
-                            self.config.pip_size = Some((size.width, size.height));
+                            let (target_w, target_h) =
+                                self.compute_pip_aspect_size(size.width, size.height, self.last_pip_resize_edge);
+                            self.pip_window_size = (target_w, target_h);
+                            self.config.pip_size = Some((target_w, target_h));
                             self.config.save_async();
                             if let Some(player) = &self.player {
                                 player.set_underlay(true);
-                                player.set_viewport(0, 0, size.width as i32, size.height as i32);
+                                player.set_viewport(0, 0, target_w as i32, target_h as i32);
                                 player.set_rendering_active(true);
+                            }
+                            if (size.width - target_w).abs() > 1.0 || (size.height - target_h).abs() > 1.0 {
+                                return window::resize(win_id, Size::new(target_w, target_h));
                             }
                             return Task::none();
                         } else if Some(win_id) == self.main_window_id || self.main_window_id.is_none() {
@@ -5517,7 +5721,7 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
 
         if let Some(frame) = video_frame {
             layers.push(
-                crate::ui::video_widget::video_shader(frame),
+                crate::ui::video_widget::video_shader_pip(frame),
             );
         }
 
@@ -5568,7 +5772,7 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
             .width(Length::Fill)
             .height(Length::Fill)
             .style(|_t| container::Style {
-                background: Some(iced::Color::BLACK.into()),
+                background: Some(iced::Color::TRANSPARENT.into()),
                 ..container::Style::default()
             })
             .into()
@@ -6236,6 +6440,8 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
             subs.push(iced::time::every(tick_rate).map(|_| Message::Tick));
         }
 
+        subs.push(Subscription::run(ipc_url_stream));
+
         Subscription::batch(subs)
     }
 
@@ -6304,6 +6510,42 @@ fn load_app_icon() -> Option<window::Icon> {
 use ::image as image_crate;
 
 fn main() -> iced::Result {
+    // Check if an argument (e.g. YouTube URL) was passed and an existing instance is already running
+    if let Some(arg) = std::env::args().nth(1) {
+        if try_send_to_existing_instance(&arg) {
+            println!("[Mitub IPC] Sent URL to existing instance successfully: {arg}");
+            return Ok(());
+        }
+    }
+
+    // Set up cross-platform local TCP listener for single-instance IPC
+    let port = get_ipc_port();
+    if let Ok(listener) = std::net::TcpListener::bind(("127.0.0.1", port)) {
+        let _ = listener.set_nonblocking(true);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let _ = IPC_RX.set(tokio::sync::Mutex::new(Some(rx)));
+
+        tokio::task::spawn(async move {
+            if let Ok(tokio_listener) = tokio::net::TcpListener::from_std(listener) {
+                use tokio::io::AsyncReadExt;
+                while let Ok((mut socket, _)) = tokio_listener.accept().await {
+                    let tx = tx.clone();
+                    tokio::spawn(async move {
+                        let mut buf = vec![0u8; 2048];
+                        if let Ok(n) = socket.read(&mut buf).await {
+                            if n > 0 {
+                                let content = String::from_utf8_lossy(&buf[..n]).trim().to_string();
+                                if !content.is_empty() {
+                                    let _ = tx.send(content);
+                                }
+                            }
+                        }
+                    });
+                }
+            }
+        });
+    }
+
     // 1. Hardware video acceleration environment setup
     std::env::set_var("GST_VAAPI_ALL_DRIVERS", "1");
 

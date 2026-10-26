@@ -59,6 +59,47 @@ Diseñado con enfoque de ingeniería en eficiencia de memoria, soporte nativo de
 
 ---
 
+## Apertura de Enlaces de YouTube a Nivel de Sistema (Linux, macOS, Windows)
+
+OxideTube incluye soporte nativo de **instancia única con IPC local**. Si la aplicación ya está abierta y se ejecuta `mitub <URL>` (desde la terminal, el explorador o un enlace externo), el video se abrirá instantáneamente en una nueva pestaña sin reiniciar la aplicación ni duplicar el consumo de memoria RAM.
+
+### 🐧 Linux
+
+1. **Vía Desktop y Gestor MIME**:
+   El archivo `.desktop` instalado registra `mitub %u` con el tipo `x-scheme-handler/vnd.youtube`.
+2. **Despachador a nivel de sistema (para que todos los links `https://youtu.be/...` abran en OxideTube)**:
+   Puedes utilizar un despachador universal de URLs como [`handlr`](https://github.com/chmln/handlr) o un script wrapper configurado como navegador predeterminado:
+   ```bash
+   # Si la URL contiene 'youtu.be' o 'youtube.com/watch', se despacha a mitub:
+   mitub "$URL"
+   # En caso contrario, se reenvía a tu navegador web habitual (ej. firefox "$URL")
+   ```
+
+### 🍎 macOS
+
+1. Registra el protocolo personalizado o enlace a través de un wrapper en Automator / AppleScript Application o usando herramientas como **Velja** o **Finicky**:
+   ```javascript
+   // Configuración en Finicky (~/.finicky.js):
+   module.exports = {
+     defaultBrowser: "Safari",
+     handlers: [
+       {
+         match: ["*youtube.com/watch*", "*youtu.be/*"],
+         browser: {
+           name: "/usr/local/bin/mitub"
+         }
+       }
+     ]
+   };
+   ```
+
+### 🪟 Windows
+
+1. OxideTube escucha en el puerto IPC local `127.0.0.1` de tu usuario.
+2. Puedes asociar el protocolo `vnd.youtube:` o usar despachadores de URLs para Windows como **Browser Tamer** o **Junction** para reenviar los enlaces de YouTube directamente a `mitub.exe %1`.
+
+---
+
 ## Compilación Rápida
 
 Consulta [`BUILD.md`](file:///home/kes/Documentos/Programando/Mitub/BUILD.md) para la guía completa de dependencias por distribución.

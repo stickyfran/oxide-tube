@@ -170,6 +170,7 @@ pub fn view_channel_page<'a, Message: Clone + 'static>(
                 .spacing(12)
                 .width(Length::Fill),
         )
+        .id(iced::widget::scrollable::Id::new("channel_scrollable"))
         .height(Length::Fill),
     )
     .width(Length::Fill)

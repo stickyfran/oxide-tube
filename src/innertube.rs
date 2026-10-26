@@ -1092,6 +1092,7 @@ impl InnerTubeClient {
     }
 
     pub async fn fetch_thumbnail_bytes(&self, url: &str) -> Option<Vec<u8>> {
+        static THUMB_NET_SEM: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(12);
         if url.is_empty() {
             return None;
         }
@@ -1117,8 +1118,40 @@ impl InnerTubeClient {
             }
         }
 
-        let resp = self.client.get(&full_url).send().await.ok()?;
-        let bytes = resp.bytes().await.ok()?.to_vec();
+        let _permit = THUMB_NET_SEM.acquire().await.ok()?;
+        let mut fetched_bytes: Option<Vec<u8>> = None;
+
+        for attempt in 0..3 {
+            if attempt > 0 {
+                tokio::time::sleep(Duration::from_millis(180 * attempt as u64)).await;
+            }
+            let req = self.client.get(&full_url).header(USER_AGENT, USER_AGENT_STR);
+            if let Ok(Ok(resp)) = tokio::time::timeout(Duration::from_secs(6), req.send()).await {
+                if resp.status().is_success() {
+                    if let Ok(Ok(b)) = tokio::time::timeout(Duration::from_secs(6), resp.bytes()).await {
+                        if !b.is_empty() {
+                            fetched_bytes = Some(b.to_vec());
+                            break;
+                        }
+                    }
+                } else if resp.status() == reqwest::StatusCode::NOT_FOUND && full_url.contains("maxresdefault") {
+                    let fallback_url = full_url.replace("maxresdefault", "hqdefault");
+                    let fb_req = self.client.get(&fallback_url).header(USER_AGENT, USER_AGENT_STR);
+                    if let Ok(Ok(fb_resp)) = tokio::time::timeout(Duration::from_secs(6), fb_req.send()).await {
+                        if fb_resp.status().is_success() {
+                            if let Ok(Ok(b)) = tokio::time::timeout(Duration::from_secs(6), fb_resp.bytes()).await {
+                                if !b.is_empty() {
+                                    fetched_bytes = Some(b.to_vec());
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let bytes = fetched_bytes?;
 
         let bytes_to_save = bytes.clone();
         let path_to_save = cache_path.clone();

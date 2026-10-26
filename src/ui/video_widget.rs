@@ -116,6 +116,7 @@ impl VideoPipeline {
 #[derive(Debug, Clone)]
 pub struct VideoPrimitive {
     pub frame: VideoFrameBuffer,
+    pub fill_bounds: bool,
 }
 
 impl shader::Primitive for VideoPrimitive {
@@ -213,23 +214,26 @@ impl shader::Primitive for VideoPrimitive {
             }
         }
 
-        // 3. Compute aspect-ratio preserving bounds in physical pixels based on the widget's on-screen bounds
+        // 3. Compute bounds in physical pixels based on the widget's on-screen bounds
         let phys_w = (bounds.width * scale).max(1.0);
         let phys_h = (bounds.height * scale).max(1.0);
         let phys_x = bounds.x * scale;
         let phys_y = bounds.y * scale;
 
-        let video_aspect = self.frame.width as f32 / self.frame.height as f32;
-        let bounds_aspect = phys_w / phys_h;
-
-        let (vid_w, vid_h) = if bounds_aspect > video_aspect {
-            (phys_h * video_aspect, phys_h)
+        let (vid_x, vid_y, vid_w, vid_h) = if self.fill_bounds {
+            (phys_x, phys_y, phys_w, phys_h)
         } else {
-            (phys_w, phys_w / video_aspect)
-        };
+            let video_aspect = self.frame.width as f32 / self.frame.height as f32;
+            let bounds_aspect = phys_w / phys_h;
 
-        let vid_x = phys_x + (phys_w - vid_w) / 2.0;
-        let vid_y = phys_y + (phys_h - vid_h) / 2.0;
+            let (vw, vh) = if bounds_aspect > video_aspect {
+                (phys_h * video_aspect, phys_h)
+            } else {
+                (phys_w, phys_w / video_aspect)
+            };
+
+            (phys_x + (phys_w - vw) / 2.0, phys_y + (phys_h - vh) / 2.0, vw, vh)
+        };
 
         // Convert physical pixel coordinates to NDC coordinates [-1.0, 1.0]
         let left = (vid_x / win_w) * 2.0 - 1.0;
@@ -301,6 +305,7 @@ impl shader::Primitive for VideoPrimitive {
 
 pub struct VideoProgram {
     frame: VideoFrameBuffer,
+    fill_bounds: bool,
 }
 
 impl<Message> shader::Program<Message> for VideoProgram {
@@ -315,14 +320,28 @@ impl<Message> shader::Program<Message> for VideoProgram {
     ) -> Self::Primitive {
         VideoPrimitive {
             frame: self.frame.clone(),
+            fill_bounds: self.fill_bounds,
         }
     }
 }
 
 pub fn video_shader<'a, Message: 'static>(frame: VideoFrameBuffer) -> Element<'a, Message> {
-    iced::widget::shader(VideoProgram { frame })
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .into()
+    iced::widget::shader(VideoProgram {
+        frame,
+        fill_bounds: false,
+    })
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .into()
+}
+
+pub fn video_shader_pip<'a, Message: 'static>(frame: VideoFrameBuffer) -> Element<'a, Message> {
+    iced::widget::shader(VideoProgram {
+        frame,
+        fill_bounds: true,
+    })
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .into()
 }
 

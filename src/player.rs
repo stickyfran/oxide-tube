@@ -834,17 +834,24 @@ impl WaylandZeroCopyPlayer {
 
                         let (vid_w, vid_h) = *video_dims.safe_lock();
                         // Render at the size the video is actually displayed at (x1.15 margin for subpixel sharpness),
-                        // never above the source: a 480px PiP or 960px windowed player no longer pays for a full 1080p readback.
-                        let (mut target_w, mut target_h) = (vid_w.clamp(320, 1920), vid_h.clamp(180, 1080));
-                        if vp_w > 16 && vp_h > 16 && vid_w > 0 && vid_h > 0 {
-                            let sx = (vp_w as f32 * 1.15) / vid_w as f32;
-                            let sy = (vp_h as f32 * 1.15) / vid_h as f32;
-                            let scale = sx.min(sy).min(1.0);
-                            if scale < 1.0 {
-                                target_w = ((vid_w as f32 * scale) as u32 & !1).clamp(320, 1920);
-                                target_h = ((vid_h as f32 * scale) as u32 & !1).clamp(180, 1080);
-                            }
-                        }
+                        // never above the source, while strictly preserving the exact video aspect ratio so libmpv
+                        // never bakes letterbox or pillarbox black bars into the FBO texture.
+                        let (target_w, target_h) = if vid_w > 0 && vid_h > 0 {
+                            let max_scale = (1920.0 / vid_w as f32).min(1080.0 / vid_h as f32).min(1.0);
+                            let min_scale = (240.0 / vid_w.max(vid_h) as f32).min(max_scale);
+                            let vp_scale = if vp_w > 16 && vp_h > 16 {
+                                let sx = (vp_w as f32 * 1.15) / vid_w as f32;
+                                let sy = (vp_h as f32 * 1.15) / vid_h as f32;
+                                sx.max(sy).clamp(min_scale, max_scale)
+                            } else {
+                                max_scale
+                            };
+                            let tw = ((vid_w as f32 * vp_scale).round() as u32 & !1).max(2);
+                            let th = ((vid_h as f32 * vp_scale).round() as u32 & !1).max(2);
+                            (tw, th)
+                        } else {
+                            (1280, 720)
+                        };
 
                         if target_w != current_buf_w || target_h != current_buf_h {
                             current_buf_w = target_w;
@@ -1375,6 +1382,10 @@ impl WaylandZeroCopyPlayer {
 
     pub fn get_current_frame(&self) -> Option<VideoFrameBuffer> {
         self.current_frame.safe_lock().clone()
+    }
+
+    pub fn get_video_dims(&self) -> (u32, u32) {
+        *self.video_dims.safe_lock()
     }
 
     pub fn switch_surface(&self, _surf_ptr: usize, _explicit_pos_ms: Option<u64>) {

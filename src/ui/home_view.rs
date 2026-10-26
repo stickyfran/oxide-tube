@@ -365,6 +365,7 @@ pub fn view_home_grid<'a, Message: Clone + 'static>(
                 .padding([20, 24])
                 .width(Length::Fill),
         )
+        .id(iced::widget::scrollable::Id::new("home_scrollable"))
         .on_scroll(on_scroll)
         .height(Length::Fill),
     )
