@@ -1172,12 +1172,19 @@ impl MitubApp {
                 _ => 0usize,
             };
             let disp_addr = if surf_addr != 0 {
-                #[link(name = "wayland-client")]
-                extern "C" {
-                    fn wl_proxy_get_display(proxy: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
-                }
+                // Wayland >= 1.23 provides wl_proxy_get_display; dynamically look it up to support older distributions (Ubuntu 22.04/24.04)
                 unsafe {
-                    wl_proxy_get_display(surf_addr as *mut std::ffi::c_void) as usize
+                    let mut addr = 0usize;
+                    let lib = libc::dlopen(b"libwayland-client.so.0\0".as_ptr() as *const libc::c_char, libc::RTLD_LAZY);
+                    if !lib.is_null() {
+                        let sym = libc::dlsym(lib, b"wl_proxy_get_display\0".as_ptr() as *const libc::c_char);
+                        if !sym.is_null() {
+                            let f: unsafe extern "C" fn(*mut std::ffi::c_void) -> *mut std::ffi::c_void = std::mem::transmute(sym);
+                            addr = f(surf_addr as *mut std::ffi::c_void) as usize;
+                        }
+                        libc::dlclose(lib);
+                    }
+                    addr
                 }
             } else {
                 0usize
