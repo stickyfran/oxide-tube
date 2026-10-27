@@ -277,8 +277,6 @@ pub struct MitubApp {
     is_window_minimized: bool,
 }
 
-static IPC_RX: std::sync::OnceLock<tokio::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<String>>>> = std::sync::OnceLock::new();
-
 fn get_ipc_port() -> u16 {
     use std::hash::{Hash, Hasher};
     let username = std::env::var("USER")
@@ -307,15 +305,30 @@ fn try_send_to_existing_instance(arg: &str) -> bool {
 }
 
 fn ipc_url_stream() -> impl iced::futures::Stream<Item = Message> {
-    iced::futures::stream::unfold((), |_| async {
-        let mutex = IPC_RX.get_or_init(|| tokio::sync::Mutex::new(None));
-        let mut lock = mutex.lock().await;
-        if let Some(rx) = lock.as_mut() {
-            if let Some(url) = rx.recv().await {
-                return Some((Message::IpcUrlReceived(url), ()));
+    iced::stream::channel(10, |mut output: iced::futures::channel::mpsc::Sender<Message>| async move {
+        use iced::futures::SinkExt;
+        use tokio::io::AsyncReadExt;
+
+        let port = get_ipc_port();
+        let listener = match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("[Mitub IPC] Could not bind local IPC listener on port {port}: {e}");
+                return;
+            }
+        };
+
+        while let Ok((mut socket, _)) = listener.accept().await {
+            let mut buf = vec![0u8; 2048];
+            if let Ok(n) = socket.read(&mut buf).await {
+                if n > 0 {
+                    let content = String::from_utf8_lossy(&buf[..n]).trim().to_string();
+                    if !content.is_empty() {
+                        let _ = output.send(Message::IpcUrlReceived(content)).await;
+                    }
+                }
             }
         }
-        None
     })
 }
 
@@ -6525,33 +6538,6 @@ fn main() -> iced::Result {
         }
     }
 
-    // Set up cross-platform local TCP listener for single-instance IPC
-    let port = get_ipc_port();
-    if let Ok(listener) = std::net::TcpListener::bind(("127.0.0.1", port)) {
-        let _ = listener.set_nonblocking(true);
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-        let _ = IPC_RX.set(tokio::sync::Mutex::new(Some(rx)));
-
-        tokio::task::spawn(async move {
-            if let Ok(tokio_listener) = tokio::net::TcpListener::from_std(listener) {
-                use tokio::io::AsyncReadExt;
-                while let Ok((mut socket, _)) = tokio_listener.accept().await {
-                    let tx = tx.clone();
-                    tokio::spawn(async move {
-                        let mut buf = vec![0u8; 2048];
-                        if let Ok(n) = socket.read(&mut buf).await {
-                            if n > 0 {
-                                let content = String::from_utf8_lossy(&buf[..n]).trim().to_string();
-                                if !content.is_empty() {
-                                    let _ = tx.send(content);
-                                }
-                            }
-                        }
-                    });
-                }
-            }
-        });
-    }
 
     // 1. Hardware video acceleration environment setup
     std::env::set_var("GST_VAAPI_ALL_DRIVERS", "1");
