@@ -433,18 +433,41 @@ impl InnerTubeClient {
                 return None;
             }
 
-            let video_id = vm.get("contentId")
+            let video_id_opt = vm.get("contentId")
                 .and_then(|s| s.as_str())
+                .filter(|s| !s.is_empty() && !s.starts_with("PL") && !s.starts_with("RD"))
                 .or_else(|| {
                     vm.get("rendererContext")
                         .and_then(|r| r.get("commandContext"))
                         .and_then(|c| c.get("onTap"))
-                        .and_then(|t| t.get("innertubeCommand"))
+                        .and_then(|t| t.get("innertubeCommand").or(Some(t)))
                         .and_then(|i| i.get("watchEndpoint"))
                         .and_then(|w| w.get("videoId"))
                         .and_then(|s| s.as_str())
-                })?
-                .to_string();
+                })
+                .or_else(|| {
+                    vm.get("onTap")
+                        .and_then(|t| t.get("innertubeCommand").or(Some(t)))
+                        .and_then(|i| i.get("watchEndpoint"))
+                        .and_then(|w| w.get("videoId"))
+                        .and_then(|s| s.as_str())
+                });
+
+            let Some(raw_vid) = video_id_opt else {
+                return None;
+            };
+
+            let video_id = if raw_vid.len() == 11 {
+                raw_vid.to_string()
+            } else if let Some(idx) = raw_vid.find("v=") {
+                raw_vid[idx + 2..].chars().take(11).collect()
+            } else if let Some(stripped) = raw_vid.strip_prefix("shorts/") {
+                stripped.chars().take(11).collect()
+            } else if raw_vid.len() > 11 {
+                raw_vid.chars().take(11).collect()
+            } else {
+                return None;
+            };
 
             let meta = vm.get("metadata").and_then(|m| m.get("lockupMetadataViewModel"));
 
@@ -569,6 +592,14 @@ impl InnerTubeClient {
                 .unwrap_or("")
                 .to_string();
 
+            let thumbnail_url = if thumbnail_url.starts_with("//") {
+                format!("https:{thumbnail_url}")
+            } else if thumbnail_url.is_empty() {
+                format!("https://i.ytimg.com/vi/{video_id}/mqdefault.jpg")
+            } else {
+                thumbnail_url
+            };
+
             let is_live = duration_str.to_lowercase().contains("en vivo") || duration_str.to_lowercase().contains("live");
 
             let mut parts: Vec<&str> = Vec::with_capacity(2);
@@ -605,7 +636,15 @@ impl InnerTubeClient {
             .or_else(|| val.get("compactVideoRenderer"))
             .or_else(|| val.get("gridVideoRenderer"))?;
 
-        let video_id = renderer.get("videoId")?.as_str()?.to_string();
+        let video_id = renderer.get("videoId")
+            .and_then(|s| s.as_str())
+            .or_else(|| {
+                renderer.get("navigationEndpoint")
+                    .and_then(|n| n.get("watchEndpoint"))
+                    .and_then(|w| w.get("videoId"))
+                    .and_then(|s| s.as_str())
+            })?
+            .to_string();
 
         let title = renderer.get("title")
             .and_then(|t| {

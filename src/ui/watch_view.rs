@@ -1630,11 +1630,6 @@ pub fn view_compact_card<'a, Message: Clone + 'static>(
             .into()
     };
 
-    let thumb_btn = button(thumb_element)
-        .style(ghost_button)
-        .padding(0)
-        .on_press(on_open_video(vid_id.clone()));
-
     let title_cow: std::borrow::Cow<'a, str> = if video.title.chars().count() > 50 {
         let mut t: String = video.title.chars().take(47).collect();
         t.push_str("...");
@@ -1652,15 +1647,10 @@ pub fn view_compact_card<'a, Message: Clone + 'static>(
         ..COLOR_TEXT_SECONDARY
     };
 
-    let title_btn = button(
-        text(title_cow)
-            .size(13)
-            .line_height(iced::widget::text::LineHeight::Relative(1.2))
-            .color(title_color),
-    )
-    .style(ghost_button)
-    .padding(0)
-    .on_press(on_open_video(vid_id.clone()));
+    let title_elem = text(title_cow)
+        .size(13)
+        .line_height(iced::widget::text::LineHeight::Relative(1.2))
+        .color(title_color);
 
     let chan_btn = button(text(&video.channel_name).size(12).color(secondary_color))
         .style(ghost_button)
@@ -1691,9 +1681,9 @@ pub fn view_compact_card<'a, Message: Clone + 'static>(
     .padding([2, 6])
     .on_press(on_add_to_queue(video_clone));
 
-    let info_col = column![title_btn, chan_btn, meta, queue_btn].spacing(3).width(Length::Fill);
+    let info_col = column![title_elem, chan_btn, meta, queue_btn].spacing(3).width(Length::Fill);
 
-    let card_btn = button(row![thumb_btn, info_col].spacing(10).align_y(Alignment::Start))
+    let card_btn = button(row![thumb_element, info_col].spacing(10).align_y(Alignment::Start))
         .style(video_card_button)
         .padding(4)
         .on_press(on_open_video(vid_id.clone()));

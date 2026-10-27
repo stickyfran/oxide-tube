@@ -814,6 +814,8 @@ async fn run_instance<P, C>(
                         debug.draw_finished();
 
                         if new_mouse_interaction != window.mouse_interaction {
+                            let is_visible = new_mouse_interaction != mouse::Interaction::None;
+                            window.raw.set_cursor_visible(is_visible);
                             window.raw.set_cursor(
                                 conversion::mouse_interaction(
                                     new_mouse_interaction,
@@ -886,6 +888,8 @@ async fn run_instance<P, C>(
 
                             if new_mouse_interaction != window.mouse_interaction
                             {
+                                let is_visible = new_mouse_interaction != mouse::Interaction::None;
+                                window.raw.set_cursor_visible(is_visible);
                                 window.raw.set_cursor(
                                     conversion::mouse_interaction(
                                         new_mouse_interaction,
@@ -1476,6 +1480,11 @@ fn run_action<P, C>(
             window::Action::DisableMousePassthrough(id) => {
                 if let Some(window) = window_manager.get_mut(id) {
                     let _ = window.raw.set_cursor_hittest(true);
+                }
+            }
+            window::Action::SetVisible(id, visible) => {
+                if let Some(window) = window_manager.get_mut(id) {
+                    window.raw.set_visible(visible);
                 }
             }
         },

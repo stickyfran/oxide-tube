@@ -7,6 +7,7 @@ mod player;
 mod power_manager;
 mod ui;
 mod diagnostics;
+mod tray;
 
 use auth::AuthSession;
 use config::{AppConfig, PreferredCodec, PreferredResolution};
@@ -177,6 +178,9 @@ pub enum Message {
     EventOccurred(iced::Event, Id),
     WindowIdFound(Option<Id>),
     WindowMaximized(bool),
+    ToggleCloseToTray,
+    RestoreFromTray,
+    QuitApp,
 }
 
 #[derive(Debug, Clone)]
@@ -275,6 +279,7 @@ pub struct MitubApp {
     inactive_tab_osd_state: OsdState,
     auto_pip_triggered_by_unfocus: bool,
     is_window_minimized: bool,
+    is_window_hidden: bool,
 }
 
 fn get_ipc_port() -> u16 {
@@ -323,9 +328,24 @@ fn ipc_url_stream() -> impl iced::futures::Stream<Item = Message> {
             if let Ok(n) = socket.read(&mut buf).await {
                 if n > 0 {
                     let content = String::from_utf8_lossy(&buf[..n]).trim().to_string();
-                    if !content.is_empty() {
-                        let _ = output.send(Message::IpcUrlReceived(content)).await;
-                    }
+                    let _ = output.send(Message::IpcUrlReceived(content)).await;
+                }
+            }
+        }
+    })
+}
+
+fn tray_action_stream() -> impl iced::futures::Stream<Item = Message> {
+    iced::stream::channel(10, |mut output: iced::futures::channel::mpsc::Sender<Message>| async move {
+        use iced::futures::SinkExt;
+        let mut rx = crate::tray::start_tray_service();
+        while let Some(action) = rx.recv().await {
+            match action {
+                crate::tray::TrayAction::Restore => {
+                    let _ = output.send(Message::RestoreFromTray).await;
+                }
+                crate::tray::TrayAction::Quit => {
+                    let _ = output.send(Message::QuitApp).await;
                 }
             }
         }
@@ -1170,6 +1190,7 @@ impl MitubApp {
             inactive_tab_osd_state: OsdState::default(),
             auto_pip_triggered_by_unfocus: false,
             is_window_minimized: false,
+            is_window_hidden: false,
         };
 
         // Initial tasks: fetch home feed & bind Wayland window pointers
@@ -3922,6 +3943,42 @@ impl MitubApp {
                 Task::none()
             }
 
+            Message::ToggleCloseToTray => {
+                self.config.close_to_tray = !self.config.close_to_tray;
+                self.config.save_async();
+                Task::none()
+            }
+
+            Message::RestoreFromTray => {
+                if let Some(main_id) = self.main_window_id {
+                    self.is_window_hidden = false;
+                    self.focused_window = Some(main_id);
+                    self.is_window_focused = true;
+                    self.is_window_minimized = false;
+                    return Task::batch([
+                        window::set_visible(main_id, true),
+                        window::minimize(main_id, false),
+                        window::gain_focus(main_id),
+                    ]);
+                }
+                Task::none()
+            }
+
+            Message::QuitApp => {
+                if self.pip_window_id.is_some() {
+                    save_current_kwin_pip_position(&mut self.config);
+                }
+                self.save_session();
+                self.config.save();
+                if !self.is_fullscreen && self.pip_window_id.is_none() {
+                    save_window_state(self.window_size.0, self.window_size.1, self.is_maximized);
+                }
+                if let Some(player) = self.player.as_ref() {
+                    player.shutdown_sync();
+                }
+                std::process::exit(0);
+            }
+
             Message::ScalePip(scale) => {
                 if let Some(pip_id) = self.pip_window_id {
                     self.last_pip_resize_edge = None;
@@ -3964,9 +4021,11 @@ impl MitubApp {
 
                 let mut tasks = Vec::new();
                 if let Some(main_id) = self.main_window_id {
+                    self.is_window_hidden = false;
                     self.focused_window = Some(main_id);
                     self.is_window_focused = true;
                     self.is_window_minimized = false;
+                    tasks.push(window::set_visible(main_id, true));
                     tasks.push(window::minimize(main_id, false));
                     tasks.push(window::gain_focus(main_id));
                 }
@@ -4839,19 +4898,23 @@ impl MitubApp {
                                 self.osd_state.hover_seek_ratio = None;
                             }
                         } else if matches!(self.current_view, ViewMode::Watch(_) | ViewMode::VideoFullscreen) {
-                            let was_visible = self.osd_state.is_visible;
-                            self.osd_state.on_mouse_move();
-                            if self.is_fullscreen && !was_visible {
-                                self.sync_player_viewport();
-                            }
-
-                            // Calculate exact seek bar geometry so hovering/clicking bottom buttons never triggers seeks!
+                            // Calculate exact video player geometry: only awaken OSD controls if cursor is within player bounds
                             let (win_w, win_h) = self.window_size;
                             let (px, py, pw, ph) = if self.is_fullscreen {
                                 (0.0, 0.0, win_w, win_h)
                             } else {
                                 self.get_windowed_player_rect()
                             };
+
+                            let in_player = position.x >= px && position.x <= px + pw && position.y >= py && position.y <= py + ph;
+
+                            if in_player && significant_move {
+                                let was_visible = self.osd_state.is_visible;
+                                self.osd_state.on_mouse_move();
+                                if self.is_fullscreen && !was_visible {
+                                    self.sync_player_viewport();
+                                }
+                            }
 
                             let pad_x = px + 12.0;
                             let seek_w = (pw - 24.0).max(1.0);
@@ -5086,6 +5149,16 @@ impl MitubApp {
                         if Some(win_id) == self.pip_window_id {
                             return self.update(Message::ClosePip);
                         } else if Some(win_id) == self.main_window_id {
+                            if self.config.close_to_tray {
+                                self.is_window_hidden = true;
+                                self.save_session();
+                                self.config.save();
+                                if !self.is_fullscreen && self.pip_window_id.is_none() {
+                                    save_window_state(self.window_size.0, self.window_size.1, self.is_maximized);
+                                }
+                                return window::set_visible(win_id, false);
+                            }
+
                             if self.pip_window_id.is_some() {
                                 save_current_kwin_pip_position(&mut self.config);
                             }
@@ -6303,6 +6376,7 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
                 self.config.preferred_audio_lang,
                 self.config.auto_pip_on_unfocus,
                 self.config.full_buffer_tabs,
+                self.config.close_to_tray,
                 self.config.max_cache_size_bytes,
                 self.current_cache_size_bytes,
                 Message::CookieInputChanged,
@@ -6318,6 +6392,7 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
                 Message::SetPreferredAudioLanguage,
                 Message::ToggleAutoPipOnUnfocus,
                 Message::ToggleFullBufferTabs,
+                Message::ToggleCloseToTray,
                 Message::SetCacheLimitIndex,
                 Message::ClearCache,
                 Message::ToggleLoginModal,
@@ -6461,6 +6536,7 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
         }
 
         subs.push(Subscription::run(ipc_url_stream));
+        subs.push(Subscription::run(tray_action_stream));
 
         Subscription::batch(subs)
     }

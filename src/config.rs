@@ -128,6 +128,12 @@ pub struct AppConfig {
     pub cached_avatar_url: Option<String>,
     #[serde(default = "crate::cache_manager::default_cache_limit")]
     pub max_cache_size_bytes: u64,
+    #[serde(default = "default_true")]
+    pub close_to_tray: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for AppConfig {
@@ -153,6 +159,7 @@ impl Default for AppConfig {
             cached_user_name: None,
             cached_avatar_url: None,
             max_cache_size_bytes: crate::cache_manager::default_cache_limit(),
+            close_to_tray: true,
         }
     }
 }

@@ -162,6 +162,9 @@ pub enum Action {
     /// This enables mouse events for the window and stops mouse events
     /// from being passed to whatever is underneath.
     DisableMousePassthrough(Id),
+
+    /// Sets the window visibility.
+    SetVisible(Id, bool),
 }
 
 /// Subscribes to the frames of the window of the running application.
@@ -449,3 +452,9 @@ pub fn enable_mouse_passthrough<Message>(id: Id) -> Task<Message> {
 pub fn disable_mouse_passthrough<Message>(id: Id) -> Task<Message> {
     task::effect(crate::Action::Window(Action::DisableMousePassthrough(id)))
 }
+
+/// Sets the visibility of the window with the given [`Id`].
+pub fn set_visible<T>(id: Id, visible: bool) -> Task<T> {
+    task::effect(crate::Action::Window(Action::SetVisible(id, visible)))
+}
+

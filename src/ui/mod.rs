@@ -603,6 +603,7 @@ pub fn view_auth_modal<'a, Message: Clone + 'static>(
     current_audio_lang: PreferredAudioLanguage,
     auto_pip_on_unfocus: bool,
     full_buffer_tabs: bool,
+    close_to_tray: bool,
     max_cache_size_bytes: u64,
     current_cache_size_bytes: u64,
     on_cookie_input: impl Fn(String) -> Message + 'static,
@@ -618,6 +619,7 @@ pub fn view_auth_modal<'a, Message: Clone + 'static>(
     on_select_audio_lang: impl Fn(PreferredAudioLanguage) -> Message + Copy + 'static,
     on_toggle_auto_pip: Message,
     on_toggle_full_buffer_tabs: Message,
+    on_toggle_close_to_tray: Message,
     on_change_cache_limit: impl Fn(usize) -> Message + Copy + 'static,
     on_clear_cache: Message,
     on_close_modal: Message,
@@ -845,6 +847,35 @@ pub fn view_auth_modal<'a, Message: Clone + 'static>(
     .size(11)
     .color(COLOR_TEXT_SECONDARY);
 
+    // Modo Minimizar / Cerrar a la Bandeja del Sistema (Tray)
+    let close_to_tray_btn = button(
+        row![
+            if close_to_tray {
+                icon_check_circle(15.0)
+            } else {
+                icon_close(15.0)
+            },
+            text(if close_to_tray {
+                "Cerrar a la Bandeja del Sistema (Segundo plano): ACTIVADO"
+            } else {
+                "Cerrar a la Bandeja del Sistema (Segundo plano): Desactivado"
+            })
+            .size(12),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center),
+    )
+    .style(if close_to_tray { primary_button } else { secondary_button })
+    .padding([6, 14])
+    .on_press(on_toggle_close_to_tray);
+
+    let close_to_tray_hint = text(
+        "Al pulsar la X de la ventana, Mitub continuará reproduciendo audio y video en segundo plano\n\
+        y se mantendrá en la bandeja del sistema (tray). Al hacer clic en el icono o abrir la app se restaura.",
+    )
+    .size(11)
+    .color(COLOR_TEXT_SECONDARY);
+
     // 4. Section: Límite y Gestión de Caché
     let cache_heading = text("Almacenamiento y Límite de Caché de Video")
         .size(13)
@@ -1049,12 +1080,15 @@ pub fn view_auth_modal<'a, Message: Clone + 'static>(
 
     let card_features = section_card(
         column![
-            text("Multitarea y Pestañas").size(13).color(COLOR_TEXT_PRIMARY),
+            text("Multitarea, Pestañas y Sistema").size(13).color(COLOR_TEXT_PRIMARY),
             auto_pip_btn,
             auto_pip_hint,
             Space::with_height(Length::Fixed(4.0)),
             buffer_tabs_btn,
             buffer_tabs_hint,
+            Space::with_height(Length::Fixed(4.0)),
+            close_to_tray_btn,
+            close_to_tray_hint,
         ]
         .spacing(8),
     );
