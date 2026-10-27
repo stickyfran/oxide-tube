@@ -9,6 +9,11 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 #[tokio::test]
 async fn test_benchmark_full_playback_lifecycle() {
+    if std::env::var("CI").is_ok() || std::env::var("GITHUB_ACTIONS").is_ok() {
+        println!("Skipping test_benchmark_full_playback_lifecycle in CI environment");
+        return;
+    }
+
     diagnostics::set_debug_enabled(true);
 
     let test_video_id = "jNQXAC9IVRw";

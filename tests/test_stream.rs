@@ -3,6 +3,11 @@ use tokio::sync::RwLock;
 
 #[tokio::test]
 async fn test_fetch_watch_details() {
+    if std::env::var("CI").is_ok() || std::env::var("GITHUB_ACTIONS").is_ok() {
+        println!("Skipping test_fetch_watch_details in CI environment");
+        return;
+    }
+
     let session = mitub::auth::AuthSession::auto_load();
     let client = mitub::innertube::InnerTubeClient::new(Arc::new(RwLock::new(session)));
 
@@ -43,6 +48,11 @@ async fn test_fetch_watch_details() {
 
 #[tokio::test]
 async fn test_user_profile() {
+    if std::env::var("CI").is_ok() || std::env::var("GITHUB_ACTIONS").is_ok() {
+        println!("Skipping test_user_profile in CI environment");
+        return;
+    }
+
     let session = mitub::auth::AuthSession::auto_load();
     let client = mitub::innertube::InnerTubeClient::new(Arc::new(RwLock::new(session)));
     let (avatar, name) = client.get_user_profile().await;
