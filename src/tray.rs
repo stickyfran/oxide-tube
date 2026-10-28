@@ -148,8 +148,10 @@ mod linux {
             // Handled via DBusMenu on /MenuBar
         }
 
-        fn provide_xdg_activation_token(&self, _token: &str) {
-            let _ = self.sender.send(TrayAction::Restore);
+        fn provide_xdg_activation_token(&self, token: &str) {
+            if !token.is_empty() {
+                std::env::set_var("XDG_ACTIVATION_TOKEN", token);
+            }
         }
 
         fn scroll(&self, _delta: i32, _orientation: &str) {}
