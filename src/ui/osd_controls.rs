@@ -890,7 +890,8 @@ pub fn view_floating_dropdown_menu<'a, Message: Clone + 'static>(
             .max_height(265.0)
             .padding([10, 12])
             .style(osd_container),
-        );
+        )
+        .on_press(on_close_menus.clone());
 
         return Some(
             row![
@@ -952,7 +953,8 @@ pub fn view_floating_dropdown_menu<'a, Message: Clone + 'static>(
             .max_height(225.0)
             .padding([10, 12])
             .style(osd_container),
-        );
+        )
+        .on_press(on_close_menus.clone());
 
         return Some(
             row![
@@ -1015,7 +1017,8 @@ pub fn view_floating_dropdown_menu<'a, Message: Clone + 'static>(
             .max_height(225.0)
             .padding([10, 12])
             .style(osd_container),
-        );
+        )
+        .on_press(on_close_menus.clone());
 
         return Some(
             row![
@@ -1110,7 +1113,8 @@ pub fn view_floating_dropdown_menu<'a, Message: Clone + 'static>(
             .max_height(225.0)
             .padding([10, 12])
             .style(osd_container),
-        );
+        )
+        .on_press(on_close_menus.clone());
 
         return Some(
             row![
@@ -1343,13 +1347,9 @@ pub fn view_control_bar<'a, Message: Clone + 'static>(
         }
     }
 
-    let empty_center_spacer: Element<'a, Message> = if state.has_open_menu() {
-        mouse_area(Space::new(Length::Fill, Length::Fixed(34.0)))
-            .on_press(on_close_menus.clone())
-            .into()
-    } else {
-        Space::new(Length::Fill, Length::Fixed(34.0)).into()
-    };
+    let empty_center_spacer: Element<'a, Message> = mouse_area(Space::new(Length::Fill, Length::Fixed(34.0)))
+        .on_press(on_close_menus.clone())
+        .into();
 
     let mut controls_row = row![
         play_btn,
@@ -1414,9 +1414,12 @@ pub fn view_control_bar<'a, Message: Clone + 'static>(
         .height(Length::Fixed(tooltip_h));
 
         outer_col = outer_col.push(
-            container(tooltip_canvas)
-                .width(Length::Fill)
-                .padding([0, 12]),
+            mouse_area(
+                container(tooltip_canvas)
+                    .width(Length::Fill)
+                    .padding([0, 12]),
+            )
+            .on_press(on_close_menus.clone()),
         );
     }
 
@@ -1427,14 +1430,9 @@ pub fn view_control_bar<'a, Message: Clone + 'static>(
     .padding([8, 12])
     .width(Length::Fill);
 
-    let bottom_bar_inner: Element<'a, Message> = if state.has_open_menu() {
-        iced::widget::mouse_area(bottom_bar_box)
-            .on_press(on_close_menus.clone())
-            .into()
-    } else {
-        iced::widget::mouse_area(bottom_bar_box)
-            .into()
-    };
+    let bottom_bar_inner: Element<'a, Message> = iced::widget::mouse_area(bottom_bar_box)
+        .on_press(on_close_menus.clone())
+        .into();
 
     outer_col = outer_col.push(bottom_bar_inner);
 
