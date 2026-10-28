@@ -101,6 +101,12 @@ pub fn window_attributes(
 
     #[cfg(target_os = "linux")]
     {
+        let app_id = if settings.platform_specific.application_id.is_empty() {
+            "tube-oxide"
+        } else {
+            &settings.platform_specific.application_id
+        };
+
         #[cfg(feature = "x11")]
         {
             use winit::platform::x11::WindowAttributesExtX11;
@@ -110,8 +116,8 @@ pub fn window_attributes(
                     settings.platform_specific.override_redirect,
                 )
                 .with_name(
-                    &settings.platform_specific.application_id,
-                    &settings.platform_specific.application_id,
+                    app_id,
+                    app_id,
                 );
         }
         #[cfg(feature = "wayland")]
@@ -119,8 +125,8 @@ pub fn window_attributes(
             use winit::platform::wayland::WindowAttributesExtWayland;
 
             attributes = attributes.with_name(
-                &settings.platform_specific.application_id,
-                &settings.platform_specific.application_id,
+                app_id,
+                app_id,
             );
         }
     }

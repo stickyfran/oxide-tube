@@ -4794,6 +4794,7 @@ dependencies = [
  "simd-json",
  "tokio",
  "url",
+ "windows-sys 0.52.0",
  "zbus 5.19.0",
 ]
 

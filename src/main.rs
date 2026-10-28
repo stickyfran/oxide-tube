@@ -98,6 +98,7 @@ pub enum Message {
     SelectSuggestion(String),
     VideoHitboxClicked,
     PlayPauseToggle,
+    StopPlayback,
     Seek(u64),
     SeekRelative(i64),
     WindowMinimizedStatus(bool),
@@ -345,6 +346,12 @@ fn tray_action_stream() -> impl iced::futures::Stream<Item = Message> {
                 crate::tray::TrayAction::Restore => {
                     let _ = output.send(Message::RestoreFromTray).await;
                 }
+                crate::tray::TrayAction::PlayPause => {
+                    let _ = output.send(Message::PlayPauseToggle).await;
+                }
+                crate::tray::TrayAction::Stop => {
+                    let _ = output.send(Message::StopPlayback).await;
+                }
                 crate::tray::TrayAction::Quit => {
                     let _ = output.send(Message::QuitApp).await;
                 }
@@ -386,7 +393,7 @@ focusstealingrule=3
 {pos_line}{size_line}title=PiP
 titlematch=2
 types=1
-wmclass=mitub
+wmclass=tube-oxide
 wmclassmatch=1");
 
     let mut new_content = String::new();
@@ -3266,6 +3273,17 @@ impl MitubApp {
                     self.osd_state.play_pause_anim = Some((std::time::Instant::now(), is_play));
                     self.power_manager.set_screensaver_inhibit(is_play);
                 }
+                Task::none()
+            }
+
+            Message::StopPlayback => {
+                if let Some(player) = &self.player {
+                    player.stop();
+                }
+                self.playing_video_id = None;
+                self.video_started_at = None;
+                self.osd_state.is_playing = false;
+                self.power_manager.set_screensaver_inhibit(false);
                 Task::none()
             }
 
@@ -6718,11 +6736,52 @@ fn load_app_icon() -> Option<window::Icon> {
 // Renamed alias to avoid confusion with iced::widget::image
 use ::image as image_crate;
 
+#[cfg(target_os = "linux")]
+fn ensure_desktop_integration() {
+    let Some(data_dir) = dirs::data_local_dir() else { return };
+    let apps_dir = data_dir.join("applications");
+    let icons_base = data_dir.join("icons/hicolor");
+    let pixmaps_dir = data_dir.join("pixmaps");
+
+    let _ = fs::create_dir_all(&apps_dir);
+    let _ = fs::create_dir_all(&pixmaps_dir);
+
+    let desktop_content = "\
+[Desktop Entry]
+Categories=AudioVideo;Video;Player;Network;
+Comment=Cliente Nativo de YouTube en 100% Rust (Zero-Copy Wayland + libmpv + iced)
+Exec=tube-oxide %u
+Icon=tube-oxide
+Keywords=youtube;video;streaming;media;wayland;oxide;tube;
+Name=Tube-oxide
+NoDisplay=false
+MimeType=x-scheme-handler/vnd.youtube;x-scheme-handler/youtube;video/x-youtube;
+StartupNotify=true
+StartupWMClass=tube-oxide
+Terminal=false
+Type=Application
+";
+    let _ = fs::write(apps_dir.join("tube-oxide.desktop"), desktop_content);
+
+    let icon_bytes = include_bytes!("../assets/icon.png");
+    let _ = fs::write(pixmaps_dir.join("tube-oxide.png"), icon_bytes);
+
+    let sizes = ["16x16", "32x32", "48x48", "64x64", "128x128", "256x256", "512x512", "scalable"];
+    for sz in sizes {
+        let dir = icons_base.join(sz).join("apps");
+        let _ = fs::create_dir_all(&dir);
+        let _ = fs::write(dir.join("tube-oxide.png"), icon_bytes);
+    }
+}
+
 fn main() -> iced::Result {
     #[cfg(target_os = "linux")]
     unsafe {
         libc::prctl(libc::PR_SET_NAME, b"Tube-oxide\0".as_ptr() as *const libc::c_char);
     }
+
+    #[cfg(target_os = "linux")]
+    ensure_desktop_integration();
 
     // Check if an argument (e.g. YouTube URL or RESTORE) was passed and an existing instance is already running
     let arg = std::env::args().nth(1).unwrap_or_else(|| "RESTORE".to_string());
