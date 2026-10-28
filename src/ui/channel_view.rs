@@ -19,17 +19,7 @@ pub fn view_channel_page<'a, Message: Clone + 'static>(
     on_open_video_new_tab: impl Fn(String) -> Message + Copy + 'static,
     on_open_channel: impl Fn(String) -> Message + Copy + 'static,
 ) -> Element<'a, Message> {
-    let chunk_size = if window_width < 700.0 {
-        1
-    } else if window_width < 1100.0 {
-        2
-    } else if window_width < 1650.0 {
-        3
-    } else if window_width < 2200.0 {
-        4
-    } else {
-        5
-    };
+    let (chunk_size, thumb_height) = crate::ui::home_view::calculate_grid_layout(window_width);
     let blur = blur_amount.clamp(0.0, 1.0);
 
     // Top banner (real banner image when available, fallback to surface container)
@@ -127,18 +117,18 @@ pub fn view_channel_page<'a, Message: Clone + 'static>(
     // Video grid of selected tab
     let selected_videos = channel.tabs.get(selected_tab_idx).map(|t| &t.videos[..]).unwrap_or(&[]);
 
-    let mut grid = column![].spacing(24).padding([16, 24]).width(Length::Fill);
+    let mut grid = column![].spacing(40).padding([16, 24]).width(Length::Fill);
     if selected_videos.is_empty() {
         for _ in 0..2 {
-            let mut row_cards = row![].spacing(20).width(Length::Fill);
+            let mut row_cards = row![].spacing(16).width(Length::Fill);
             for _ in 0..chunk_size {
-                row_cards = row_cards.push(view_skeleton_card());
+                row_cards = row_cards.push(view_skeleton_card(thumb_height));
             }
             grid = grid.push(row_cards);
         }
     } else {
         for chunk in selected_videos.chunks(chunk_size) {
-            let mut row_cards = row![].spacing(20).width(Length::Fill);
+            let mut row_cards = row![].spacing(16).width(Length::Fill);
             let chunk_len = chunk.len();
             for video in chunk {
                 let thumb = thumbnail_cache.get(&video.thumbnail_url);
@@ -152,6 +142,7 @@ pub fn view_channel_page<'a, Message: Clone + 'static>(
                     avatar,
                     blurred_avatar,
                     blur_amount,
+                    thumb_height,
                     on_open_video,
                     on_open_video_new_tab,
                     on_open_channel,

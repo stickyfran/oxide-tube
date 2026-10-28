@@ -172,18 +172,29 @@ pub fn search_input(_theme: &iced::Theme, status: text_input::Status) -> text_in
     }
 }
 
-pub fn video_card_button(_theme: &iced::Theme, status: button::Status) -> button::Style {
-    match status {
-        button::Status::Hovered => button::Style {
-            background: Some(Color::from_rgba(1.0, 1.0, 1.0, 0.04).into()),
-            border: border::rounded(12),
-            ..button::Style::default()
-        },
-        _ => button::Style {
-            background: Some(Color::TRANSPARENT.into()),
-            border: border::rounded(12),
-            ..button::Style::default()
-        },
+pub fn yt_badge_container(_theme: &iced::Theme) -> container::Style {
+    container::Style {
+        background: Some(Color::from_rgba(0.0, 0.0, 0.0, 0.8).into()),
+        border: border::rounded(4),
+        text_color: Some(Color::WHITE),
+        ..container::Style::default()
+    }
+}
+
+pub fn yt_live_badge_container(_theme: &iced::Theme) -> container::Style {
+    container::Style {
+        background: Some(Color::from_rgb8(0xcc, 0x00, 0x00).into()),
+        border: border::rounded(4),
+        text_color: Some(Color::WHITE),
+        ..container::Style::default()
+    }
+}
+
+pub fn video_card_button(_theme: &iced::Theme, _status: button::Status) -> button::Style {
+    button::Style {
+        background: Some(Color::TRANSPARENT.into()),
+        border: border::rounded(0),
+        ..button::Style::default()
     }
 }
 
