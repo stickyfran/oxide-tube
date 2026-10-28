@@ -5,7 +5,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
-use mitub::player::{render_stats, WaylandZeroCopyPlayer};
+use tube_oxide::player::{render_stats, WaylandZeroCopyPlayer};
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -31,8 +31,8 @@ async fn bench_render_path() {
     let secs: u64 = std::env::var("MITUB_BENCH_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(20);
     let vid = std::env::var("MITUB_BENCH_VIDEO").unwrap_or_else(|_| "U-QiUAMda7Y".into());
 
-    let session = mitub::auth::AuthSession::auto_load();
-    let client = mitub::innertube::InnerTubeClient::new(Arc::new(RwLock::new(session)));
+    let session = tube_oxide::auth::AuthSession::auto_load();
+    let client = tube_oxide::innertube::InnerTubeClient::new(Arc::new(RwLock::new(session)));
     let d = match client.get_watch_details(&vid).await {
         Ok(details) => details,
         Err(e) => {

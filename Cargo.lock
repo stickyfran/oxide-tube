@@ -2633,35 +2633,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "mitub"
-version = "0.99.0"
-dependencies = [
- "base64 0.23.1",
- "bytes",
- "chrono",
- "core_affinity",
- "crossbeam-channel",
- "dirs 5.0.1",
- "futures-util",
- "hex",
- "iced",
- "iced_wgpu",
- "image",
- "libc",
- "mimalloc",
- "raw-window-handle",
- "reqwest",
- "rusqlite",
- "serde",
- "serde_json",
- "sha1",
- "simd-json",
- "tokio",
- "url",
- "zbus 5.19.0",
-]
-
-[[package]]
 name = "multiversion_no_op"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4796,6 +4767,35 @@ name = "ttf-parser"
 version = "0.25.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d2df906b07856748fa3f6e0ad0cbaa047052d4a7dd609e231c4f72cee8c36f31"
+
+[[package]]
+name = "tube-oxide"
+version = "0.99.0"
+dependencies = [
+ "base64 0.23.1",
+ "bytes",
+ "chrono",
+ "core_affinity",
+ "crossbeam-channel",
+ "dirs 5.0.1",
+ "futures-util",
+ "hex",
+ "iced",
+ "iced_wgpu",
+ "image",
+ "libc",
+ "mimalloc",
+ "raw-window-handle",
+ "reqwest",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha1",
+ "simd-json",
+ "tokio",
+ "url",
+ "zbus 5.19.0",
+]
 
 [[package]]
 name = "typenum"

@@ -8,8 +8,8 @@ async fn test_fetch_watch_details() {
         return;
     }
 
-    let session = mitub::auth::AuthSession::auto_load();
-    let client = mitub::innertube::InnerTubeClient::new(Arc::new(RwLock::new(session)));
+    let session = tube_oxide::auth::AuthSession::auto_load();
+    let client = tube_oxide::innertube::InnerTubeClient::new(Arc::new(RwLock::new(session)));
 
     // Cold-start test (without calling get_home_feed first) to verify visitorData bootstrap + WebM selection
     let details = client
@@ -53,8 +53,8 @@ async fn test_user_profile() {
         return;
     }
 
-    let session = mitub::auth::AuthSession::auto_load();
-    let client = mitub::innertube::InnerTubeClient::new(Arc::new(RwLock::new(session)));
+    let session = tube_oxide::auth::AuthSession::auto_load();
+    let client = tube_oxide::innertube::InnerTubeClient::new(Arc::new(RwLock::new(session)));
     let (avatar, name) = client.get_user_profile().await;
     println!("User profile: avatar={:?}, name={:?}", avatar, name);
 }

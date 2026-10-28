@@ -38,42 +38,43 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Build release binary
-        run: cargo build --release --bin mitub
+        run: cargo build --release
 
       - name: Package tarball
         run: |
           mkdir -p package/bin package/share/applications package/share/icons/hicolor/scalable/apps
-          cp target/release/mitub package/bin/
-          cp assets/icon.png package/bin/oxide-tube.png 2>/dev/null || true
-          cat << 'EOF' > package/share/applications/oxide-tube.desktop
+          cp target/release/tube-oxide package/bin/
+          ln -sf tube-oxide package/bin/mitub
+          cp assets/icon.png package/bin/tube-oxide.png 2>/dev/null || true
+          cat << 'EOF' > package/share/applications/tube-oxide.desktop
           [Desktop Entry]
           Categories=AudioVideo;Video;Player;Network;
           Comment=Cliente Nativo de YouTube en 100% Rust (Zero-Copy Wayland + libmpv + iced)
-          Exec=mitub %u
-          Icon=oxide-tube
+          Exec=tube-oxide %u
+          Icon=tube-oxide
           Keywords=youtube;video;streaming;media;wayland;oxide;
-          Name=Oxide tube
+          Name=Tube-oxide
           NoDisplay=false
           MimeType=x-scheme-handler/vnd.youtube;x-scheme-handler/youtube;video/x-youtube;
           StartupNotify=true
-          StartupWMClass=mitub
+          StartupWMClass=tube-oxide
           Terminal=false
           Type=Application
           EOF
-          tar -czf oxidetube-linux-x86_64-${{ github.ref_name }}.tar.gz -C package .
-          cp target/release/mitub oxidetube-bin-linux-x86_64
+          tar -czf tube-oxide-linux-x86_64-${{ github.ref_name }}.tar.gz -C package .
+          cp target/release/tube-oxide tube-oxide-bin-linux-x86_64
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          name: OxideTube ${{ github.ref_name }}
+          name: Tube-oxide ${{ github.ref_name }}
           draft: false
           prerelease: false
           files: |
-            oxidetube-linux-x86_64-${{ github.ref_name }}.tar.gz
-            oxidetube-bin-linux-x86_64
+            tube-oxide-linux-x86_64-${{ github.ref_name }}.tar.gz
+            tube-oxide-bin-linux-x86_64
           body: |
-            ## OxideTube ${{ github.ref_name }}
+            ## Tube-oxide ${{ github.ref_name }}
             
             Cliente nativo de YouTube desarrollado en 100% Rust sobre `iced 0.13` y `libmpv`.
             

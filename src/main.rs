@@ -576,7 +576,7 @@ fn activate_kwin_main_window() {
 const clients = workspace.windowList();
 for (let i = 0; i < clients.length; i++) {
     const w = clients[i];
-    const isMitub = (w.resourceClass === "mitub" || (w.caption && (w.caption.indexOf("Mitub") !== -1 || w.caption.indexOf("Oxide") !== -1)));
+    const isMitub = (w.resourceClass === "tube-oxide" || w.resourceClass === "Tube-oxide" || w.resourceClass === "mitub" || (w.caption && (w.caption.indexOf("Tube-oxide") !== -1 || w.caption.indexOf("Oxide") !== -1 || w.caption.indexOf("Mitub") !== -1)));
     const isPip = w.caption && w.caption.indexOf("PiP") !== -1;
     if (isMitub && !isPip) {
         try { w.minimized = false; } catch(e) {}
@@ -614,6 +614,9 @@ for (let i = 0; i < clients.length; i++) {
             }
             // Fallback for X11 environments if wmctrl exists
             if std::path::Path::new("/usr/bin/wmctrl").exists() {
+                let _ = std::process::Command::new("/usr/bin/wmctrl")
+                    .args(["-x", "-a", "tube-oxide"])
+                    .output();
                 let _ = std::process::Command::new("/usr/bin/wmctrl")
                     .args(["-x", "-a", "mitub"])
                     .output();
@@ -1065,6 +1068,7 @@ impl MitubApp {
             transparent: true,
             decorations: true,
             icon: load_app_icon(),
+            exit_on_close_request: false,
             ..Settings::default()
         };
 
@@ -1367,6 +1371,74 @@ impl MitubApp {
         }
 
         (app, Task::batch(initial_tasks))
+    }
+
+    pub fn open_main_window(&mut self) -> Task<Message> {
+        let ((saved_w, saved_h), saved_maximized) = load_window_state();
+        let window_settings = Settings {
+            size: Size::new(saved_w, saved_h),
+            min_size: Some(Size::new(800.0, 600.0)),
+            transparent: true,
+            decorations: true,
+            icon: load_app_icon(),
+            exit_on_close_request: false,
+            ..Settings::default()
+        };
+
+        let (main_id, open_task) = window::open(window_settings);
+        self.main_window_id = Some(main_id);
+        self.focused_window = Some(main_id);
+        self.is_window_focused = true;
+        self.is_window_hidden = false;
+        self.is_window_minimized = false;
+
+        let handle_task = open_task
+            .then(move |id| {
+                window::run_with_handle(id, move |handle| {
+                    let surf_addr = match handle.as_raw() {
+                        RawWindowHandle::Wayland(h) => h.surface.as_ptr() as usize,
+                        _ => 0usize,
+                    };
+                    let disp_addr = if surf_addr != 0 {
+                        unsafe {
+                            let mut addr = 0usize;
+                            let lib = libc::dlopen(
+                                b"libwayland-client.so.0\0".as_ptr() as *const libc::c_char,
+                                libc::RTLD_LAZY,
+                            );
+                            if !lib.is_null() {
+                                let sym = libc::dlsym(
+                                    lib,
+                                    b"wl_proxy_get_display\0".as_ptr() as *const libc::c_char,
+                                );
+                                if !sym.is_null() {
+                                    let f: unsafe extern "C" fn(*mut std::ffi::c_void) -> *mut std::ffi::c_void =
+                                        std::mem::transmute(sym);
+                                    addr = f(surf_addr as *mut std::ffi::c_void) as usize;
+                                }
+                                libc::dlclose(lib);
+                            }
+                            addr
+                        }
+                    } else {
+                        0usize
+                    };
+                    (disp_addr, surf_addr)
+                })
+            })
+            .map(|(disp, surf)| Message::WindowHandleAcquired(disp, surf));
+
+        let focus_task = window::gain_focus(main_id);
+        let mut tasks = vec![handle_task, focus_task];
+        if saved_maximized {
+            tasks.push(window::maximize(main_id, true));
+        }
+        if let Some(player) = &self.player {
+            player.set_rendering_active(true);
+            self.sync_player_viewport();
+        }
+        activate_kwin_main_window();
+        Task::batch(tasks)
     }
 
     /// Starts the blur-in phase when navigating to a new page whose content is loading.
@@ -3959,13 +4031,19 @@ impl MitubApp {
                     self.focused_window = Some(main_id);
                     self.is_window_focused = true;
                     self.is_window_minimized = false;
+                    if let Some(player) = &self.player {
+                        player.set_rendering_active(true);
+                        self.sync_player_viewport();
+                    }
+                    activate_kwin_main_window();
                     return Task::batch([
                         window::set_visible(main_id, true),
                         window::minimize(main_id, false),
                         window::gain_focus(main_id),
                     ]);
+                } else {
+                    return self.open_main_window();
                 }
-                Task::none()
             }
 
             Message::QuitApp => {
@@ -4014,8 +4092,12 @@ impl MitubApp {
             }
 
             Message::IpcUrlReceived(raw_url) => {
-                let video_id_opt = extract_youtube_video_id(&raw_url).or_else(|| {
-                    let trimmed = raw_url.trim();
+                let trimmed = raw_url.trim();
+                if trimmed.eq_ignore_ascii_case("RESTORE") || trimmed.is_empty() {
+                    return self.update(Message::RestoreFromTray);
+                }
+
+                let video_id_opt = extract_youtube_video_id(trimmed).or_else(|| {
                     if trimmed.len() >= 10 && trimmed.len() <= 12 && trimmed.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
                         Some(trimmed.to_string())
                     } else {
@@ -4029,9 +4111,16 @@ impl MitubApp {
                     self.focused_window = Some(main_id);
                     self.is_window_focused = true;
                     self.is_window_minimized = false;
+                    if let Some(player) = &self.player {
+                        player.set_rendering_active(true);
+                        self.sync_player_viewport();
+                    }
+                    activate_kwin_main_window();
                     tasks.push(window::set_visible(main_id, true));
                     tasks.push(window::minimize(main_id, false));
                     tasks.push(window::gain_focus(main_id));
+                } else {
+                    tasks.push(self.open_main_window());
                 }
 
                 if let Some(vid) = video_id_opt {
@@ -5156,12 +5245,16 @@ impl MitubApp {
                         } else if Some(win_id) == self.main_window_id {
                             if self.config.close_to_tray {
                                 self.is_window_hidden = true;
+                                self.main_window_id = None;
                                 self.save_session();
                                 self.config.save();
                                 if !self.is_fullscreen && self.pip_window_id.is_none() {
                                     save_window_state(self.window_size.0, self.window_size.1, self.is_maximized);
                                 }
-                                return window::set_visible(win_id, false);
+                                if let Some(player) = &self.player {
+                                    player.set_rendering_active(false);
+                                }
+                                return window::close(win_id);
                             }
 
                             if self.pip_window_id.is_some() {
@@ -6626,14 +6719,17 @@ fn load_app_icon() -> Option<window::Icon> {
 use ::image as image_crate;
 
 fn main() -> iced::Result {
-    // Check if an argument (e.g. YouTube URL) was passed and an existing instance is already running
-    if let Some(arg) = std::env::args().nth(1) {
-        if try_send_to_existing_instance(&arg) {
-            println!("[Mitub IPC] Sent URL to existing instance successfully: {arg}");
-            return Ok(());
-        }
+    #[cfg(target_os = "linux")]
+    unsafe {
+        libc::prctl(libc::PR_SET_NAME, b"Tube-oxide\0".as_ptr() as *const libc::c_char);
     }
 
+    // Check if an argument (e.g. YouTube URL or RESTORE) was passed and an existing instance is already running
+    let arg = std::env::args().nth(1).unwrap_or_else(|| "RESTORE".to_string());
+    if try_send_to_existing_instance(&arg) {
+        println!("[Tube-oxide IPC] Sent command/URL to existing instance successfully: {arg}");
+        return Ok(());
+    }
 
     // 1. Hardware video acceleration environment setup
     std::env::set_var("GST_VAAPI_ALL_DRIVERS", "1");
@@ -6651,7 +6747,7 @@ fn main() -> iced::Result {
         std::env::set_var("WGPU_BACKEND", "gl");
     }
 
-    println!("[Mitub] Starting Native YouTube Client (100% Rust + libmpv + iced)");
+    println!("[Tube-oxide] Starting Native YouTube Client (100% Rust + libmpv + iced)");
 
     iced::daemon(MitubApp::title, MitubApp::update, MitubApp::view)
         .subscription(MitubApp::subscription)

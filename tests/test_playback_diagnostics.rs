@@ -1,4 +1,4 @@
-use mitub::diagnostics;
+use tube_oxide::diagnostics;
 use std::time::Instant;
 
 #[test]

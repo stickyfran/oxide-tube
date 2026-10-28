@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use mitub::diagnostics;
-use mitub::player::WaylandZeroCopyPlayer;
+use tube_oxide::diagnostics;
+use tube_oxide::player::WaylandZeroCopyPlayer;
 use std::time::Instant;
 
 #[global_allocator]
@@ -21,8 +21,8 @@ async fn test_benchmark_full_playback_lifecycle() {
 
     // 1. Measure API fetch latency
     let t_api_start = Instant::now();
-    let session = mitub::auth::AuthSession::auto_load();
-    let client = mitub::innertube::InnerTubeClient::new(Arc::new(RwLock::new(session)));
+    let session = tube_oxide::auth::AuthSession::auto_load();
+    let client = tube_oxide::innertube::InnerTubeClient::new(Arc::new(RwLock::new(session)));
     let details = client.get_watch_details(test_video_id).await.expect("Failed to get watch details");
     let api_elapsed = t_api_start.elapsed();
     diagnostics::session_details_loaded();
