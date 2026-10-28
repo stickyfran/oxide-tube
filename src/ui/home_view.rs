@@ -1,24 +1,44 @@
+use crate::config::{CardStyle, GridColumnsConfig};
 use crate::innertube::VideoCard;
-use crate::ui::icons::{icon_live_dot, view_avatar_image_or_badge};
+use crate::ui::icons::{icon_live_dot, view_avatar_image_or_badge_with_radius};
 use crate::ui::theme::*;
 use iced::widget::{button, column, container, image, mouse_area, row, scrollable, stack, text, Space};
 use iced::{Alignment, Element, Length};
 use std::collections::HashMap;
 
-/// Calculates responsive column count and 16:9 thumbnail height matching YouTube Desktop specs
-pub fn calculate_grid_layout(window_width: f32) -> (usize, f32) {
+/// Calculates column count and 16:9 thumbnail height matching YouTube Desktop specs
+pub fn calculate_grid_layout(window_width: f32, cols_pref: GridColumnsConfig) -> (usize, f32) {
     let padding = 48.0; // 24px left + 24px right
     let col_gap = 16.0;  // --ytd-rich-grid-item-margin: 16px
     let available_width = (window_width - padding).max(280.0);
 
-    // YouTube desktop enforces min-width of ~320px per item
-    let cols = ((available_width + col_gap) / (320.0 + col_gap)).floor() as usize;
-    let chunk_size = cols.clamp(1, 6);
+    let chunk_size: usize = match cols_pref {
+        GridColumnsConfig::Cols2 => 2,
+        GridColumnsConfig::Cols4 => 4,
+        GridColumnsConfig::Cols5 => 5,
+        GridColumnsConfig::Cols6 => 6,
+        GridColumnsConfig::Auto => {
+            // YouTube original desktop layout: 4 columns standard at 1080p
+            if window_width < 600.0 {
+                1
+            } else if window_width < 960.0 {
+                2
+            } else if window_width < 1280.0 {
+                3
+            } else if window_width < 1920.0 {
+                4
+            } else if window_width < 2400.0 {
+                5
+            } else {
+                6
+            }
+        }
+    };
 
     let total_gaps = (chunk_size.saturating_sub(1) as f32) * col_gap;
     let card_width = (available_width - total_gaps) / (chunk_size as f32);
     // Strict 16:9 aspect ratio
-    let thumb_height = ((card_width * 9.0 / 16.0).round()).clamp(130.0, 420.0);
+    let thumb_height = ((card_width * 9.0 / 16.0).round()).clamp(100.0, 500.0);
 
     (chunk_size, thumb_height)
 }
@@ -32,6 +52,7 @@ pub fn view_video_card<'a, Message: Clone + 'static>(
     blurred_avatar_handle: Option<&'a image::Handle>,
     blur_amount: f32,
     thumb_height: f32,
+    card_style: CardStyle,
     on_open_video: impl Fn(String) -> Message + 'static,
     on_open_video_new_tab: impl Fn(String) -> Message + 'static,
     on_open_channel: impl Fn(String) -> Message + 'static,
@@ -40,6 +61,11 @@ pub fn view_video_card<'a, Message: Clone + 'static>(
     let chan_id = video.channel_id.clone();
     let blur = blur_amount.clamp(0.0, 1.0);
     let text_alpha = (1.0 - blur * 0.62).clamp(0.25, 1.0);
+
+    let (thumb_radius, badge_radius, avatar_radius) = match card_style {
+        CardStyle::Squircle => (12, 4, 18.0),
+        CardStyle::Rectangular => (0, 0, 0.0),
+    };
 
     // YouTube-style duration or live badge
     let badge_element: Element<'a, Message> = if video.is_live {
@@ -54,7 +80,12 @@ pub fn view_video_card<'a, Message: Clone + 'static>(
             .align_y(Alignment::Center),
         )
         .padding([2, 5])
-        .style(yt_live_badge_container)
+        .style(move |_t| container::Style {
+            background: Some(iced::Color::from_rgb8(0xcc, 0x00, 0x00).into()),
+            border: iced::border::rounded(badge_radius),
+            text_color: Some(iced::Color::WHITE),
+            ..container::Style::default()
+        })
         .into()
     } else if !video.duration_str.is_empty() {
         container(
@@ -63,7 +94,12 @@ pub fn view_video_card<'a, Message: Clone + 'static>(
                 .color(iced::Color { a: text_alpha, ..iced::Color::WHITE }),
         )
         .padding([2, 4])
-        .style(yt_badge_container)
+        .style(move |_t| container::Style {
+            background: Some(iced::Color::from_rgba(0.0, 0.0, 0.0, 0.8).into()),
+            border: iced::border::rounded(badge_radius),
+            text_color: Some(iced::Color::WHITE),
+            ..container::Style::default()
+        })
         .into()
     } else {
         Space::with_width(Length::Fixed(0.0)).into()
@@ -79,7 +115,6 @@ pub fn view_video_card<'a, Message: Clone + 'static>(
     .height(Length::Fixed(thumb_height))
     .padding(6);
 
-    // Swap to Gaussian-blurred thumbnail handle during blur transition and cross-fade with a frosted veil
     let active_thumb = if blur > 0.20 {
         blurred_thumb_handle.or(thumb_handle)
     } else {
@@ -96,9 +131,9 @@ pub fn view_video_card<'a, Message: Clone + 'static>(
         container(Space::with_width(Length::Fill))
             .width(Length::Fill)
             .height(Length::Fixed(thumb_height))
-            .style(|_theme| container::Style {
+            .style(move |_theme| container::Style {
                 background: Some(iced::Color::from_rgb8(0x18, 0x18, 0x18).into()),
-                border: iced::border::rounded(12),
+                border: iced::border::rounded(thumb_radius),
                 ..container::Style::default()
             })
             .into()
@@ -111,14 +146,14 @@ pub fn view_video_card<'a, Message: Clone + 'static>(
             .height(Length::Fixed(thumb_height))
             .style(move |_t| container::Style {
                 background: Some(iced::Color::from_rgba(0.07, 0.07, 0.09, frost_alpha).into()),
-                border: iced::border::rounded(12),
+                border: iced::border::rounded(thumb_radius),
                 ..container::Style::default()
             });
         container(stack![base_thumb, frost_layer, badge_overlay])
             .width(Length::Fill)
             .height(Length::Fixed(thumb_height))
-            .style(|_t| container::Style {
-                border: iced::border::rounded(12),
+            .style(move |_t| container::Style {
+                border: iced::border::rounded(thumb_radius),
                 ..container::Style::default()
             })
             .into()
@@ -126,8 +161,8 @@ pub fn view_video_card<'a, Message: Clone + 'static>(
         container(stack![base_thumb, badge_overlay])
             .width(Length::Fill)
             .height(Length::Fixed(thumb_height))
-            .style(|_t| container::Style {
-                border: iced::border::rounded(12),
+            .style(move |_t| container::Style {
+                border: iced::border::rounded(thumb_radius),
                 ..container::Style::default()
             })
             .into()
@@ -145,8 +180,8 @@ pub fn view_video_card<'a, Message: Clone + 'static>(
         avatar_handle
     };
 
-    // YouTube Desktop avatar: 36x36 circular
-    let avatar = view_avatar_image_or_badge(&video.channel_name, active_avatar, 36.0, 14.0);
+    // YouTube Desktop avatar: 36x36 (circular or rectangular based on setting)
+    let avatar = view_avatar_image_or_badge_with_radius(&video.channel_name, active_avatar, 36.0, 14.0, avatar_radius);
 
     let channel_avatar_btn = button(avatar)
         .style(ghost_button)
@@ -181,8 +216,8 @@ pub fn view_video_card<'a, Message: Clone + 'static>(
     .padding(0)
     .on_press(on_open_video(vid_id.clone()));
 
-    let chan_cow: std::borrow::Cow<'a, str> = if video.channel_name.chars().count() > 45 {
-        let mut s: String = video.channel_name.chars().take(42).collect();
+    let chan_cow: std::borrow::Cow<'a, str> = if video.channel_name.chars().count() > 30 {
+        let mut s: String = video.channel_name.chars().take(28).collect();
         s.push_str("...");
         std::borrow::Cow::Owned(s)
     } else {
@@ -198,19 +233,35 @@ pub fn view_video_card<'a, Message: Clone + 'static>(
     .padding(0)
     .on_press(on_open_channel(chan_id));
 
-    let meta_text = text(&video.meta_suffix)
-        .size(12)
-        .color(secondary_color);
+    // Formatear línea 3: Canal • views • hora
+    let suffix_trimmed = video.meta_suffix.trim();
+    let meta_suffix_text = if suffix_trimmed.is_empty() {
+        String::new()
+    } else if suffix_trimmed.starts_with('•') {
+        format!(" {}", suffix_trimmed)
+    } else {
+        format!(" • {}", suffix_trimmed)
+    };
 
-    // YouTube Desktop layout: Channel on its own line, views and timestamp on the line below
+    let meta_line = row![
+        channel_btn,
+        text(meta_suffix_text)
+            .size(12)
+            .color(secondary_color),
+    ]
+    .spacing(0)
+    .align_y(Alignment::Center);
+
+    // Contenido a la derecha del avatar:
+    // Línea 1 y 2: Título completo (2 líneas)
+    // Línea 3: Canal views y hora
     let info_col: Element<'a, Message> = if blur > 0.08 {
         let pill_alpha = (blur * 0.36).clamp(0.0, 0.45);
         let text_col = column![
             title_btn,
-            channel_btn,
-            meta_text,
+            meta_line,
         ]
-        .spacing(3)
+        .spacing(4)
         .width(Length::Fill);
 
         let blur_bars = column![
@@ -219,7 +270,7 @@ pub fn view_video_card<'a, Message: Clone + 'static>(
                 .height(Length::Fixed(14.0))
                 .style(move |_t| container::Style {
                     background: Some(iced::Color::from_rgba(0.22, 0.22, 0.26, pill_alpha).into()),
-                    border: iced::border::rounded(4),
+                    border: iced::border::rounded(thumb_radius.min(4)),
                     ..container::Style::default()
                 }),
             container(Space::with_width(Length::Fixed(140.0)))
@@ -227,7 +278,7 @@ pub fn view_video_card<'a, Message: Clone + 'static>(
                 .height(Length::Fixed(12.0))
                 .style(move |_t| container::Style {
                     background: Some(iced::Color::from_rgba(0.18, 0.18, 0.22, pill_alpha).into()),
-                    border: iced::border::rounded(4),
+                    border: iced::border::rounded(thumb_radius.min(4)),
                     ..container::Style::default()
                 }),
         ]
@@ -238,10 +289,9 @@ pub fn view_video_card<'a, Message: Clone + 'static>(
     } else {
         column![
             title_btn,
-            channel_btn,
-            meta_text,
+            meta_line,
         ]
-        .spacing(3)
+        .spacing(4)
         .into()
     };
 
@@ -263,64 +313,60 @@ pub fn view_video_card<'a, Message: Clone + 'static>(
         .into()
 }
 
-pub fn view_skeleton_card<'a, Message: 'static>(thumb_height: f32) -> Element<'a, Message> {
+pub fn view_skeleton_card<'a, Message: 'static>(thumb_height: f32, card_style: CardStyle) -> Element<'a, Message> {
+    let (thumb_radius, _badge_radius, avatar_radius) = match card_style {
+        CardStyle::Squircle => (12, 4, 18.0),
+        CardStyle::Rectangular => (0, 0, 0.0),
+    };
+
     let thumb_box = container(Space::with_width(Length::Fill))
         .width(Length::Fill)
         .height(Length::Fixed(thumb_height))
-        .style(|_t| container::Style {
+        .style(move |_t| container::Style {
             background: Some(iced::Color::from_rgb8(0x1a, 0x1a, 0x1a).into()),
-            border: iced::border::rounded(12),
+            border: iced::border::rounded(thumb_radius),
             ..container::Style::default()
         });
 
-    let avatar_circle = container(Space::with_width(Length::Fixed(36.0)))
+    let avatar_box = container(Space::with_width(Length::Fixed(36.0)))
         .width(Length::Fixed(36.0))
         .height(Length::Fixed(36.0))
-        .style(|_t| container::Style {
+        .style(move |_t| container::Style {
             background: Some(iced::Color::from_rgb8(0x22, 0x22, 0x22).into()),
-            border: iced::border::rounded(18),
+            border: iced::border::rounded(avatar_radius),
             ..container::Style::default()
         });
 
     let line_1 = container(Space::with_width(Length::Fill))
         .width(Length::Fill)
         .height(Length::Fixed(14.0))
-        .style(|_t| container::Style {
+        .style(move |_t| container::Style {
             background: Some(iced::Color::from_rgb8(0x24, 0x24, 0x24).into()),
-            border: iced::border::rounded(4),
+            border: iced::border::rounded(thumb_radius.min(4)),
             ..container::Style::default()
         });
 
     let line_2 = container(Space::with_width(Length::FillPortion(2)))
         .width(Length::FillPortion(2))
         .height(Length::Fixed(14.0))
-        .style(|_t| container::Style {
+        .style(move |_t| container::Style {
             background: Some(iced::Color::from_rgb8(0x24, 0x24, 0x24).into()),
-            border: iced::border::rounded(4),
+            border: iced::border::rounded(thumb_radius.min(4)),
             ..container::Style::default()
         });
 
-    let line_chan = container(Space::with_width(Length::Fixed(130.0)))
-        .width(Length::Fixed(130.0))
+    let line_meta = container(Space::with_width(Length::Fixed(200.0)))
+        .width(Length::Fixed(200.0))
         .height(Length::Fixed(12.0))
-        .style(|_t| container::Style {
+        .style(move |_t| container::Style {
             background: Some(iced::Color::from_rgb8(0x1e, 0x1e, 0x1e).into()),
-            border: iced::border::rounded(4),
-            ..container::Style::default()
-        });
-
-    let line_meta = container(Space::with_width(Length::Fixed(100.0)))
-        .width(Length::Fixed(100.0))
-        .height(Length::Fixed(11.0))
-        .style(|_t| container::Style {
-            background: Some(iced::Color::from_rgb8(0x1a, 0x1a, 0x1a).into()),
-            border: iced::border::rounded(4),
+            border: iced::border::rounded(thumb_radius.min(4)),
             ..container::Style::default()
         });
 
     let details_row = row![
-        avatar_circle,
-        column![line_1, line_2, line_chan, line_meta].spacing(5).width(Length::Fill),
+        avatar_box,
+        column![line_1, line_2, line_meta].spacing(5).width(Length::Fill),
     ]
     .spacing(12)
     .align_y(Alignment::Start);
@@ -338,13 +384,15 @@ pub fn view_home_grid<'a, Message: Clone + 'static>(
     blurred_cache: &'a HashMap<String, image::Handle>,
     blur_amount: f32,
     window_width: f32,
+    card_style: CardStyle,
+    home_columns: GridColumnsConfig,
     is_loading_more: bool,
     on_open_video: impl Fn(String) -> Message + Copy + 'static,
     on_open_video_new_tab: impl Fn(String) -> Message + Copy + 'static,
     on_open_channel: impl Fn(String) -> Message + Copy + 'static,
     on_scroll: impl Fn(iced::widget::scrollable::Viewport) -> Message + 'static,
 ) -> Element<'a, Message> {
-    let (chunk_size, thumb_height) = calculate_grid_layout(window_width);
+    let (chunk_size, thumb_height) = calculate_grid_layout(window_width, home_columns);
 
     // Spacing between rows: 40px (--ytd-rich-grid-row-margin: 40px)
     let mut grid = column![].spacing(40).width(Length::Fill);
@@ -354,7 +402,7 @@ pub fn view_home_grid<'a, Message: Clone + 'static>(
         for _row_idx in 0..3 {
             let mut row_cards = row![].spacing(16).width(Length::Fill);
             for _col_idx in 0..chunk_size {
-                row_cards = row_cards.push(view_skeleton_card(thumb_height));
+                row_cards = row_cards.push(view_skeleton_card(thumb_height, card_style));
             }
             grid = grid.push(row_cards);
         }
@@ -375,6 +423,7 @@ pub fn view_home_grid<'a, Message: Clone + 'static>(
                     blurred_avatar,
                     blur_amount,
                     thumb_height,
+                    card_style,
                     on_open_video,
                     on_open_video_new_tab,
                     on_open_channel,
@@ -388,7 +437,7 @@ pub fn view_home_grid<'a, Message: Clone + 'static>(
         if is_loading_more {
             let mut skeleton_row = row![].spacing(16).width(Length::Fill);
             for _ in 0..chunk_size {
-                skeleton_row = skeleton_row.push(view_skeleton_card(thumb_height));
+                skeleton_row = skeleton_row.push(view_skeleton_card(thumb_height, card_style));
             }
             grid = grid.push(skeleton_row);
         }

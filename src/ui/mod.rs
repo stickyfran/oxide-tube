@@ -601,6 +601,8 @@ pub fn view_auth_modal<'a, Message: Clone + 'static>(
     current_res: PreferredResolution,
     current_codec: PreferredCodec,
     current_audio_lang: PreferredAudioLanguage,
+    current_card_style: crate::config::CardStyle,
+    current_columns: crate::config::GridColumnsConfig,
     auto_pip_on_unfocus: bool,
     full_buffer_tabs: bool,
     close_to_tray: bool,
@@ -617,6 +619,8 @@ pub fn view_auth_modal<'a, Message: Clone + 'static>(
     on_select_res: impl Fn(PreferredResolution) -> Message + Copy + 'static,
     on_select_codec: impl Fn(PreferredCodec) -> Message + Copy + 'static,
     on_select_audio_lang: impl Fn(PreferredAudioLanguage) -> Message + Copy + 'static,
+    on_select_card_style: impl Fn(crate::config::CardStyle) -> Message + Copy + 'static,
+    on_select_home_columns: impl Fn(crate::config::GridColumnsConfig) -> Message + Copy + 'static,
     on_toggle_auto_pip: Message,
     on_toggle_full_buffer_tabs: Message,
     on_toggle_close_to_tray: Message,
@@ -1052,6 +1056,64 @@ pub fn view_auth_modal<'a, Message: Clone + 'static>(
         .spacing(10),
     );
 
+    let style_row = row![
+        button(text("Squircle (YouTube)").size(12))
+            .style(if current_card_style == crate::config::CardStyle::Squircle { primary_button } else { secondary_button })
+            .padding([6, 14])
+            .on_press(on_select_card_style(crate::config::CardStyle::Squircle)),
+        button(text("Rectangular").size(12))
+            .style(if current_card_style == crate::config::CardStyle::Rectangular { primary_button } else { secondary_button })
+            .padding([6, 14])
+            .on_press(on_select_card_style(crate::config::CardStyle::Rectangular)),
+    ]
+    .spacing(8);
+
+    let cols_row = row![
+        button(text("4 (Original)").size(12))
+            .style(if current_columns == crate::config::GridColumnsConfig::Cols4 { primary_button } else { secondary_button })
+            .padding([6, 12])
+            .on_press(on_select_home_columns(crate::config::GridColumnsConfig::Cols4)),
+        button(text("Auto (Adaptativo)").size(12))
+            .style(if current_columns == crate::config::GridColumnsConfig::Auto { primary_button } else { secondary_button })
+            .padding([6, 12])
+            .on_press(on_select_home_columns(crate::config::GridColumnsConfig::Auto)),
+        button(text("2").size(12))
+            .style(if current_columns == crate::config::GridColumnsConfig::Cols2 { primary_button } else { secondary_button })
+            .padding([6, 12])
+            .on_press(on_select_home_columns(crate::config::GridColumnsConfig::Cols2)),
+        button(text("5").size(12))
+            .style(if current_columns == crate::config::GridColumnsConfig::Cols5 { primary_button } else { secondary_button })
+            .padding([6, 12])
+            .on_press(on_select_home_columns(crate::config::GridColumnsConfig::Cols5)),
+        button(text("6").size(12))
+            .style(if current_columns == crate::config::GridColumnsConfig::Cols6 { primary_button } else { secondary_button })
+            .padding([6, 12])
+            .on_press(on_select_home_columns(crate::config::GridColumnsConfig::Cols6)),
+    ]
+    .spacing(8);
+
+    let card_appearance = section_card(
+        column![
+            text("Diseño y Cuadrícula del Home").size(13).color(COLOR_TEXT_PRIMARY),
+            row![
+                text("Bordes:").size(12).color(COLOR_TEXT_SECONDARY).width(Length::Fixed(80.0)),
+                style_row,
+            ]
+            .spacing(10)
+            .align_y(Alignment::Center),
+            row![
+                text("Columnas:").size(12).color(COLOR_TEXT_SECONDARY).width(Length::Fixed(80.0)),
+                cols_row,
+            ]
+            .spacing(10)
+            .align_y(Alignment::Center),
+            text("YouTube Desktop usa 4 columnas por defecto con esquinas Squircle (12px). Puedes personalizar a rectangulares o cambiar columnas sin saltos de layout.")
+                .size(11)
+                .color(COLOR_TEXT_SECONDARY),
+        ]
+        .spacing(10),
+    );
+
     let card_playback = section_card(
         column![
             defaults_heading,
@@ -1114,6 +1176,7 @@ pub fn view_auth_modal<'a, Message: Clone + 'static>(
         column![
             profile_header,
             card_nav,
+            card_appearance,
             card_playback,
             card_features,
             card_cache,

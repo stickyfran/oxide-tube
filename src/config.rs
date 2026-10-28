@@ -88,6 +88,23 @@ pub struct LocalHistoryItem {
     pub saved_pos_ms: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum CardStyle {
+    #[default]
+    Squircle,
+    Rectangular,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum GridColumnsConfig {
+    #[default]
+    Cols4,
+    Auto,
+    Cols2,
+    Cols5,
+    Cols6,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     pub preferred_resolution: PreferredResolution,
@@ -130,6 +147,10 @@ pub struct AppConfig {
     pub max_cache_size_bytes: u64,
     #[serde(default = "default_true")]
     pub close_to_tray: bool,
+    #[serde(default)]
+    pub card_style: CardStyle,
+    #[serde(default)]
+    pub home_columns: GridColumnsConfig,
 }
 
 fn default_true() -> bool {
@@ -160,6 +181,8 @@ impl Default for AppConfig {
             cached_avatar_url: None,
             max_cache_size_bytes: crate::cache_manager::default_cache_limit(),
             close_to_tray: true,
+            card_style: CardStyle::Squircle,
+            home_columns: GridColumnsConfig::Cols4,
         }
     }
 }

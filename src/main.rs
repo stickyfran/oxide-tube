@@ -154,6 +154,8 @@ pub enum Message {
     SetPreferredResolution(PreferredResolution),
     SetPreferredCodec(PreferredCodec),
     SetPreferredAudioLanguage(crate::config::PreferredAudioLanguage),
+    SetCardStyle(crate::config::CardStyle),
+    SetHomeColumns(crate::config::GridColumnsConfig),
     ToggleAutoPipOnUnfocus,
     ScalePip(f32),
     WatchDetailsLoadedPassive(Result<Arc<innertube::WatchDetails>, String>),
@@ -4038,6 +4040,18 @@ impl MitubApp {
                 Task::none()
             }
 
+            Message::SetCardStyle(style) => {
+                self.config.card_style = style;
+                self.config.save_async();
+                Task::none()
+            }
+
+            Message::SetHomeColumns(cols) => {
+                self.config.home_columns = cols;
+                self.config.save_async();
+                Task::none()
+            }
+
             Message::ToggleAutoPipOnUnfocus => {
                 self.config.auto_pip_on_unfocus = !self.config.auto_pip_on_unfocus;
                 self.config.save_async();
@@ -6172,6 +6186,8 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
                 &self.blurred_thumbnails,
                 blur_amount,
                 self.window_size.0,
+                self.config.card_style,
+                self.config.home_columns,
                 self.is_loading_more_feed,
                 Message::OpenVideo,
                 Message::OpenVideoInNewTab,
@@ -6184,6 +6200,8 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
                 &self.blurred_thumbnails,
                 blur_amount,
                 self.window_size.0,
+                self.config.card_style,
+                self.config.home_columns,
                 self.is_loading_more_feed,
                 Message::OpenVideo,
                 Message::OpenVideoInNewTab,
@@ -6196,6 +6214,8 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
                 &self.blurred_thumbnails,
                 blur_amount,
                 self.window_size.0,
+                self.config.card_style,
+                self.config.home_columns,
                 self.is_loading_more_feed,
                 Message::OpenVideo,
                 Message::OpenVideoInNewTab,
@@ -6208,6 +6228,8 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
                 &self.blurred_thumbnails,
                 blur_amount,
                 self.window_size.0,
+                self.config.card_style,
+                self.config.home_columns,
                 false,
                 Message::OpenVideo,
                 Message::OpenVideoInNewTab,
@@ -6318,6 +6340,8 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
                         &self.blurred_thumbnails,
                         blur_amount,
                         self.window_size.0,
+                        self.config.card_style,
+                        self.config.home_columns,
                         self.is_loading_more_feed,
                         Message::OpenVideo,
                         Message::OpenVideoInNewTab,
@@ -6339,6 +6363,8 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
                         &self.blurred_thumbnails,
                         blur_amount,
                         self.window_size.0,
+                        self.config.card_style,
+                        self.config.home_columns,
                         Message::SelectChannelTab,
                         Message::ToggleSubscribe,
                         Message::OpenVideo,
@@ -6352,6 +6378,8 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
                         &self.blurred_thumbnails,
                         blur_amount,
                         self.window_size.0,
+                        self.config.card_style,
+                        self.config.home_columns,
                         false,
                         Message::OpenVideo,
                         Message::OpenVideoInNewTab,
@@ -6512,6 +6540,8 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
                 self.config.preferred_resolution,
                 self.config.preferred_codec,
                 self.config.preferred_audio_lang,
+                self.config.card_style,
+                self.config.home_columns,
                 self.config.auto_pip_on_unfocus,
                 self.config.full_buffer_tabs,
                 self.config.close_to_tray,
@@ -6528,6 +6558,8 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
                 Message::SetPreferredResolution,
                 Message::SetPreferredCodec,
                 Message::SetPreferredAudioLanguage,
+                Message::SetCardStyle,
+                Message::SetHomeColumns,
                 Message::ToggleAutoPipOnUnfocus,
                 Message::ToggleFullBufferTabs,
                 Message::ToggleCloseToTray,

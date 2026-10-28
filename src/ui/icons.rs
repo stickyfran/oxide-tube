@@ -26,11 +26,11 @@ pub fn icon_back<'a, Message: 'static>(size: f32) -> Element<'a, Message> {
 pub fn icon_app_logo<'a, Message: 'static>(size: f32) -> Element<'a, Message> {
     static LOGO_HANDLE: OnceLock<image::Handle> = OnceLock::new();
     let handle = LOGO_HANDLE.get_or_init(|| {
-        const ICON_BYTES: &[u8] = include_bytes!("../../assets/icon.png");
+        const ICON_BYTES: &[u8] = include_bytes!("../../assets/app_logo.png");
         image::Handle::from_bytes(ICON_BYTES)
     });
     image(handle.clone())
-        .width(Length::Fixed(size))
+        .width(Length::Fixed(size * 1.43))
         .height(Length::Fixed(size))
         .content_fit(iced::ContentFit::Contain)
         .into()
@@ -210,12 +210,12 @@ pub fn view_avatar_badge<'a, Message: 'static>(name: &str, diameter: f32, font_s
         })
 }
 
-/// Renders a circular avatar from downloaded image handle, or falls back to view_avatar_badge
-pub fn view_avatar_image_or_badge<'a, Message: 'static>(
+pub fn view_avatar_image_or_badge_with_radius<'a, Message: 'static>(
     name: &str,
     avatar_handle: Option<&'a iced::widget::image::Handle>,
     diameter: f32,
     font_size: f32,
+    border_radius: f32,
 ) -> Element<'a, Message> {
     if let Some(h) = avatar_handle {
         container(
@@ -227,13 +227,39 @@ pub fn view_avatar_image_or_badge<'a, Message: 'static>(
         .width(Length::Fixed(diameter))
         .height(Length::Fixed(diameter))
         .style(move |_theme| container::Style {
-            border: iced::border::rounded(diameter / 2.0),
+            border: iced::border::rounded(border_radius),
             ..container::Style::default()
         })
         .into()
     } else {
-        view_avatar_badge(name, diameter, font_size).into()
+        let initial = name
+            .chars()
+            .find(|c| c.is_ascii_alphanumeric())
+            .map(|c| c.to_ascii_uppercase().to_string())
+            .unwrap_or_else(|| "Y".to_string());
+
+        container(text(initial).size(font_size).color(COLOR_TEXT_PRIMARY))
+            .width(Length::Fixed(diameter))
+            .height(Length::Fixed(diameter))
+            .align_x(iced::alignment::Horizontal::Center)
+            .align_y(iced::alignment::Vertical::Center)
+            .style(move |_theme| container::Style {
+                background: Some(COLOR_SURFACE_HOVER.into()),
+                border: iced::border::rounded(border_radius),
+                ..container::Style::default()
+            })
+            .into()
     }
+}
+
+/// Renders a circular avatar from downloaded image handle, or falls back to view_avatar_badge
+pub fn view_avatar_image_or_badge<'a, Message: 'static>(
+    name: &str,
+    avatar_handle: Option<&'a iced::widget::image::Handle>,
+    diameter: f32,
+    font_size: f32,
+) -> Element<'a, Message> {
+    view_avatar_image_or_badge_with_radius(name, avatar_handle, diameter, font_size, diameter / 2.0)
 }
 
 pub fn icon_chevron_right<'a, Message: 'static>(size: f32) -> Element<'a, Message> {

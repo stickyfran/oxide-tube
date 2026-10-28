@@ -172,6 +172,7 @@ pub fn search_input(_theme: &iced::Theme, status: text_input::Status) -> text_in
     }
 }
 
+#[allow(dead_code)]
 pub fn yt_badge_container(_theme: &iced::Theme) -> container::Style {
     container::Style {
         background: Some(Color::from_rgba(0.0, 0.0, 0.0, 0.8).into()),
@@ -181,6 +182,7 @@ pub fn yt_badge_container(_theme: &iced::Theme) -> container::Style {
     }
 }
 
+#[allow(dead_code)]
 pub fn yt_live_badge_container(_theme: &iced::Theme) -> container::Style {
     container::Style {
         background: Some(Color::from_rgb8(0xcc, 0x00, 0x00).into()),

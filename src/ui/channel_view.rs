@@ -13,13 +13,15 @@ pub fn view_channel_page<'a, Message: Clone + 'static>(
     blurred_cache: &'a std::collections::HashMap<String, iced::widget::image::Handle>,
     blur_amount: f32,
     window_width: f32,
+    card_style: crate::config::CardStyle,
+    home_columns: crate::config::GridColumnsConfig,
     on_select_tab: impl Fn(usize) -> Message + Copy + 'static,
     on_toggle_subscribe: Message,
     on_open_video: impl Fn(String) -> Message + Copy + 'static,
     on_open_video_new_tab: impl Fn(String) -> Message + Copy + 'static,
     on_open_channel: impl Fn(String) -> Message + Copy + 'static,
 ) -> Element<'a, Message> {
-    let (chunk_size, thumb_height) = crate::ui::home_view::calculate_grid_layout(window_width);
+    let (chunk_size, thumb_height) = crate::ui::home_view::calculate_grid_layout(window_width, home_columns);
     let blur = blur_amount.clamp(0.0, 1.0);
 
     // Top banner (real banner image when available, fallback to surface container)
@@ -122,7 +124,7 @@ pub fn view_channel_page<'a, Message: Clone + 'static>(
         for _ in 0..2 {
             let mut row_cards = row![].spacing(16).width(Length::Fill);
             for _ in 0..chunk_size {
-                row_cards = row_cards.push(view_skeleton_card(thumb_height));
+                row_cards = row_cards.push(view_skeleton_card(thumb_height, card_style));
             }
             grid = grid.push(row_cards);
         }
@@ -143,6 +145,7 @@ pub fn view_channel_page<'a, Message: Clone + 'static>(
                     blurred_avatar,
                     blur_amount,
                     thumb_height,
+                    card_style,
                     on_open_video,
                     on_open_video_new_tab,
                     on_open_channel,
