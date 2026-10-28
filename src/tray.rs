@@ -1,4 +1,5 @@
-use tokio::sync::mpsc;
+use std::sync::OnceLock;
+use tokio::sync::broadcast;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrayAction {
@@ -7,6 +8,8 @@ pub enum TrayAction {
     Stop,
     Quit,
 }
+
+static TRAY_CHANNEL: OnceLock<broadcast::Sender<TrayAction>> = OnceLock::new();
 
 #[cfg(target_os = "linux")]
 mod linux {
@@ -43,7 +46,7 @@ mod linux {
     }
 
     pub struct StatusNotifierItem {
-        sender: mpsc::UnboundedSender<TrayAction>,
+        sender: broadcast::Sender<TrayAction>,
     }
 
     #[interface(name = "org.kde.StatusNotifierItem")]
@@ -153,7 +156,7 @@ mod linux {
     }
 
     pub struct DBusMenu {
-        sender: mpsc::UnboundedSender<TrayAction>,
+        sender: broadcast::Sender<TrayAction>,
     }
 
     #[interface(name = "com.canonical.dbusmenu")]
@@ -260,6 +263,9 @@ mod linux {
             for id in ids {
                 let mut fields = HashMap::new();
                 match id {
+                    0 => {
+                        let _ = Value::from("submenu".to_string()).try_into().map(|v| fields.insert("children-display".into(), v));
+                    }
                     1 => {
                         let _ = Value::from("Abrir Tube-oxide".to_string()).try_into().map(|v| fields.insert("label".into(), v));
                         let _ = Value::from("window-restore".to_string()).try_into().map(|v| fields.insert("icon-name".into(), v));
@@ -297,6 +303,7 @@ mod linux {
 
         fn get_property(&self, id: i32, name: &str) -> zbus::fdo::Result<OwnedValue> {
             match (id, name) {
+                (0, "children-display") => Value::from("submenu".to_string()).try_into().map_err(|e| zbus::fdo::Error::Failed(format!("{e}"))),
                 (1, "label") => Value::from("Abrir Tube-oxide".to_string()).try_into().map_err(|e| zbus::fdo::Error::Failed(format!("{e}"))),
                 (3, "label") => Value::from("Reproducir / Pausar".to_string()).try_into().map_err(|e| zbus::fdo::Error::Failed(format!("{e}"))),
                 (4, "label") => Value::from("Detener reproducción".to_string()).try_into().map_err(|e| zbus::fdo::Error::Failed(format!("{e}"))),
@@ -309,7 +316,28 @@ mod linux {
         }
 
         fn event(&self, id: i32, event_id: &str, _data: OwnedValue, _timestamp: u32) {
-            if event_id == "clicked" {
+            self.handle_action(id, event_id);
+        }
+
+        fn event_group(&self, events: Vec<(i32, String, OwnedValue, u32)>) -> Vec<i32> {
+            for (id, event_id, _data, _timestamp) in events {
+                self.handle_action(id, &event_id);
+            }
+            Vec::new()
+        }
+
+        fn about_to_show(&self, _id: i32) -> bool {
+            false
+        }
+
+        fn about_to_show_group(&self, _ids: Vec<i32>) -> (Vec<i32>, Vec<i32>) {
+            (Vec::new(), Vec::new())
+        }
+    }
+
+    impl DBusMenu {
+        fn handle_action(&self, id: i32, event_id: &str) {
+            if event_id == "clicked" || event_id == "activate" {
                 match id {
                     1 => {
                         let _ = self.sender.send(TrayAction::Restore);
@@ -327,10 +355,6 @@ mod linux {
                 }
             }
         }
-
-        fn about_to_show(&self, _id: i32) -> bool {
-            false
-        }
     }
 
     #[proxy(
@@ -342,8 +366,13 @@ mod linux {
         fn register_status_notifier_item(&self, service: &str) -> zbus::Result<()>;
     }
 
-    pub fn start_tray_service() -> mpsc::UnboundedReceiver<TrayAction> {
-        let (tx, rx) = mpsc::unbounded_channel();
+    static STARTED: OnceLock<()> = OnceLock::new();
+
+    pub fn init_tray(tx: broadcast::Sender<TrayAction>) {
+        if STARTED.set(()).is_err() {
+            return;
+        }
+
         let pid = std::process::id();
         let service_name = format!("org.kde.StatusNotifierItem-{}-1", pid);
 
@@ -381,8 +410,6 @@ mod linux {
                 tokio::time::sleep(tokio::time::Duration::from_secs(3600)).await;
             }
         });
-
-        rx
     }
 }
 
@@ -408,7 +435,7 @@ mod windows {
     const ID_STOP: usize = 1003;
     const ID_QUIT: usize = 1004;
 
-    static SENDER: std::sync::OnceLock<mpsc::UnboundedSender<TrayAction>> = std::sync::OnceLock::new();
+    static SENDER: std::sync::OnceLock<broadcast::Sender<TrayAction>> = std::sync::OnceLock::new();
 
     unsafe extern "system" fn window_proc(
         hwnd: HWND,
@@ -476,7 +503,7 @@ mod windows {
         }
     }
 
-    pub fn start_windows_tray(tx: mpsc::UnboundedSender<TrayAction>) {
+    pub fn init_tray(tx: broadcast::Sender<TrayAction>) {
         let _ = SENDER.set(tx);
         std::thread::spawn(|| unsafe {
             let class_name: Vec<u16> = "TubeOxideTrayClass\0".encode_utf16().collect();
@@ -530,25 +557,23 @@ mod windows {
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
 mod fallback {
     use super::*;
-    pub fn start_fallback_tray() -> mpsc::UnboundedReceiver<TrayAction> {
-        let (_tx, rx) = mpsc::unbounded_channel();
-        rx
-    }
+    pub fn init_tray(_tx: broadcast::Sender<TrayAction>) {}
 }
 
-pub fn start_tray_service() -> mpsc::UnboundedReceiver<TrayAction> {
-    #[cfg(target_os = "linux")]
-    {
-        linux::start_tray_service()
-    }
-    #[cfg(target_os = "windows")]
-    {
-        let (tx, rx) = mpsc::unbounded_channel();
-        windows::start_windows_tray(tx);
-        rx
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
-    {
-        fallback::start_fallback_tray()
-    }
+pub fn get_tray_receiver() -> broadcast::Receiver<TrayAction> {
+    let tx = TRAY_CHANNEL.get_or_init(|| {
+        let (tx, _) = broadcast::channel(64);
+        #[cfg(target_os = "linux")]
+        linux::init_tray(tx.clone());
+        #[cfg(target_os = "windows")]
+        windows::init_tray(tx.clone());
+        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+        fallback::init_tray(tx.clone());
+        tx
+    });
+    tx.subscribe()
+}
+
+pub fn start_tray_service() -> broadcast::Receiver<TrayAction> {
+    get_tray_receiver()
 }

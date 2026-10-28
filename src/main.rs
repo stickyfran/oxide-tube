@@ -341,20 +341,26 @@ fn tray_action_stream() -> impl iced::futures::Stream<Item = Message> {
     iced::stream::channel(10, |mut output: iced::futures::channel::mpsc::Sender<Message>| async move {
         use iced::futures::SinkExt;
         let mut rx = crate::tray::start_tray_service();
-        while let Some(action) = rx.recv().await {
-            match action {
-                crate::tray::TrayAction::Restore => {
-                    let _ = output.send(Message::RestoreFromTray).await;
+        loop {
+            match rx.recv().await {
+                Ok(action) => {
+                    match action {
+                        crate::tray::TrayAction::Restore => {
+                            let _ = output.send(Message::RestoreFromTray).await;
+                        }
+                        crate::tray::TrayAction::PlayPause => {
+                            let _ = output.send(Message::PlayPauseToggle).await;
+                        }
+                        crate::tray::TrayAction::Stop => {
+                            let _ = output.send(Message::StopPlayback).await;
+                        }
+                        crate::tray::TrayAction::Quit => {
+                            let _ = output.send(Message::QuitApp).await;
+                        }
+                    }
                 }
-                crate::tray::TrayAction::PlayPause => {
-                    let _ = output.send(Message::PlayPauseToggle).await;
-                }
-                crate::tray::TrayAction::Stop => {
-                    let _ = output.send(Message::StopPlayback).await;
-                }
-                crate::tray::TrayAction::Quit => {
-                    let _ = output.send(Message::QuitApp).await;
-                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             }
         }
     })
@@ -575,7 +581,7 @@ fn activate_kwin_main_window() {
     std::thread::Builder::new()
         .name("kwin-activate-main".into())
         .spawn(|| {
-            for delay in [0u64, 150u64] {
+            for delay in [0u64, 150u64, 350u64, 700u64] {
                 if delay > 0 {
                     std::thread::sleep(std::time::Duration::from_millis(delay));
                 }
@@ -1762,6 +1768,7 @@ impl MitubApp {
                             Err(e) => eprintln!("[WaylandZeroCopy] Error initializing player: {e}"),
                         }
                     }
+                    activate_kwin_main_window();
                 }
                 Task::none()
             }
