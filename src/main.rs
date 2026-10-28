@@ -280,6 +280,7 @@ pub struct MitubApp {
     auto_pip_triggered_by_unfocus: bool,
     is_window_minimized: bool,
     is_window_hidden: bool,
+    cursor_hidden_fullscreen: bool,
 }
 
 fn get_ipc_port() -> u16 {
@@ -1191,6 +1192,7 @@ impl MitubApp {
             auto_pip_triggered_by_unfocus: false,
             is_window_minimized: false,
             is_window_hidden: false,
+            cursor_hidden_fullscreen: false,
         };
 
         // Initial tasks: fetch home feed & bind Wayland window pointers
@@ -2071,7 +2073,7 @@ impl MitubApp {
                         }
                     }
                 }
-                Task::none()
+                self.update_fullscreen_cursor_visibility()
             }
 
             Message::ChatMessagesBatch(msgs) => {
@@ -3467,10 +3469,11 @@ impl MitubApp {
                 if self.is_fullscreen {
                     self.current_view = ViewMode::VideoFullscreen;
                     self.sync_player_viewport();
+                    let cursor_task = self.update_fullscreen_cursor_visibility();
                     if let Some(id) = self.main_window_id {
-                        window::change_mode(id, Mode::Fullscreen)
+                        Task::batch([window::change_mode(id, Mode::Fullscreen), cursor_task])
                     } else {
-                        Task::none()
+                        cursor_task
                     }
                 } else {
                     if let ViewMode::VideoFullscreen = self.current_view {
@@ -3481,10 +3484,11 @@ impl MitubApp {
                         }
                     }
                     self.sync_player_viewport();
+                    let cursor_task = self.update_fullscreen_cursor_visibility();
                     if let Some(id) = self.main_window_id {
-                        window::change_mode(id, Mode::Windowed)
+                        Task::batch([window::change_mode(id, Mode::Windowed), window::set_cursor_visible(id, true), cursor_task])
                     } else {
-                        Task::none()
+                        cursor_task
                     }
                 }
             }
@@ -4952,6 +4956,7 @@ impl MitubApp {
                                 self.osd_state.hover_seek_ratio = None;
                             }
                         }
+                        return self.update_fullscreen_cursor_visibility();
                     }
                     iced::Event::Mouse(iced::mouse::Event::ButtonPressed(button)) => {
                         let is_pip = Some(win_id) == self.pip_window_id;
@@ -5511,6 +5516,21 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
                 }
             }
         }
+    }
+
+    fn update_fullscreen_cursor_visibility(&mut self) -> Task<Message> {
+        let should_hide = self.is_fullscreen
+            && self.pip_window_id.is_none()
+            && !self.osd_state.is_visible
+            && self.osd_state.is_playing;
+
+        if should_hide != self.cursor_hidden_fullscreen {
+            self.cursor_hidden_fullscreen = should_hide;
+            if let Some(main_id) = self.main_window_id {
+                return window::set_cursor_visible(main_id, !should_hide);
+            }
+        }
+        Task::none()
     }
 
     pub fn view(&self, id: Id) -> Element<'_, Message> {

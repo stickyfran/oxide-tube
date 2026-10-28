@@ -165,6 +165,9 @@ pub enum Action {
 
     /// Sets the window visibility.
     SetVisible(Id, bool),
+
+    /// Sets whether the mouse cursor is visible on the window.
+    SetCursorVisible(Id, bool),
 }
 
 /// Subscribes to the frames of the window of the running application.
@@ -457,4 +460,10 @@ pub fn disable_mouse_passthrough<Message>(id: Id) -> Task<Message> {
 pub fn set_visible<T>(id: Id, visible: bool) -> Task<T> {
     task::effect(crate::Action::Window(Action::SetVisible(id, visible)))
 }
+
+/// Sets whether the mouse cursor is visible for the window with the given [`Id`].
+pub fn set_cursor_visible<T>(id: Id, visible: bool) -> Task<T> {
+    task::effect(crate::Action::Window(Action::SetCursorVisible(id, visible)))
+}
+
 

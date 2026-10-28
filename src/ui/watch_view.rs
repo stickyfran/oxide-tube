@@ -201,7 +201,7 @@ pub fn view_watch_page<'a, Message: Clone + 'static>(
 ) -> Element<'a, Message> {
     let col_w = player_viewport_width as f32;
     let blur = blur_amount.clamp(0.0, 1.0);
-    let hide_cursor = !osd_state.is_visible && osd_state.is_playing && !is_pip_active;
+    let hide_cursor = is_fullscreen && !osd_state.is_visible && osd_state.is_playing && !is_pip_active;
 
     // 1. Transparent Underlay Punch-Through Video Container:
     let hitbox_msg = if osd_state.has_open_menu() {
@@ -676,11 +676,7 @@ pub fn view_watch_page<'a, Message: Clone + 'static>(
         .into();
 
     let player_area = mouse_area(player_stack)
-        .interaction(if hide_cursor {
-            iced::mouse::Interaction::None
-        } else {
-            iced::mouse::Interaction::Idle
-        });
+        .interaction(iced::mouse::Interaction::Idle);
 
     // 2. Video Metadata & Details:
     let title: Element<'a, Message> = if details.title.is_empty() {
