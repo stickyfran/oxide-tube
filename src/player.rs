@@ -1087,6 +1087,25 @@ impl WaylandZeroCopyPlayer {
         audio_url: Option<&str>,
         initial_seek_ms: Option<u64>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.play_stream_internal(video_url, audio_url, initial_seek_ms, true)
+    }
+
+    pub fn play_stream_with_seek_paused(
+        &self,
+        video_url: &str,
+        audio_url: Option<&str>,
+        initial_seek_ms: Option<u64>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.play_stream_internal(video_url, audio_url, initial_seek_ms, false)
+    }
+
+    fn play_stream_internal(
+        &self,
+        video_url: &str,
+        audio_url: Option<&str>,
+        initial_seek_ms: Option<u64>,
+        auto_play: bool,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let t_start = Instant::now();
         crate::diagnostics::stage_start("mpv_stream_setup");
 
@@ -1153,11 +1172,19 @@ impl WaylandZeroCopyPlayer {
         self.has_error.store(false, Ordering::SeqCst);
         *self.last_error.safe_lock() = None;
 
-        // Unpause to begin immediate playback
-        unsafe {
-            mpv_set_property_string(ctx, b"pause\0".as_ptr() as _, b"no\0".as_ptr() as _);
+        if auto_play {
+            // Unpause to begin immediate playback
+            unsafe {
+                mpv_set_property_string(ctx, b"pause\0".as_ptr() as _, b"no\0".as_ptr() as _);
+            }
+            self.is_playing.store(true, Ordering::SeqCst);
+        } else {
+            // Keep paused to load first frame without autoplaying
+            unsafe {
+                mpv_set_property_string(ctx, b"pause\0".as_ptr() as _, b"yes\0".as_ptr() as _);
+            }
+            self.is_playing.store(false, Ordering::SeqCst);
         }
-        self.is_playing.store(true, Ordering::SeqCst);
 
         crate::diagnostics::session_pipeline_built();
         crate::diagnostics::stage_end("mpv_stream_setup", Some(t_start));

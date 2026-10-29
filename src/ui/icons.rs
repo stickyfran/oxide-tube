@@ -37,11 +37,13 @@ pub fn icon_app_logo<'a, Message: 'static>(size: f32) -> Element<'a, Message> {
 }
 
 pub fn icon_youtube_logo<'a, Message: 'static>(size: f32, is_active: bool) -> Element<'a, Message> {
+    static RED_HANDLE: OnceLock<svg::Handle> = OnceLock::new();
+    static WHITE_HANDLE: OnceLock<svg::Handle> = OnceLock::new();
+    const SVG_RED: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><rect x="1.5" y="4.5" width="21" height="15" rx="4.5" fill="#ff0000"/><polygon points="10,8.5 16.5,12 10,15.5" fill="#ffffff"/></svg>"##;
+    const SVG_WHITE: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><rect x="1.5" y="4.5" width="21" height="15" rx="4.5" fill="#f1f1f1"/><polygon points="10,8.5 16.5,12 10,15.5" fill="#0f0f0f"/></svg>"##;
     if is_active {
-        icon_app_logo(size)
+        render_cached_svg(&RED_HANDLE, SVG_RED, size)
     } else {
-        static WHITE_HANDLE: OnceLock<svg::Handle> = OnceLock::new();
-        const SVG_WHITE: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><rect x="1.5" y="4.5" width="21" height="15" rx="4.5" fill="#f1f1f1"/><polygon points="10,8.5 16.5,12 10,15.5" fill="#0f0f0f"/></svg>"##;
         render_cached_svg(&WHITE_HANDLE, SVG_WHITE, size)
     }
 }
