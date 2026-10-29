@@ -23,6 +23,7 @@ pub fn icon_back<'a, Message: 'static>(size: f32) -> Element<'a, Message> {
     render_cached_svg(&HANDLE, SVG, size)
 }
 
+#[allow(dead_code)]
 pub fn icon_app_logo<'a, Message: 'static>(size: f32) -> Element<'a, Message> {
     static LOGO_HANDLE: OnceLock<image::Handle> = OnceLock::new();
     let handle = LOGO_HANDLE.get_or_init(|| {
@@ -41,11 +42,15 @@ pub fn icon_youtube_logo<'a, Message: 'static>(size: f32, is_active: bool) -> El
     static WHITE_HANDLE: OnceLock<svg::Handle> = OnceLock::new();
     const SVG_RED: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><rect x="1.5" y="4.5" width="21" height="15" rx="4.5" fill="#ff0000"/><polygon points="10,8.5 16.5,12 10,15.5" fill="#ffffff"/></svg>"##;
     const SVG_WHITE: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><rect x="1.5" y="4.5" width="21" height="15" rx="4.5" fill="#f1f1f1"/><polygon points="10,8.5 16.5,12 10,15.5" fill="#0f0f0f"/></svg>"##;
-    if is_active {
-        render_cached_svg(&RED_HANDLE, SVG_RED, size)
+    let handle = if is_active {
+        RED_HANDLE.get_or_init(|| svg::Handle::from_memory(SVG_RED))
     } else {
-        render_cached_svg(&WHITE_HANDLE, SVG_WHITE, size)
-    }
+        WHITE_HANDLE.get_or_init(|| svg::Handle::from_memory(SVG_WHITE))
+    };
+    svg(handle.clone())
+        .width(Length::Fixed(size * 1.35))
+        .height(Length::Fixed(size))
+        .into()
 }
 
 pub fn icon_search<'a, Message: 'static>(size: f32) -> Element<'a, Message> {

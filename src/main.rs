@@ -284,6 +284,7 @@ pub struct MitubApp {
     is_window_minimized: bool,
     is_window_hidden: bool,
     cursor_hidden_fullscreen: bool,
+    suppress_autoplay_on_launch: bool,
 }
 
 fn get_ipc_port() -> u16 {
@@ -1084,6 +1085,11 @@ impl MitubApp {
             decorations: true,
             icon: load_app_icon(),
             exit_on_close_request: false,
+            #[cfg(target_os = "linux")]
+            platform_specific: iced::window::settings::PlatformSpecific {
+                application_id: "tube-oxide".to_string(),
+                ..Default::default()
+            },
             ..Settings::default()
         };
 
@@ -1212,6 +1218,7 @@ impl MitubApp {
             is_window_minimized: false,
             is_window_hidden: false,
             cursor_hidden_fullscreen: false,
+            suppress_autoplay_on_launch: false,
         };
 
         // Initial tasks: fetch home feed & bind Wayland window pointers
@@ -1295,6 +1302,7 @@ impl MitubApp {
         }
 
         if !saved_tabs.is_empty() {
+            app.suppress_autoplay_on_launch = true;
             let active_idx = saved_active_idx.unwrap_or(0).min(saved_tabs.len().saturating_sub(1));
             app.active_tab_idx = Some(active_idx);
             let active_tab = &saved_tabs[active_idx];
@@ -1397,6 +1405,11 @@ impl MitubApp {
             decorations: true,
             icon: load_app_icon(),
             exit_on_close_request: false,
+            #[cfg(target_os = "linux")]
+            platform_specific: iced::window::settings::PlatformSpecific {
+                application_id: "tube-oxide".to_string(),
+                ..Default::default()
+            },
             ..Settings::default()
         };
 
@@ -2588,12 +2601,25 @@ impl MitubApp {
                                 if !video_uri.is_empty() {
                                     crate::diagnostics::log_event("STREAM", &format!("Launching playback for: {}", details.video_id));
                                     self.osd_state.has_playback_error = false;
-                                    self.osd_state.is_playing = true;
-                                    self.playing_video_id = Some(details.video_id.clone());
-                                    self.video_started_at = Some(std::time::Instant::now());
-                                    if let Err(e) = player.play_stream_with_seek(&video_uri, audio_uri.as_deref(), initial_seek_ms) {
-                                        eprintln!("[Playback Error] failed to launch stream: {e}");
-                                        self.osd_state.has_playback_error = true;
+                                    let suppress_autoplay = self.suppress_autoplay_on_launch;
+                                    self.suppress_autoplay_on_launch = false;
+
+                                    if suppress_autoplay {
+                                        self.osd_state.is_playing = false;
+                                        self.playing_video_id = Some(details.video_id.clone());
+                                        self.video_started_at = None;
+                                        if let Err(e) = player.play_stream_with_seek_paused(&video_uri, audio_uri.as_deref(), initial_seek_ms) {
+                                            eprintln!("[Playback Error] failed to launch stream paused: {e}");
+                                            self.osd_state.has_playback_error = true;
+                                        }
+                                    } else {
+                                        self.osd_state.is_playing = true;
+                                        self.playing_video_id = Some(details.video_id.clone());
+                                        self.video_started_at = Some(std::time::Instant::now());
+                                        if let Err(e) = player.play_stream_with_seek(&video_uri, audio_uri.as_deref(), initial_seek_ms) {
+                                            eprintln!("[Playback Error] failed to launch stream: {e}");
+                                            self.osd_state.has_playback_error = true;
+                                        }
                                     }
                                 } else {
                                     self.osd_state.has_playback_error = true;
@@ -6785,6 +6811,10 @@ fn ensure_desktop_integration() {
     let _ = fs::create_dir_all(&apps_dir);
     let _ = fs::create_dir_all(&pixmaps_dir);
 
+    // Clean up obsolete .desktop files from previous renames
+    let _ = fs::remove_file(apps_dir.join("mitub.desktop"));
+    let _ = fs::remove_file(apps_dir.join("oxide-tube.desktop"));
+
     let desktop_content = "\
 [Desktop Entry]
 Categories=AudioVideo;Video;Player;Network;
@@ -6804,13 +6834,48 @@ Type=Application
 
     let icon_bytes = include_bytes!("../assets/icon.png");
     let _ = fs::write(pixmaps_dir.join("tube-oxide.png"), icon_bytes);
+    let _ = fs::write(pixmaps_dir.join("mitub.png"), icon_bytes);
+    let _ = fs::write(pixmaps_dir.join("oxide-tube.png"), icon_bytes);
 
-    let sizes = ["16x16", "32x32", "48x48", "64x64", "128x128", "256x256", "512x512", "scalable"];
-    for sz in sizes {
-        let dir = icons_base.join(sz).join("apps");
-        let _ = fs::create_dir_all(&dir);
-        let _ = fs::write(dir.join("tube-oxide.png"), icon_bytes);
+    if let Ok(img) = image_crate::load_from_memory(icon_bytes) {
+        let resolutions: &[(u32, &str)] = &[
+            (16, "16x16"),
+            (32, "32x32"),
+            (48, "48x48"),
+            (64, "64x64"),
+            (128, "128x128"),
+            (256, "256x256"),
+            (512, "512x512"),
+        ];
+        for (dim, folder) in resolutions {
+            let dir = icons_base.join(folder).join("apps");
+            let _ = fs::create_dir_all(&dir);
+            let resized = img.resize_exact(*dim, *dim, image_crate::imageops::FilterType::Lanczos3);
+            let target_tube = dir.join("tube-oxide.png");
+            let target_mitub = dir.join("mitub.png");
+            let target_oxide = dir.join("oxide-tube.png");
+            if resized.save(&target_tube).is_ok() {
+                let _ = fs::copy(&target_tube, &target_mitub);
+                let _ = fs::copy(&target_tube, &target_oxide);
+            }
+        }
+        let scalable_dir = icons_base.join("scalable/apps");
+        let _ = fs::create_dir_all(&scalable_dir);
+        let _ = fs::write(scalable_dir.join("tube-oxide.png"), icon_bytes);
+        let _ = fs::write(scalable_dir.join("mitub.png"), icon_bytes);
+        let _ = fs::write(scalable_dir.join("oxide-tube.png"), icon_bytes);
     }
+
+    if let Some(cache_dir) = dirs::cache_dir() {
+        let _ = fs::remove_file(cache_dir.join("icon-cache.kcache"));
+    }
+
+    // Refresh system caches asynchronously without blocking UI
+    std::thread::spawn(move || {
+        let _ = std::process::Command::new("update-desktop-database").arg(&apps_dir).output();
+        let _ = std::process::Command::new("gtk-update-icon-cache").arg("-f").arg("-t").arg(&icons_base).output();
+        let _ = std::process::Command::new("kbuildsycoca6").arg("--noincremental").output();
+    });
 }
 
 fn main() -> iced::Result {
