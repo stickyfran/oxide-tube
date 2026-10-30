@@ -945,7 +945,7 @@ impl WaylandZeroCopyPlayer {
                         };
 
                         #[cfg(target_os = "linux")]
-                        let mut rendered_gl = false;
+                        let mut gl_success = false;
                         #[cfg(target_os = "linux")]
                         if is_opengl {
                             let mut mpv_fbo = MpvOpenglFbo {
@@ -987,31 +987,16 @@ impl WaylandZeroCopyPlayer {
                                 STAT_READ_NS.fetch_add(t_read.elapsed().as_nanos() as u64, Ordering::Relaxed);
                                 STAT_BYTES.fetch_add(byte_size as u64, Ordering::Relaxed);
                                 STAT_FRAMES.fetch_add(1, Ordering::Relaxed);
-                                frame_seq += 1;
-                                let owner = RecycledBuf {
-                                    buf: target_vec,
-                                    pool_tx: pool_tx.clone(),
-                                };
-                                let byte_buf = Bytes::from_owner(owner);
-                                let v_frame = VideoFrameBuffer {
-                                    frame_id: frame_seq,
-                                    width: current_buf_w,
-                                    height: current_buf_h,
-                                    data: byte_buf,
-                                };
-                                *current_frame.safe_lock() = Some(v_frame);
-                                FRAME_NOTIFY.notify_one();
-                                first_frame_rendered.store(true, Ordering::SeqCst);
-                                rendered_gl = true;
+                                gl_success = true;
                             }
                         }
 
                         #[cfg(target_os = "linux")]
-                        let should_render_sw = !rendered_gl;
+                        let should_render_sw = !gl_success;
                         #[cfg(not(target_os = "linux"))]
                         let should_render_sw = true;
 
-                        if should_render_sw {
+                        let render_ok = if should_render_sw {
                             // Software fallback render path with RecycledBuf
                             let mut size = [current_buf_w as i32, current_buf_h as i32];
                             let mut stride = (current_buf_w * 4) as usize;
@@ -1040,23 +1025,27 @@ impl WaylandZeroCopyPlayer {
                             ];
 
                             let err = unsafe { mpv_render_context_render(r_ctx, render_params.as_ptr()) };
-                            if err >= 0 {
-                                frame_seq += 1;
-                                let owner = RecycledBuf {
-                                    buf: target_vec,
-                                    pool_tx: pool_tx.clone(),
-                                };
-                                let byte_buf = Bytes::from_owner(owner);
-                                let v_frame = VideoFrameBuffer {
-                                    frame_id: frame_seq,
-                                    width: current_buf_w,
-                                    height: current_buf_h,
-                                    data: byte_buf,
-                                };
-                                *current_frame.safe_lock() = Some(v_frame);
-                                FRAME_NOTIFY.notify_one();
-                                first_frame_rendered.store(true, Ordering::SeqCst);
-                            }
+                            err >= 0
+                        } else {
+                            true
+                        };
+
+                        if render_ok {
+                            frame_seq += 1;
+                            let owner = RecycledBuf {
+                                buf: target_vec,
+                                pool_tx: pool_tx.clone(),
+                            };
+                            let byte_buf = Bytes::from_owner(owner);
+                            let v_frame = VideoFrameBuffer {
+                                frame_id: frame_seq,
+                                width: current_buf_w,
+                                height: current_buf_h,
+                                data: byte_buf,
+                            };
+                            *current_frame.safe_lock() = Some(v_frame);
+                            FRAME_NOTIFY.notify_one();
+                            first_frame_rendered.store(true, Ordering::SeqCst);
                         }
                     }
 

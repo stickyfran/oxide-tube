@@ -466,27 +466,19 @@ mod linux {
                 if let Ok(Ok(_visible)) = sig_result {
                     // Emit NewStatus signal so the panel/taskbar updates
                     if let Ok(ref iface) = sni_iface_ref {
-                        let ctxt = iface.signal_context();
                         let status = if TRAY_VISIBLE.load(std::sync::atomic::Ordering::Relaxed) {
                             "Active"
                         } else {
                             "Passive"
                         };
-                        // Emit the NewStatus signal via zbus
-                        let _ = zbus::object_server::Interface::properties_changed(
-                            iface.get().await,
-                            ctxt,
-                            &std::collections::HashSet::from(["Status".to_string()]),
-                        ).await;
-                        let _ = ctxt
-                            .connection()
-                            .emit_signal(
-                                None::<()>,
-                                "/StatusNotifierItem",
+                        let emitter = iface.signal_emitter();
+                        let _ = emitter
+                            .emit(
                                 "org.kde.StatusNotifierItem",
                                 "NewStatus",
                                 &(status,),
                             ).await;
+                        let _ = iface.get().await.status_changed(emitter).await;
                     }
                 }
             }
