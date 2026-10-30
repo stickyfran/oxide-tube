@@ -13,8 +13,54 @@ env:
   RUSTFLAGS: "-C target-cpu=generic"
 
 jobs:
+  build-windows:
+    name: Build Release Binary (Windows x86_64)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain (GNU)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Download libmpv dev (shinchiro)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download --repo shinchiro/mpv-winbuild-cmake --pattern 'mpv-dev-x86_64-[0-9]*.7z' --dir mpvdev
+          7z x mpvdev/*.7z -ompvdev/out -y
+          find mpvdev/out -maxdepth 2 -type f
+          cp mpvdev/out/libmpv.dll.a .
+          cp mpvdev/out/*.dll . || true
+
+      - name: Build release binary
+        shell: bash
+        run: cargo build --release --target x86_64-pc-windows-gnu
+
+      - name: Package zip
+        shell: bash
+        run: |
+          mkdir -p pkg
+          cp target/x86_64-pc-windows-gnu/release/tube-oxide.exe pkg/
+          cp mpvdev/out/*.dll pkg/ || true
+          cp assets/icon.png pkg/ 2>/dev/null || true
+          7z a tube-oxide-windows-x86_64-${{ github.ref_name }}.zip ./pkg/*
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-zip
+          path: tube-oxide-windows-x86_64-${{ github.ref_name }}.zip
+
   build-release:
     name: Build Release Binary (Linux x86_64)
+    needs: build-windows
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -64,6 +110,11 @@ jobs:
           tar -czf tube-oxide-linux-x86_64-${{ github.ref_name }}.tar.gz -C package .
           cp target/release/tube-oxide tube-oxide-bin-linux-x86_64
 
+      - name: Download Windows artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-zip
+
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
@@ -73,6 +124,7 @@ jobs:
           files: |
             tube-oxide-linux-x86_64-${{ github.ref_name }}.tar.gz
             tube-oxide-bin-linux-x86_64
+            tube-oxide-windows-x86_64-${{ github.ref_name }}.zip
           body: |
             ## Tube-oxide ${{ github.ref_name }}
             
