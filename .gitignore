@@ -2,6 +2,9 @@
 /target/
 **/*.rs.bk
 *.pdb
+*.dll
+*.dll.a
+*.7z
 
 # Environment and sensitive data
 .env

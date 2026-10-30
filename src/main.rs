@@ -1235,6 +1235,7 @@ impl MitubApp {
             };
             let disp_addr = if surf_addr != 0 {
                 // Wayland >= 1.23 provides wl_proxy_get_display; dynamically look it up to support older distributions (Ubuntu 22.04/24.04)
+                #[cfg(target_os = "linux")]
                 unsafe {
                     let mut addr = 0usize;
                     let lib = libc::dlopen(b"libwayland-client.so.0\0".as_ptr() as *const libc::c_char, libc::RTLD_LAZY);
@@ -1247,6 +1248,10 @@ impl MitubApp {
                         libc::dlclose(lib);
                     }
                     addr
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    0usize
                 }
             } else {
                 0usize
@@ -1428,6 +1433,7 @@ impl MitubApp {
                         _ => 0usize,
                     };
                     let disp_addr = if surf_addr != 0 {
+                        #[cfg(target_os = "linux")]
                         unsafe {
                             let mut addr = 0usize;
                             let lib = libc::dlopen(
@@ -1447,6 +1453,10 @@ impl MitubApp {
                                 libc::dlclose(lib);
                             }
                             addr
+                        }
+                        #[cfg(not(target_os = "linux"))]
+                        {
+                            0usize
                         }
                     } else {
                         0usize
@@ -1560,6 +1570,58 @@ impl MitubApp {
         ))
     }
 
+fn apply_circular_mask(rgba: &mut image_crate::RgbaImage) {
+    let (w, h) = rgba.dimensions();
+    let cx = w as f32 / 2.0;
+    let cy = h as f32 / 2.0;
+    let radius = cx.min(cy);
+    for y in 0..h {
+        for x in 0..w {
+            let dx = x as f32 + 0.5 - cx;
+            let dy = y as f32 + 0.5 - cy;
+            let dist = (dx * dx + dy * dy).sqrt();
+            if dist > radius - 1.0 {
+                let factor = (radius + 0.5 - dist).clamp(0.0, 1.0);
+                let p = rgba.get_pixel_mut(x, y);
+                p[3] = (p[3] as f32 * factor).round() as u8;
+            }
+        }
+    }
+}
+
+fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
+    let (w, h) = rgba.dimensions();
+    if radius == 0 || w < radius * 2 || h < radius * 2 {
+        return;
+    }
+    let r_f = radius as f32;
+    for y in 0..radius {
+        for x in 0..radius {
+            let dx = r_f - (x as f32 + 0.5);
+            let dy = r_f - (y as f32 + 0.5);
+            let dist = (dx * dx + dy * dy).sqrt();
+            if dist > r_f - 1.0 {
+                let factor = (r_f + 0.5 - dist).clamp(0.0, 1.0);
+                // Top-Left
+                let p_tl = rgba.get_pixel_mut(x, y);
+                p_tl[3] = (p_tl[3] as f32 * factor).round() as u8;
+
+                // Top-Right
+                let p_tr = rgba.get_pixel_mut(w - 1 - x, y);
+                p_tr[3] = (p_tr[3] as f32 * factor).round() as u8;
+
+                // Bottom-Left
+                let p_bl = rgba.get_pixel_mut(x, h - 1 - y);
+                p_bl[3] = (p_bl[3] as f32 * factor).round() as u8;
+
+                // Bottom-Right
+                let p_br = rgba.get_pixel_mut(w - 1 - x, h - 1 - y);
+                p_br[3] = (p_br[3] as f32 * factor).round() as u8;
+            }
+        }
+    }
+}
+
     fn queue_thumbnail_download(&mut self, url: &str) -> Option<Task<Message>> {
         self.queue_thumbnail_download_delayed(url, 0)
     }
@@ -1572,6 +1634,7 @@ impl MitubApp {
         self.in_flight_thumbnails.insert(url.to_string());
         let it = self.innertube.clone();
         let target_url = url.to_string();
+        let card_style = self.config.card_style;
         Some(Task::perform(
             async move {
                 if delay_ms > 0 {
@@ -1582,10 +1645,6 @@ impl MitubApp {
                     || target_url.contains("=s")
                     || target_url.contains("/channel/");
                 if let Some(b) = bytes {
-                    // For tiny avatars (< 16 KB), pass compressed bytes directly to avoid Intermediate DynamicImage allocations
-                    if is_avatar && b.len() <= 16_384 {
-                        return (target_url, Some((image::Handle::from_bytes(b), None)));
-                    }
                     let _permit = THUMB_DECODE_SEM.acquire().await.ok();
                     let handles = tokio::task::spawn_blocking(move || {
                         let res = if let Ok(img) = image_crate::load_from_memory(&b) {
@@ -1603,7 +1662,14 @@ impl MitubApp {
                             } else {
                                 img
                             };
-                            let rgba = processed.to_rgba8();
+                            let mut rgba = processed.to_rgba8();
+                            if is_square_avatar {
+                                Self::apply_circular_mask(&mut rgba);
+                            } else if card_style == crate::config::CardStyle::Squircle {
+                                let (w, _) = rgba.dimensions();
+                                let radius = (w as f32 * (16.0 / 320.0)).round() as u32;
+                                Self::apply_squircle_mask(&mut rgba, radius);
+                            }
                             let (w, h) = rgba.dimensions();
                             drop(b);
                             let sharp_handle = image::Handle::from_rgba(w, h, rgba.into_raw());
@@ -4069,7 +4135,30 @@ impl MitubApp {
             Message::SetCardStyle(style) => {
                 self.config.card_style = style;
                 self.config.save_async();
-                Task::none()
+                self.thumbnail_cache.clear();
+                self.blurred_thumbnails.clear();
+                self.in_flight_thumbnails.clear();
+                let mut urls = Vec::new();
+                for v in &self.home_videos {
+                    urls.push(v.thumbnail_url.clone());
+                    urls.push(v.channel_avatar.clone());
+                }
+                if let Some(details) = &self.watch_details {
+                    for v in &details.recommended_videos {
+                        urls.push(v.thumbnail_url.clone());
+                    }
+                }
+                let mut tasks = Vec::new();
+                for u in urls {
+                    if let Some(t) = self.queue_thumbnail_download(&u) {
+                        tasks.push(t);
+                    }
+                }
+                if tasks.is_empty() {
+                    Task::none()
+                } else {
+                    Task::batch(tasks)
+                }
             }
 
             Message::SetHomeColumns(cols) => {
@@ -4087,10 +4176,19 @@ impl MitubApp {
             Message::ToggleCloseToTray => {
                 self.config.close_to_tray = !self.config.close_to_tray;
                 self.config.save_async();
+                // Show/hide the tray icon based on the new setting.
+                // Only show it when the window is already hidden to tray;
+                // if enabling the setting while the window is open, the icon
+                // will appear the next time the user closes to tray.
+                if !self.config.close_to_tray {
+                    crate::tray::set_tray_visible(false);
+                }
                 Task::none()
             }
 
             Message::RestoreFromTray => {
+                // Hide the tray icon — it should only be visible while minimized to tray
+                crate::tray::set_tray_visible(false);
                 if let Some(main_id) = self.main_window_id {
                     self.is_window_hidden = false;
                     self.focused_window = Some(main_id);
@@ -5319,6 +5417,8 @@ impl MitubApp {
                                 if let Some(player) = &self.player {
                                     player.set_rendering_active(false);
                                 }
+                                // Show the tray icon now that we're minimizing to tray
+                                crate::tray::set_tray_visible(true);
                                 return window::close(win_id);
                             }
 
@@ -6102,6 +6202,7 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
                     fs_viewport_w,
                     fs_viewport_h,
                     self.window_size.1,
+                    self.config.card_style,
                     Message::VideoHitboxClicked,
                     Message::CloseOsdMenus,
                     Message::PlayPauseToggle,
@@ -6318,6 +6419,7 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
                         viewport_w,
                         viewport_h,
                         self.window_size.1,
+                        self.config.card_style,
                         Message::VideoHitboxClicked,
                         Message::CloseOsdMenus,
                         Message::PlayPauseToggle,

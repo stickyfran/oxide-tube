@@ -168,12 +168,6 @@ pub fn view_video_card<'a, Message: Clone + 'static>(
             .into()
     };
 
-    let thumb_btn = button(thumb_element)
-        .style(ghost_button)
-        .padding(0)
-        .width(Length::Fill)
-        .on_press(on_open_video(vid_id.clone()));
-
     let active_avatar = if blur > 0.20 {
         blurred_avatar_handle.or(avatar_handle)
     } else {
@@ -206,15 +200,10 @@ pub fn view_video_card<'a, Message: Clone + 'static>(
         ..COLOR_TEXT_SECONDARY
     };
 
-    let title_btn = button(
-        text(title_cow)
-            .size(14)
-            .line_height(iced::widget::text::LineHeight::Relative(1.25))
-            .color(title_color),
-    )
-    .style(ghost_button)
-    .padding(0)
-    .on_press(on_open_video(vid_id.clone()));
+    let title_elem = text(title_cow)
+        .size(14)
+        .line_height(iced::widget::text::LineHeight::Relative(1.25))
+        .color(title_color);
 
     let chan_cow: std::borrow::Cow<'a, str> = if video.channel_name.chars().count() > 30 {
         let mut s: String = video.channel_name.chars().take(28).collect();
@@ -258,7 +247,7 @@ pub fn view_video_card<'a, Message: Clone + 'static>(
     let info_col: Element<'a, Message> = if blur > 0.08 {
         let pill_alpha = (blur * 0.36).clamp(0.0, 0.45);
         let text_col = column![
-            title_btn,
+            title_elem,
             meta_line,
         ]
         .spacing(4)
@@ -288,7 +277,7 @@ pub fn view_video_card<'a, Message: Clone + 'static>(
         stack![text_col, blur_bars].into()
     } else {
         column![
-            title_btn,
+            title_elem,
             meta_line,
         ]
         .spacing(4)
@@ -299,12 +288,12 @@ pub fn view_video_card<'a, Message: Clone + 'static>(
         .spacing(12)
         .align_y(Alignment::Start);
 
-    let card_content = column![thumb_btn, details_row]
-        .spacing(12);
+    let card_content = column![thumb_element, details_row]
+        .spacing(10);
 
     let card_btn = button(card_content)
-        .style(video_card_button)
-        .padding(0)
+        .style(home_card_button(card_style))
+        .padding(6)
         .width(Length::FillPortion(1))
         .on_press(on_open_video(vid_id.clone()));
 
@@ -371,8 +360,8 @@ pub fn view_skeleton_card<'a, Message: 'static>(thumb_height: f32, card_style: C
     .spacing(12)
     .align_y(Alignment::Start);
 
-    column![thumb_box, details_row]
-        .spacing(12)
+    container(column![thumb_box, details_row].spacing(10))
+        .padding(6)
         .width(Length::FillPortion(1))
         .into()
 }

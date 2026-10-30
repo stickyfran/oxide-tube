@@ -202,6 +202,7 @@ pub const EGL_OPENGL_API: u32 = 0x30A2;
 pub const EGL_WIDTH: EGLint = 0x3057;
 pub const EGL_HEIGHT: EGLint = 0x3056;
 
+#[cfg(target_os = "linux")]
 #[link(name = "EGL")]
 extern "C" {
     pub fn eglGetDisplay(display_id: EGLDisplay) -> EGLDisplay;
@@ -230,6 +231,7 @@ pub const GL_UNSIGNED_BYTE: GLenum = 0x1401;
 pub const GL_FRAMEBUFFER: GLenum = 0x8D40;
 pub const GL_COLOR_ATTACHMENT0: GLenum = 0x8CE0;
 
+#[cfg(target_os = "linux")]
 #[link(name = "GL")]
 extern "C" {
     pub fn glGenTextures(n: GLsizei, textures: *mut GLuint);
@@ -258,12 +260,14 @@ extern "C" {
     pub fn glGetError() -> GLenum;
 }
 
+#[cfg(target_os = "linux")]
 #[link(name = "wayland-client")]
 extern "C" {
     pub fn wl_display_connect(name: *const c_char) -> *mut std::ffi::c_void;
     pub fn wl_display_disconnect(display: *mut std::ffi::c_void);
 }
 
+#[cfg(target_os = "linux")]
 unsafe extern "C" fn get_proc_address_mpv(_ctx: *mut std::ffi::c_void, name: *const c_char) -> *mut std::ffi::c_void {
     eglGetProcAddress(name)
 }
@@ -298,11 +302,24 @@ extern "C" {
 }
 
 extern "C" fn on_mpv_render_update(ctx: *mut std::ffi::c_void) {
-    let write_fd = ctx as usize as i32;
-    if write_fd >= 0 {
-        let byte = 1u8;
+    if ctx.is_null() {
+        return;
+    }
+    #[cfg(unix)]
+    {
+        let write_fd = ctx as usize as i32;
+        if write_fd >= 0 {
+            let byte = 1u8;
+            unsafe {
+                libc::write(write_fd, &byte as *const _ as _, 1);
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
         unsafe {
-            libc::write(write_fd, &byte as *const _ as _, 1);
+            let thread = &*(ctx as *const std::thread::Thread);
+            thread.unpark();
         }
     }
 }
@@ -512,21 +529,33 @@ impl WaylandZeroCopyPlayer {
             .spawn(move || {
                 let ctx = mpv_addr as *mut MpvHandle;
 
-                // Connect to Wayland display to enable direct VA-API hardware decoding (iHD driver)
+                // Connect to Wayland display to enable direct VA-API hardware decoding (iHD driver) on Linux
                 let disp_ptr = display_addr.load(Ordering::SeqCst);
+                #[allow(unused_mut)]
                 let mut own_wl_dpy = false;
+                #[allow(unused_variables)]
                 let wl_dpy = if disp_ptr != 0 {
                     disp_ptr as *mut std::ffi::c_void
                 } else {
-                    let d = unsafe { wl_display_connect(std::ptr::null()) };
-                    if !d.is_null() {
-                        own_wl_dpy = true;
+                    #[cfg(target_os = "linux")]
+                    {
+                        let d = unsafe { wl_display_connect(std::ptr::null()) };
+                        if !d.is_null() {
+                            own_wl_dpy = true;
+                        }
+                        d
                     }
-                    d
+                    #[cfg(not(target_os = "linux"))]
+                    {
+                        std::ptr::null_mut()
+                    }
                 };
 
-                // 1. Initialize EGL & OpenGL offscreen rendering context on this dedicated worker thread
+                // 1. Initialize EGL & OpenGL offscreen rendering context on this dedicated worker thread (Linux)
+                #[allow(unused_mut)]
                 let mut is_opengl = false;
+
+                #[cfg(target_os = "linux")]
                 let dpy = if !wl_dpy.is_null() {
                     let d = unsafe { eglGetDisplay(wl_dpy as _) };
                     if d.is_null() {
@@ -537,14 +566,22 @@ impl WaylandZeroCopyPlayer {
                 } else {
                     unsafe { eglGetDisplay(EGL_DEFAULT_DISPLAY) }
                 };
+                #[cfg(target_os = "linux")]
                 let mut egl_ctx = EGL_NO_CONTEXT;
+                #[cfg(target_os = "linux")]
                 let mut pbuf = std::ptr::null_mut();
+                #[cfg(target_os = "linux")]
                 let mut fbo = 0u32;
+                #[cfg(target_os = "linux")]
                 let mut tex = 0u32;
+                #[cfg(target_os = "linux")]
                 let mut gl_bind_fb: Option<unsafe extern "C" fn(GLenum, GLuint)> = None;
+                #[cfg(target_os = "linux")]
                 let mut gl_fb_tex: Option<unsafe extern "C" fn(GLenum, GLenum, GLenum, GLuint, GLint)> = None;
+                #[cfg(target_os = "linux")]
                 let mut gl_del_fb: Option<unsafe extern "C" fn(GLsizei, *const GLuint)> = None;
 
+                #[cfg(target_os = "linux")]
                 if !dpy.is_null() {
                     let mut maj = 0;
                     let mut min = 0;
@@ -606,16 +643,19 @@ impl WaylandZeroCopyPlayer {
                     }
                 }
 
-                // 2. Create MPV render context (prefer hardware OpenGL with Wayland VA-API, fallback to software)
+                // 2. Create MPV render context (prefer hardware OpenGL with Wayland VA-API on Linux, fallback to software cross-platform)
                 let mut r_ctx: *mut MpvRenderContext = std::ptr::null_mut();
+                #[cfg(target_os = "linux")]
                 let mut gl_init = MpvOpenglInitParams {
                     get_proc_address: Some(get_proc_address_mpv),
                     get_proc_address_ctx: std::ptr::null_mut(),
                 };
 
+                #[cfg(target_os = "linux")]
                 let opengl_api = b"opengl\0";
                 let sw_api = b"sw\0";
 
+                #[cfg(target_os = "linux")]
                 if is_opengl {
                     let mut params = Vec::with_capacity(4);
                     params.push(MpvRenderParam {
@@ -661,19 +701,27 @@ impl WaylandZeroCopyPlayer {
 
                 *render_ctx.safe_lock() = Some(r_ctx as usize);
 
+                #[cfg(unix)]
                 let pipe_fd = unsafe { mpv_get_wakeup_pipe(ctx) };
+                #[cfg(unix)]
                 let mut wakeup_pipe = [-1i32; 2];
+                #[cfg(unix)]
                 let pipe_res = unsafe { libc::pipe(wakeup_pipe.as_mut_ptr()) };
+                #[cfg(unix)]
                 if pipe_res == 0 {
                     unsafe {
                         libc::fcntl(wakeup_pipe[0], libc::F_SETFL, libc::O_NONBLOCK);
                         libc::fcntl(wakeup_pipe[1], libc::F_SETFL, libc::O_NONBLOCK);
                     }
                 }
+                #[cfg(unix)]
                 let wakeup_rx = wakeup_pipe[0];
+                #[cfg(unix)]
                 let wakeup_tx = wakeup_pipe[1];
+                #[cfg(unix)]
                 wakeup_tx_atomic.store(wakeup_tx, Ordering::SeqCst);
 
+                #[cfg(unix)]
                 if wakeup_tx >= 0 {
                     unsafe {
                         mpv_render_context_set_update_callback(
@@ -682,6 +730,17 @@ impl WaylandZeroCopyPlayer {
                             wakeup_tx as usize as *mut std::ffi::c_void,
                         );
                     }
+                }
+
+                #[cfg(not(unix))]
+                let worker_thread_handle = Box::into_raw(Box::new(std::thread::current()));
+                #[cfg(not(unix))]
+                unsafe {
+                    mpv_render_context_set_update_callback(
+                        r_ctx,
+                        Some(on_mpv_render_update),
+                        worker_thread_handle as *mut std::ffi::c_void,
+                    );
                 }
 
                 let mut current_buf_w: u32 = 1280;
@@ -857,6 +916,7 @@ impl WaylandZeroCopyPlayer {
                             current_buf_w = target_w;
                             current_buf_h = target_h;
 
+                            #[cfg(target_os = "linux")]
                             if is_opengl {
                                 unsafe {
                                     glBindTexture(GL_TEXTURE_2D, tex);
@@ -884,6 +944,9 @@ impl WaylandZeroCopyPlayer {
                             Err(_) => vec![0u8; byte_size],
                         };
 
+                        #[cfg(target_os = "linux")]
+                        let mut rendered_gl = false;
+                        #[cfg(target_os = "linux")]
                         if is_opengl {
                             let mut mpv_fbo = MpvOpenglFbo {
                                 fbo: fbo as i32,
@@ -939,8 +1002,16 @@ impl WaylandZeroCopyPlayer {
                                 *current_frame.safe_lock() = Some(v_frame);
                                 FRAME_NOTIFY.notify_one();
                                 first_frame_rendered.store(true, Ordering::SeqCst);
+                                rendered_gl = true;
                             }
-                        } else {
+                        }
+
+                        #[cfg(target_os = "linux")]
+                        let should_render_sw = !rendered_gl;
+                        #[cfg(not(target_os = "linux"))]
+                        let should_render_sw = true;
+
+                        if should_render_sw {
                             // Software fallback render path with RecycledBuf
                             let mut size = [current_buf_w as i32, current_buf_h as i32];
                             let mut stride = (current_buf_w * 4) as usize;
@@ -991,63 +1062,81 @@ impl WaylandZeroCopyPlayer {
 
                     // 3. Reactive sleep: wakes immediately on MPV core events or new render frame notification
                     let timeout_ms = if is_playing.load(Ordering::Relaxed) { 50 } else { 350 };
-                    let mut pfds = [
-                        libc::pollfd {
-                            fd: pipe_fd,
-                            events: libc::POLLIN,
-                            revents: 0,
-                        },
-                        libc::pollfd {
-                            fd: wakeup_rx,
-                            events: libc::POLLIN,
-                            revents: 0,
-                        },
-                    ];
+                    #[cfg(unix)]
+                    {
+                        let mut pfds = [
+                            libc::pollfd {
+                                fd: pipe_fd,
+                                events: libc::POLLIN,
+                                revents: 0,
+                            },
+                            libc::pollfd {
+                                fd: wakeup_rx,
+                                events: libc::POLLIN,
+                                revents: 0,
+                            },
+                        ];
 
-                    let poll_res = unsafe { libc::poll(pfds.as_mut_ptr(), if wakeup_rx >= 0 { 2 } else { 1 }, timeout_ms) };
-                    if poll_res > 0 {
-                        if (pfds[0].revents & libc::POLLIN) != 0 {
-                            let mut drain_buf = [0u8; 256];
-                            let _ = unsafe {
-                                libc::read(
-                                    pipe_fd,
-                                    drain_buf.as_mut_ptr() as *mut libc::c_void,
-                                    drain_buf.len(),
-                                )
-                            };
+                        let poll_res = unsafe { libc::poll(pfds.as_mut_ptr(), if wakeup_rx >= 0 { 2 } else { 1 }, timeout_ms) };
+                        if poll_res > 0 {
+                            if (pfds[0].revents & libc::POLLIN) != 0 {
+                                let mut drain_buf = [0u8; 256];
+                                let _ = unsafe {
+                                    libc::read(
+                                        pipe_fd,
+                                        drain_buf.as_mut_ptr() as *mut libc::c_void,
+                                        drain_buf.len(),
+                                    )
+                                };
+                            }
+                            if wakeup_rx >= 0 && (pfds[1].revents & libc::POLLIN) != 0 {
+                                let mut drain_buf = [0u8; 256];
+                                let _ = unsafe {
+                                    libc::read(
+                                        wakeup_rx,
+                                        drain_buf.as_mut_ptr() as *mut libc::c_void,
+                                        drain_buf.len(),
+                                    )
+                                };
+                            }
+                        } else if pipe_fd < 0 && wakeup_rx < 0 {
+                            std::thread::sleep(std::time::Duration::from_millis(timeout_ms as u64));
                         }
-                        if wakeup_rx >= 0 && (pfds[1].revents & libc::POLLIN) != 0 {
-                            let mut drain_buf = [0u8; 256];
-                            let _ = unsafe {
-                                libc::read(
-                                    wakeup_rx,
-                                    drain_buf.as_mut_ptr() as *mut libc::c_void,
-                                    drain_buf.len(),
-                                )
-                            };
-                        }
-                    } else if pipe_fd < 0 && wakeup_rx < 0 {
-                        std::thread::sleep(std::time::Duration::from_millis(timeout_ms as u64));
+                    }
+
+                    #[cfg(not(unix))]
+                    {
+                        std::thread::park_timeout(std::time::Duration::from_millis(timeout_ms as u64));
                     }
                 }
 
                 // Cleanup OpenGL & EGL resources on thread exit
                 wakeup_tx_atomic.store(-1, Ordering::SeqCst);
                 *render_ctx.safe_lock() = None;
-                if wakeup_tx >= 0 {
-                    unsafe {
-                        mpv_render_context_set_update_callback(r_ctx, None, std::ptr::null_mut());
-                        libc::close(wakeup_tx);
+                #[cfg(unix)]
+                {
+                    if wakeup_tx >= 0 {
+                        unsafe {
+                            mpv_render_context_set_update_callback(r_ctx, None, std::ptr::null_mut());
+                            libc::close(wakeup_tx);
+                        }
+                    }
+                    if wakeup_rx >= 0 {
+                        unsafe {
+                            libc::close(wakeup_rx);
+                        }
                     }
                 }
-                if wakeup_rx >= 0 {
-                    unsafe {
-                        libc::close(wakeup_rx);
-                    }
+                #[cfg(not(unix))]
+                unsafe {
+                    mpv_render_context_set_update_callback(r_ctx, None, std::ptr::null_mut());
+                    let _ = Box::from_raw(worker_thread_handle);
                 }
+
                 if !r_ctx.is_null() {
                     unsafe { mpv_render_context_free(r_ctx) };
                 }
+                #[cfg(target_os = "linux")]
                 if is_opengl {
                     unsafe {
                         if tex != 0 {
@@ -1070,6 +1159,7 @@ impl WaylandZeroCopyPlayer {
                     }
                 }
 
+                #[cfg(target_os = "linux")]
                 if own_wl_dpy && !wl_dpy.is_null() {
                     unsafe { wl_display_disconnect(wl_dpy) };
                 }

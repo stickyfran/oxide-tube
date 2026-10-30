@@ -1,6 +1,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::watch;
+#[cfg(target_os = "linux")]
 use zbus::proxy;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -9,6 +10,7 @@ pub enum PowerProfile {
     Ac,
 }
 
+#[cfg(target_os = "linux")]
 #[proxy(
     default_service = "org.freedesktop.UPower",
     default_path = "/org/freedesktop/UPower",
@@ -19,6 +21,7 @@ trait UPower {
     fn on_battery(&self) -> zbus::Result<bool>;
 }
 
+#[cfg(target_os = "linux")]
 #[proxy(
     default_service = "org.freedesktop.ScreenSaver",
     default_path = "/org/freedesktop/ScreenSaver",
@@ -58,6 +61,7 @@ impl PowerManager {
     }
 
     fn start_screensaver_inhibitor(mut rx: watch::Receiver<bool>) {
+        #[cfg(target_os = "linux")]
         tokio::spawn(async move {
             let Ok(conn) = zbus::Connection::session().await else {
                 return;
@@ -87,6 +91,38 @@ impl PowerManager {
                 }
             }
         });
+
+        #[cfg(target_os = "windows")]
+        tokio::spawn(async move {
+            use windows_sys::Win32::System::Power::{
+                SetThreadExecutionState, ES_CONTINUOUS, ES_DISPLAY_REQUIRED, ES_SYSTEM_REQUIRED,
+            };
+            loop {
+                let should_inhibit = *rx.borrow_and_update();
+                if should_inhibit {
+                    unsafe {
+                        SetThreadExecutionState(
+                            ES_CONTINUOUS | ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED,
+                        );
+                    }
+                } else {
+                    unsafe {
+                        SetThreadExecutionState(ES_CONTINUOUS);
+                    }
+                }
+                if rx.changed().await.is_err() {
+                    unsafe {
+                        SetThreadExecutionState(ES_CONTINUOUS);
+                    }
+                    break;
+                }
+            }
+        });
+
+        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+        tokio::spawn(async move {
+            while rx.changed().await.is_ok() {}
+        });
     }
 
     pub fn subscribe(&self) -> watch::Receiver<PowerProfile> {
@@ -97,18 +133,48 @@ impl PowerManager {
         self.on_battery.load(Ordering::Relaxed)
     }
 
-    /// Spawns the background UPower D-Bus listener task.
+    /// Spawns the background battery and power listener task.
     pub fn start_listener(&self) {
         let on_battery = self.on_battery.clone();
         let sender = self.sender.clone();
 
+        #[cfg(target_os = "linux")]
         tokio::spawn(async move {
             if let Err(e) = Self::run_dbus_loop(on_battery, sender).await {
                 eprintln!("[PowerManager] UPower D-Bus monitor error: {e}. Falling back to polling/AC.");
             }
         });
+
+        #[cfg(target_os = "windows")]
+        tokio::spawn(async move {
+            use windows_sys::Win32::System::Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS};
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+            loop {
+                interval.tick().await;
+                let mut status: SYSTEM_POWER_STATUS = unsafe { std::mem::zeroed() };
+                if unsafe { GetSystemPowerStatus(&mut status) } != 0 {
+                    let is_battery = status.ACLineStatus == 0;
+                    if on_battery.swap(is_battery, Ordering::SeqCst) != is_battery {
+                        let profile = if is_battery {
+                            Self::apply_battery_profile();
+                            PowerProfile::Battery
+                        } else {
+                            Self::apply_ac_profile();
+                            PowerProfile::Ac
+                        };
+                        let _ = sender.send(profile);
+                    }
+                }
+            }
+        });
+
+        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+        tokio::spawn(async move {
+            let _ = sender.send(PowerProfile::Ac);
+        });
     }
 
+    #[cfg(target_os = "linux")]
     async fn run_dbus_loop(
         on_battery_flag: Arc<AtomicBool>,
         sender: watch::Sender<PowerProfile>,
@@ -166,6 +232,7 @@ impl PowerManager {
 /// Safely pins background execution to power-efficient cores
 /// based on dynamic topology detection.
 pub fn pin_to_lp_ecores() {
+    #[cfg(target_os = "linux")]
     unsafe {
         let num_cpus = libc::sysconf(libc::_SC_NPROCESSORS_ONLN) as usize;
         let mut set: libc::cpu_set_t = std::mem::zeroed();
@@ -191,10 +258,20 @@ pub fn pin_to_lp_ecores() {
             }
         }
     }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        if let Some(core_ids) = core_affinity::get_core_ids() {
+            if core_ids.len() >= 2 {
+                let _ = core_affinity::set_for_current(core_ids[core_ids.len() - 1]);
+            }
+        }
+    }
 }
 
 /// Restores thread affinity mask to all available cores
 pub fn unpin_all_cores() {
+    #[cfg(target_os = "linux")]
     unsafe {
         let mut set: libc::cpu_set_t = std::mem::zeroed();
         libc::CPU_ZERO(&mut set);
@@ -203,6 +280,11 @@ pub fn unpin_all_cores() {
             libc::CPU_SET(i, &mut set);
         }
         libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set);
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        // On non-Linux platforms, default OS scheduler manages execution
     }
 }
 

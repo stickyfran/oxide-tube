@@ -11,23 +11,44 @@ pub enum TrayAction {
 
 static TRAY_CHANNEL: OnceLock<broadcast::Sender<TrayAction>> = OnceLock::new();
 
+// ─── Tray visibility control ───────────────────────────────────────────────
+
+/// Set to true to show the tray icon, false to hide it.
+/// Called from main.rs when close_to_tray is toggled or the window is closed to tray.
+pub fn set_tray_visible(visible: bool) {
+    #[cfg(target_os = "linux")]
+    linux::set_tray_visible(visible);
+    #[cfg(target_os = "windows")]
+    windows::set_tray_visible(visible);
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    let _ = visible;
+}
+
+// ─── Linux (KDE StatusNotifierItem via D-Bus) ─────────────────────────────
+
 #[cfg(target_os = "linux")]
 mod linux {
     use super::*;
     use serde::{Deserialize, Serialize};
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use zbus::zvariant::{OwnedValue, Type, Value};
     use zbus::{interface, proxy};
 
-    #[derive(Type, Serialize, Deserialize, Debug, Clone)]
-    pub struct DbusMenuItemLayout {
-        pub id: i32,
-        pub fields: HashMap<String, OwnedValue>,
-        pub children: Vec<OwnedValue>,
+    static TRAY_VISIBLE: AtomicBool = AtomicBool::new(false);
+
+    pub fn set_tray_visible(visible: bool) {
+        TRAY_VISIBLE.store(visible, Ordering::Relaxed);
+        // Trigger a NewStatus signal so KDE picks up the change
+        SNI_SIGNAL.get().map(|tx| { let _ = tx.send(visible); });
     }
 
+    // Channel to notify the async SNI task of visibility changes
+    static SNI_SIGNAL: OnceLock<std::sync::mpsc::SyncSender<bool>> = OnceLock::new();
+
     fn load_tray_icon_pixmap() -> Vec<(i32, i32, Vec<u8>)> {
-        let icon_bytes = include_bytes!("../assets/icon.png");
+        // Use the white symbolic icon (KDE style)
+        let icon_bytes = include_bytes!("../assets/tray_icon_white.png");
         if let Ok(img) = image::load_from_memory(icon_bytes) {
             let resized = img.resize(32, 32, image::imageops::FilterType::Lanczos3);
             let rgba = resized.to_rgba8();
@@ -43,6 +64,13 @@ mod linux {
         } else {
             vec![]
         }
+    }
+
+    #[derive(Type, Serialize, Deserialize, Debug, Clone)]
+    pub struct DbusMenuItemLayout {
+        pub id: i32,
+        pub fields: HashMap<String, OwnedValue>,
+        pub children: Vec<OwnedValue>,
     }
 
     pub struct StatusNotifierItem {
@@ -66,14 +94,20 @@ mod linux {
             "Tube-oxide"
         }
 
+        /// "Active" = visible, "Passive" = hidden
         #[zbus(property)]
         fn status(&self) -> &str {
-            "Active"
+            if TRAY_VISIBLE.load(std::sync::atomic::Ordering::Relaxed) {
+                "Active"
+            } else {
+                "Passive"
+            }
         }
 
         #[zbus(property)]
         fn icon_name(&self) -> &str {
-            "multimedia-video-player"
+            // Empty name: use pixmap instead (white symbolic pixmap)
+            ""
         }
 
         #[zbus(property)]
@@ -129,7 +163,7 @@ mod linux {
         #[zbus(property)]
         fn tool_tip(&self) -> (String, Vec<(i32, i32, Vec<u8>)>, String, String) {
             (
-                "multimedia-video-player".to_string(),
+                "".to_string(),
                 vec![],
                 "Tube-oxide".to_string(),
                 "Reproductor nativo de YouTube".to_string(),
@@ -375,6 +409,10 @@ mod linux {
             return;
         }
 
+        // Set up the visibility signal channel
+        let (sig_tx, sig_rx) = std::sync::mpsc::sync_channel::<bool>(8);
+        let _ = SNI_SIGNAL.set(sig_tx);
+
         let pid = std::process::id();
         let service_name = format!("org.kde.StatusNotifierItem-{}-1", pid);
 
@@ -408,27 +446,76 @@ mod linux {
                 }
             }
 
+            // Listen for visibility-change signals and emit NewStatus D-Bus signal
+            let sni_iface_ref = connection
+                .object_server()
+                .interface::<_, StatusNotifierItem>("/StatusNotifierItem")
+                .await;
+
             loop {
-                tokio::time::sleep(tokio::time::Duration::from_secs(3600)).await;
+                // Poll for visibility changes (sync channel in async context via spawn_blocking)
+                let sig_result = tokio::task::spawn_blocking({
+                    let sig_rx_ptr = &sig_rx as *const _ as usize;
+                    move || {
+                        // SAFETY: sig_rx lives for the duration of this task
+                        let rx = unsafe { &*(sig_rx_ptr as *const std::sync::mpsc::Receiver<bool>) };
+                        rx.recv_timeout(std::time::Duration::from_secs(3600))
+                    }
+                }).await;
+
+                if let Ok(Ok(_visible)) = sig_result {
+                    // Emit NewStatus signal so the panel/taskbar updates
+                    if let Ok(ref iface) = sni_iface_ref {
+                        let ctxt = iface.signal_context();
+                        let status = if TRAY_VISIBLE.load(std::sync::atomic::Ordering::Relaxed) {
+                            "Active"
+                        } else {
+                            "Passive"
+                        };
+                        // Emit the NewStatus signal via zbus
+                        let _ = zbus::object_server::Interface::properties_changed(
+                            iface.get().await,
+                            ctxt,
+                            &std::collections::HashSet::from(["Status".to_string()]),
+                        ).await;
+                        let _ = ctxt
+                            .connection()
+                            .emit_signal(
+                                None::<()>,
+                                "/StatusNotifierItem",
+                                "org.kde.StatusNotifierItem",
+                                "NewStatus",
+                                &(status,),
+                            ).await;
+                    }
+                }
             }
         });
     }
 }
 
+// ─── Windows (Shell_NotifyIconW) ──────────────────────────────────────────
+
 #[cfg(target_os = "windows")]
 mod windows {
     use super::*;
     use std::ptr;
+    use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
     use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
+    use windows_sys::Win32::Graphics::Gdi::{
+        CreateBitmap, CreateCompatibleDC, DeleteDC, DeleteObject,
+        GetDC, ReleaseDC, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS,
+    };
     use windows_sys::Win32::UI::Shell::{
-        Shell_NotifyIconW, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW, NIF_MESSAGE, NIF_TIP,
+        Shell_NotifyIconW, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
+        NIF_ICON, NIF_MESSAGE, NIF_TIP,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu,
-        DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW, RegisterClassW,
-        SetForegroundWindow, TrackPopupMenu, TranslateMessage, MF_SEPARATOR, MF_STRING,
-        TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RIGHTBUTTON, WM_COMMAND, WM_DESTROY, WM_LBUTTONUP,
-        WM_RBUTTONUP, WM_USER, WNDCLASSW,
+        AppendMenuW, CreateIconIndirect, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
+        DestroyMenu, DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW,
+        RegisterClassW, SetForegroundWindow, TrackPopupMenu, TranslateMessage,
+        MF_SEPARATOR, MF_STRING, TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RIGHTBUTTON,
+        WM_COMMAND, WM_DESTROY, WM_LBUTTONUP, WM_RBUTTONUP, WM_USER, WNDCLASSW, ICONINFO,
     };
 
     const WM_TRAYICON: u32 = WM_USER + 101;
@@ -438,6 +525,132 @@ mod windows {
     const ID_QUIT: usize = 1004;
 
     static SENDER: std::sync::OnceLock<broadcast::Sender<TrayAction>> = std::sync::OnceLock::new();
+    /// Handle to the hidden message-only window; 0 = not yet created
+    static HWND_TRAY: AtomicIsize = AtomicIsize::new(0);
+    /// Whether the icon is currently added to the tray
+    static ICON_ADDED: AtomicBool = AtomicBool::new(false);
+
+    /// Build an HICON from the white PNG bytes embedded at compile time.
+    /// Returns 0 (null) on failure.
+    unsafe fn create_white_hicon() -> isize {
+        let icon_bytes = include_bytes!("../assets/tray_icon_white.png");
+        let img = match image::load_from_memory(icon_bytes) {
+            Ok(i) => i,
+            Err(_) => return 0,
+        };
+        let rgba = img.resize(32, 32, image::imageops::FilterType::Lanczos3).to_rgba8();
+        let (w, h) = rgba.dimensions();
+        let w = w as i32;
+        let h = h as i32;
+
+        // Build a top-down DIB with pre-multiplied alpha for the color mask
+        // Windows BITMAPINFOHEADER for 32-bpp top-down
+        let bmi = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: w,
+                biHeight: -h, // negative = top-down
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB as u32,
+                biSizeImage: 0,
+                biXPelsPerMeter: 0,
+                biYPelsPerMeter: 0,
+                biClrUsed: 0,
+                biClrImportant: 0,
+            },
+            bmiColors: [windows_sys::Win32::Graphics::Gdi::RGBQUAD {
+                rgbBlue: 0, rgbGreen: 0, rgbRed: 0, rgbReserved: 0,
+            }],
+        };
+
+        // Convert RGBA → BGRA (Windows DIB order)
+        let mut bgra: Vec<u8> = Vec::with_capacity((w * h * 4) as usize);
+        for pixel in rgba.pixels() {
+            bgra.push(pixel[2]); // B
+            bgra.push(pixel[1]); // G
+            bgra.push(pixel[0]); // R
+            bgra.push(pixel[3]); // A
+        }
+
+        let screen_dc = GetDC(0);
+        let mem_dc = CreateCompatibleDC(screen_dc);
+
+        let mut color_bits_ptr: *mut std::ffi::c_void = ptr::null_mut();
+        let color_bmp = windows_sys::Win32::Graphics::Gdi::CreateDIBSection(
+            mem_dc,
+            &bmi,
+            DIB_RGB_COLORS,
+            &mut color_bits_ptr,
+            0,
+            0,
+        );
+        if color_bmp == 0 {
+            DeleteDC(mem_dc);
+            ReleaseDC(0, screen_dc);
+            return 0;
+        }
+        // Copy pixel data into the DIB
+        std::ptr::copy_nonoverlapping(bgra.as_ptr(), color_bits_ptr as *mut u8, bgra.len());
+
+        // Create a 1-bpp mask bitmap (all zeros = fully use color bitmap alpha)
+        let mask_bmp = CreateBitmap(w, h, 1, 1, ptr::null());
+
+        DeleteDC(mem_dc);
+        ReleaseDC(0, screen_dc);
+
+        if mask_bmp == 0 {
+            DeleteObject(color_bmp);
+            return 0;
+        }
+
+        let icon_info = ICONINFO {
+            fIcon: 1,    // 1 = icon (not cursor)
+            xHotspot: 0,
+            yHotspot: 0,
+            hbmMask: mask_bmp,
+            hbmColor: color_bmp,
+        };
+        let hicon = CreateIconIndirect(&icon_info);
+
+        DeleteObject(mask_bmp);
+        DeleteObject(color_bmp);
+
+        hicon
+    }
+
+    unsafe fn build_nid(hwnd: HWND, hicon: isize) -> NOTIFYICONDATAW {
+        let mut nid: NOTIFYICONDATAW = std::mem::zeroed();
+        nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
+        nid.hWnd = hwnd;
+        nid.uID = 1;
+        nid.uFlags = NIF_MESSAGE | NIF_TIP | if hicon != 0 { NIF_ICON } else { 0 };
+        nid.uCallbackMessage = WM_TRAYICON;
+        nid.hIcon = hicon;
+        let tip: Vec<u16> = "Tube-oxide\0".encode_utf16().collect();
+        let copy_len = tip.len().min(nid.szTip.len());
+        ptr::copy_nonoverlapping(tip.as_ptr(), nid.szTip.as_mut_ptr(), copy_len);
+        nid
+    }
+
+    pub fn set_tray_visible(visible: bool) {
+        let hwnd = HWND_TRAY.load(Ordering::Relaxed) as HWND;
+        if hwnd == 0 {
+            return; // Window not created yet; init_tray will handle initial state
+        }
+        unsafe {
+            if visible && !ICON_ADDED.load(Ordering::Relaxed) {
+                let hicon = create_white_hicon();
+                let nid = build_nid(hwnd, hicon);
+                Shell_NotifyIconW(NIM_ADD, &nid);
+                ICON_ADDED.store(true, Ordering::Relaxed);
+            } else if !visible && ICON_ADDED.load(Ordering::Relaxed) {
+                let nid = build_nid(hwnd, 0);
+                Shell_NotifyIconW(NIM_DELETE, &nid);
+                ICON_ADDED.store(false, Ordering::Relaxed);
+            }
+        }
+    }
 
     unsafe extern "system" fn window_proc(
         hwnd: HWND,
@@ -532,17 +745,10 @@ mod windows {
                 0, 0, 0, ptr::null(),
             );
 
-            let mut nid: NOTIFYICONDATAW = std::mem::zeroed();
-            nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
-            nid.hWnd = hwnd;
-            nid.uID = 1;
-            nid.uFlags = NIF_MESSAGE | NIF_TIP;
-            nid.uCallbackMessage = WM_TRAYICON;
-            let tip: Vec<u16> = "Tube-oxide\0".encode_utf16().collect();
-            let copy_len = tip.len().min(nid.szTip.len());
-            ptr::copy_nonoverlapping(tip.as_ptr(), nid.szTip.as_mut_ptr(), copy_len);
+            // Store hwnd so set_tray_visible can use it from any thread
+            HWND_TRAY.store(hwnd as isize, Ordering::Relaxed);
 
-            Shell_NotifyIconW(NIM_ADD, &nid);
+            // Do NOT add the icon here — it will be added when set_tray_visible(true) is called
 
             let mut msg = std::mem::zeroed();
             while GetMessageW(&mut msg, 0, 0, 0) > 0 {
@@ -550,11 +756,17 @@ mod windows {
                 DispatchMessageW(&msg);
             }
 
-            Shell_NotifyIconW(NIM_DELETE, &nid);
+            // Clean up if still added
+            if ICON_ADDED.load(Ordering::Relaxed) {
+                let nid = build_nid(hwnd, 0);
+                Shell_NotifyIconW(NIM_DELETE, &nid);
+            }
             DestroyWindow(hwnd);
         });
     }
 }
+
+// ─── Fallback (other OS) ──────────────────────────────────────────────────
 
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
 mod fallback {
@@ -562,9 +774,12 @@ mod fallback {
     pub fn init_tray(_tx: broadcast::Sender<TrayAction>) {}
 }
 
+// ─── Public API ───────────────────────────────────────────────────────────
+
 pub fn get_tray_receiver() -> broadcast::Receiver<TrayAction> {
     let tx = TRAY_CHANNEL.get_or_init(|| {
         let (tx, _) = broadcast::channel(64);
+        // Start the background tray service (icon is hidden until set_tray_visible(true))
         #[cfg(target_os = "linux")]
         linux::init_tray(tx.clone());
         #[cfg(target_os = "windows")]

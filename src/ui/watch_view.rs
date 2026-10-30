@@ -1,4 +1,4 @@
-use crate::config::PreferredCodec;
+use crate::config::{CardStyle, PreferredCodec};
 use crate::innertube::{VideoCard, WatchDetails};
 use crate::live_chat::ChatMessage;
 use crate::ui::icons::*;
@@ -158,6 +158,7 @@ pub fn view_watch_page<'a, Message: Clone + 'static>(
     player_viewport_width: u16,
     player_viewport_height: u16,
     _window_height: f32,
+    card_style: CardStyle,
     on_video_hitbox_click: Message,
     on_close_menus: Message,
     on_play_pause: Message,
@@ -1363,7 +1364,7 @@ pub fn view_watch_page<'a, Message: Clone + 'static>(
     let mut recs_list = column![recs_header].spacing(10);
     if details.recommended_videos.is_empty() {
         for _ in 0..8 {
-            recs_list = recs_list.push(view_skeleton_compact_card());
+            recs_list = recs_list.push(view_skeleton_compact_card(card_style));
         }
     } else {
         for video in &details.recommended_videos {
@@ -1374,6 +1375,7 @@ pub fn view_watch_page<'a, Message: Clone + 'static>(
                 thumb,
                 blurred_thumb,
                 blur,
+                card_style,
                 on_open_video,
                 on_open_video_new_tab,
                 on_open_channel,
@@ -1491,13 +1493,17 @@ fn view_skeleton_comment<'a, Message: 'static>() -> Element<'a, Message> {
         .into()
 }
 
-fn view_skeleton_compact_card<'a, Message: 'static>() -> Element<'a, Message> {
+fn view_skeleton_compact_card<'a, Message: 'static>(card_style: CardStyle) -> Element<'a, Message> {
+    let thumb_radius = match card_style {
+        CardStyle::Squircle => 12,
+        CardStyle::Rectangular => 0,
+    };
     let thumb = container(Space::with_width(Length::Fixed(168.0)))
         .width(Length::Fixed(168.0))
         .height(Length::Fixed(94.0))
-        .style(|_t| container::Style {
+        .style(move |_t| container::Style {
             background: Some(iced::Color::from_rgb8(0x1a, 0x1a, 0x1a).into()),
-            border: iced::border::rounded(8).color(COLOR_BORDER).width(1.0),
+            border: iced::border::rounded(thumb_radius).color(COLOR_BORDER).width(1.0),
             ..container::Style::default()
         });
 
@@ -1519,9 +1525,8 @@ fn view_skeleton_compact_card<'a, Message: 'static>() -> Element<'a, Message> {
             ..container::Style::default()
         });
 
-    row![thumb, column![line1, line2].spacing(6).width(Length::Fill)]
-        .spacing(10)
-        .align_y(Alignment::Start)
+    container(row![thumb, column![line1, line2].spacing(6).width(Length::Fill)].spacing(10).align_y(Alignment::Start))
+        .padding(iced::Padding { top: 6.0, right: 8.0, bottom: 6.0, left: 6.0 })
         .into()
 }
 
@@ -1531,6 +1536,7 @@ pub fn view_compact_card<'a, Message: Clone + 'static>(
     thumb_handle: Option<&'a iced::widget::image::Handle>,
     blurred_thumb_handle: Option<&'a iced::widget::image::Handle>,
     blur_amount: f32,
+    card_style: CardStyle,
     on_open_video: impl Fn(String) -> Message + 'static,
     on_open_video_new_tab: impl Fn(String) -> Message + 'static,
     on_open_channel: impl Fn(String) -> Message + 'static,
@@ -1541,6 +1547,11 @@ pub fn view_compact_card<'a, Message: Clone + 'static>(
     let video_clone = video.clone();
     let blur = blur_amount.clamp(0.0, 1.0);
     let text_alpha = (1.0 - blur * 0.62).clamp(0.25, 1.0);
+
+    let (thumb_radius, badge_radius) = match card_style {
+        CardStyle::Squircle => (12, 4),
+        CardStyle::Rectangular => (0, 0),
+    };
 
     let badge_content: Element<'a, Message> = if video.is_live {
         row![
@@ -1561,7 +1572,12 @@ pub fn view_compact_card<'a, Message: Clone + 'static>(
 
     let thumb_badge = container(badge_content)
         .padding([2, 4])
-        .style(osd_container);
+        .style(move |_t| container::Style {
+            background: Some(COLOR_OSD_BG.into()),
+            border: iced::border::rounded(badge_radius),
+            text_color: Some(COLOR_TEXT_PRIMARY),
+            ..container::Style::default()
+        });
 
     let badge_overlay = container(
         column![
@@ -1589,9 +1605,9 @@ pub fn view_compact_card<'a, Message: Clone + 'static>(
         container(Space::with_width(Length::Fixed(168.0)))
             .width(Length::Fixed(168.0))
             .height(Length::Fixed(94.0))
-            .style(|_t| container::Style {
+            .style(move |_t| container::Style {
                 background: Some(iced::Color::from_rgb8(0x18, 0x18, 0x18).into()),
-                border: iced::border::rounded(8).color(COLOR_BORDER).width(1.0),
+                border: iced::border::rounded(thumb_radius).color(COLOR_BORDER).width(1.0),
                 ..container::Style::default()
             })
             .into()
@@ -1604,14 +1620,14 @@ pub fn view_compact_card<'a, Message: Clone + 'static>(
             .height(Length::Fixed(94.0))
             .style(move |_t| container::Style {
                 background: Some(iced::Color::from_rgba(0.07, 0.07, 0.09, frost_alpha).into()),
-                border: iced::border::rounded(8),
+                border: iced::border::rounded(thumb_radius),
                 ..container::Style::default()
             });
         container(stack![base_thumb, frost_layer, badge_overlay])
             .width(Length::Fixed(168.0))
             .height(Length::Fixed(94.0))
-            .style(|_t| container::Style {
-                border: iced::border::rounded(8),
+            .style(move |_t| container::Style {
+                border: iced::border::rounded(thumb_radius),
                 ..container::Style::default()
             })
             .into()
@@ -1619,8 +1635,8 @@ pub fn view_compact_card<'a, Message: Clone + 'static>(
         container(stack![base_thumb, badge_overlay])
             .width(Length::Fixed(168.0))
             .height(Length::Fixed(94.0))
-            .style(|_t| container::Style {
-                border: iced::border::rounded(8),
+            .style(move |_t| container::Style {
+                border: iced::border::rounded(thumb_radius),
                 ..container::Style::default()
             })
             .into()
@@ -1680,8 +1696,8 @@ pub fn view_compact_card<'a, Message: Clone + 'static>(
     let info_col = column![title_elem, chan_btn, meta, queue_btn].spacing(3).width(Length::Fill);
 
     let card_btn = button(row![thumb_element, info_col].spacing(10).align_y(Alignment::Start))
-        .style(video_card_button)
-        .padding(4)
+        .style(compact_card_button(card_style))
+        .padding(iced::Padding { top: 6.0, right: 8.0, bottom: 6.0, left: 6.0 })
         .on_press(on_open_video(vid_id.clone()));
 
     mouse_area(card_btn)

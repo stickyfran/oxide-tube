@@ -192,6 +192,64 @@ pub fn yt_live_badge_container(_theme: &iced::Theme) -> container::Style {
     }
 }
 
+pub fn home_card_button(card_style: crate::config::CardStyle) -> impl Fn(&iced::Theme, button::Status) -> button::Style {
+    let radius = match card_style {
+        crate::config::CardStyle::Squircle => 16,
+        crate::config::CardStyle::Rectangular => 0,
+    };
+    move |_theme, status| match status {
+        button::Status::Hovered => button::Style {
+            background: Some(Color::from_rgba(1.0, 1.0, 1.0, 0.07).into()),
+            border: border::rounded(radius).width(1.0).color(Color::from_rgba(1.0, 1.0, 1.0, 0.12)),
+            shadow: iced::Shadow {
+                color: Color::from_rgba(0.0, 0.0, 0.0, 0.45),
+                offset: iced::Vector::new(0.0, 4.0),
+                blur_radius: 10.0,
+            },
+            ..button::Style::default()
+        },
+        button::Status::Pressed => button::Style {
+            background: Some(Color::from_rgba(1.0, 1.0, 1.0, 0.13).into()),
+            border: border::rounded(radius).width(1.0).color(Color::from_rgba(1.0, 1.0, 1.0, 0.20)),
+            ..button::Style::default()
+        },
+        _ => button::Style {
+            background: Some(Color::TRANSPARENT.into()),
+            border: border::rounded(radius).width(1.0).color(Color::TRANSPARENT),
+            ..button::Style::default()
+        },
+    }
+}
+
+pub fn compact_card_button(card_style: crate::config::CardStyle) -> impl Fn(&iced::Theme, button::Status) -> button::Style {
+    let radius = match card_style {
+        crate::config::CardStyle::Squircle => 12,
+        crate::config::CardStyle::Rectangular => 0,
+    };
+    move |_theme, status| match status {
+        button::Status::Hovered => button::Style {
+            background: Some(Color::from_rgba(1.0, 1.0, 1.0, 0.08).into()),
+            border: border::rounded(radius).width(1.0).color(Color::from_rgba(1.0, 1.0, 1.0, 0.12)),
+            shadow: iced::Shadow {
+                color: Color::from_rgba(0.0, 0.0, 0.0, 0.35),
+                offset: iced::Vector::new(0.0, 2.0),
+                blur_radius: 6.0,
+            },
+            ..button::Style::default()
+        },
+        button::Status::Pressed => button::Style {
+            background: Some(Color::from_rgba(1.0, 1.0, 1.0, 0.14).into()),
+            border: border::rounded(radius).width(1.0).color(Color::from_rgba(1.0, 1.0, 1.0, 0.20)),
+            ..button::Style::default()
+        },
+        _ => button::Style {
+            background: Some(Color::TRANSPARENT.into()),
+            border: border::rounded(radius).width(1.0).color(Color::TRANSPARENT),
+            ..button::Style::default()
+        },
+    }
+}
+
 pub fn video_card_button(_theme: &iced::Theme, _status: button::Status) -> button::Style {
     button::Style {
         background: Some(Color::TRANSPARENT.into()),

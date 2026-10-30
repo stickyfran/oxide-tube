@@ -33,6 +33,15 @@ sudo apt install -y build-essential pkg-config libmpv-dev libwayland-dev libxkbc
 sudo dnf install -y gcc gcc-c++ mpv-libs-devel wayland-devel libxkbcommon-devel mesa-va-drivers wl-clipboard
 ```
 
+### Windows (10/11)
+1. Instalar toolchain de Rust (GNU o MSVC):
+   ```powershell
+   rustup default stable-x86_64-pc-windows-gnu
+   ```
+2. Descargar las librerías de desarrollo de `libmpv` (compilaciones oficiales para Windows de shinchiro en SourceForge o GitHub).
+3. Colocar `libmpv.dll.a` en la raíz del proyecto (o en `target/debug`/`target/release`) y `mpv-2.dll` junto al ejecutable generado.
+4. Compilar normalmente con `cargo build` o `cargo build --release`.
+
 ---
 
 ## 3. Compilación
