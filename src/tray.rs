@@ -40,11 +40,13 @@ mod linux {
     pub fn set_tray_visible(visible: bool) {
         TRAY_VISIBLE.store(visible, Ordering::Relaxed);
         // Trigger a NewStatus signal so KDE picks up the change
-        SNI_SIGNAL.get().map(|tx| { let _ = tx.send(visible); });
+        if let Some(tx) = SNI_SIGNAL.get() {
+            let _ = tx.send(visible);
+        }
     }
 
     // Channel to notify the async SNI task of visibility changes
-    static SNI_SIGNAL: OnceLock<std::sync::mpsc::SyncSender<bool>> = OnceLock::new();
+    static SNI_SIGNAL: OnceLock<tokio::sync::mpsc::UnboundedSender<bool>> = OnceLock::new();
 
     fn load_tray_icon_pixmap() -> Vec<(i32, i32, Vec<u8>)> {
         // Use the white symbolic icon (KDE style)
@@ -410,7 +412,7 @@ mod linux {
         }
 
         // Set up the visibility signal channel
-        let (sig_tx, sig_rx) = std::sync::mpsc::sync_channel::<bool>(8);
+        let (sig_tx, mut sig_rx) = tokio::sync::mpsc::unbounded_channel::<bool>();
         let _ = SNI_SIGNAL.set(sig_tx);
 
         let pid = std::process::id();
@@ -452,34 +454,22 @@ mod linux {
                 .interface::<_, StatusNotifierItem>("/StatusNotifierItem")
                 .await;
 
-            loop {
-                // Poll for visibility changes (sync channel in async context via spawn_blocking)
-                let sig_result = tokio::task::spawn_blocking({
-                    let sig_rx_ptr = &sig_rx as *const _ as usize;
-                    move || {
-                        // SAFETY: sig_rx lives for the duration of this task
-                        let rx = unsafe { &*(sig_rx_ptr as *const std::sync::mpsc::Receiver<bool>) };
-                        rx.recv_timeout(std::time::Duration::from_secs(3600))
-                    }
-                }).await;
-
-                if let Ok(Ok(_visible)) = sig_result {
-                    // Emit NewStatus signal so the panel/taskbar updates
-                    if let Ok(ref iface) = sni_iface_ref {
-                        let status = if TRAY_VISIBLE.load(std::sync::atomic::Ordering::Relaxed) {
-                            "Active"
-                        } else {
-                            "Passive"
-                        };
-                        let emitter = iface.signal_emitter();
-                        let _ = emitter
-                            .emit(
-                                "org.kde.StatusNotifierItem",
-                                "NewStatus",
-                                &(status,),
-                            ).await;
-                        let _ = iface.get().await.status_changed(emitter).await;
-                    }
+            while let Some(_visible) = sig_rx.recv().await {
+                // Emit NewStatus signal so the panel/taskbar updates
+                if let Ok(ref iface) = sni_iface_ref {
+                    let status = if TRAY_VISIBLE.load(std::sync::atomic::Ordering::Relaxed) {
+                        "Active"
+                    } else {
+                        "Passive"
+                    };
+                    let emitter = iface.signal_emitter();
+                    let _ = emitter
+                        .emit(
+                            "org.kde.StatusNotifierItem",
+                            "NewStatus",
+                            &(status,),
+                        ).await;
+                    let _ = iface.get().await.status_changed(emitter).await;
                 }
             }
         });

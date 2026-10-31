@@ -437,6 +437,8 @@ impl WaylandZeroCopyPlayer {
 
             let hwdec_val = if cfg!(target_os = "windows") {
                 c"auto-copy"
+            } else if cfg!(target_os = "linux") {
+                c"vaapi"
             } else {
                 c"auto-safe"
             };
@@ -906,19 +908,9 @@ impl WaylandZeroCopyPlayer {
                         // Render at the size the video is actually displayed at (x1.15 margin for subpixel sharpness),
                         // never above the source, while strictly preserving the exact video aspect ratio so libmpv
                         // never bakes letterbox or pillarbox black bars into the FBO texture.
+                        // Strict 1080p cap to guarantee glReadPixels / SW rasterizer never transfers >8.3MB per frame
                         let (target_w, target_h) = if vid_w > 0 && vid_h > 0 {
-                            #[cfg(target_os = "linux")]
-                            let is_zero_copy = is_opengl;
-                            #[cfg(not(target_os = "linux"))]
-                            let is_zero_copy = false;
-
-                            let (limit_w, limit_h) = if is_zero_copy {
-                                ((vp_w as f32).max(1920.0), (vp_h as f32).max(1080.0))
-                            } else {
-                                (1920.0, 1080.0)
-                            };
-
-                            let max_scale = (limit_w / vid_w as f32).min(limit_h / vid_h as f32).min(1.0);
+                            let max_scale = (1920.0 / vid_w as f32).min(1080.0 / vid_h as f32).min(1.0);
                             let min_scale = (240.0 / vid_w.max(vid_h) as f32).min(max_scale);
                             let vp_scale = if vp_w > 16 && vp_h > 16 {
                                 let sx = (vp_w as f32 * 1.15) / vid_w as f32;

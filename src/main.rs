@@ -1677,7 +1677,6 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                         } else {
                             (image::Handle::from_bytes(b), None)
                         };
-                        crate::power_manager::trim_process_memory();
                         res
                     })
                     .await
@@ -6807,7 +6806,8 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
             .map(|(_, t)| t.elapsed().as_secs_f32() < 0.25)
             .unwrap_or(false);
 
-        let is_video_active = is_watching && self.osd_state.is_playing && (self.is_window_focused || is_pip);
+        let is_window_visible = !self.is_window_minimized && !self.is_window_hidden;
+        let is_video_active = is_watching && self.osd_state.is_playing && (is_window_visible || is_pip);
 
         if is_video_active {
             // Frame-driven presentation: stay continuously subscribed while video is playing on-screen
@@ -6829,13 +6829,13 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
             && !self.is_window_minimized
             && !self.is_fullscreen;
 
-        if has_active_animation && (self.is_window_focused || is_pip) {
+        if has_active_animation && (is_window_visible || is_pip) {
             subs.push(iced::time::every(Duration::from_millis(16)).map(|_| Message::Tick));
         } else if has_playing_tab_glow {
             // Smooth ~31 FPS cadence for perimeter glow on playing tab, even when idle or unfocused
             subs.push(iced::time::every(Duration::from_millis(32)).map(|_| Message::Tick));
         } else if is_watching || self.osd_state.is_playing {
-            let tick_rate = if !self.is_window_focused && !is_pip {
+            let tick_rate = if !is_window_visible && !is_pip {
                 Duration::from_secs(2)
             } else {
                 match self.power_profile {
