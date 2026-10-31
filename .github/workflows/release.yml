@@ -50,13 +50,32 @@ jobs:
           cp target/x86_64-pc-windows-gnu/release/tube-oxide.exe pkg/
           cp mpvdev/out/*.dll pkg/ || true
           cp assets/icon.png pkg/ 2>/dev/null || true
+          cp assets/icon.ico pkg/ 2>/dev/null || true
           7z a tube-oxide-windows-x86_64-${{ github.ref_name }}.zip ./pkg/*
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup --no-progress -y
+
+      - name: Build Windows Installer (Inno Setup)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            $iscc = (Get-Command iscc.exe -ErrorAction SilentlyContinue).Source
+          }
+          & $iscc "/DAppVersion=${{ github.ref_name }}" installer\windows\tube-oxide.iss
+          Copy-Item dist/*.exe .
+          Get-ChildItem -Filter *.exe
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: windows-zip
-          path: tube-oxide-windows-x86_64-${{ github.ref_name }}.zip
+          name: windows-assets
+          path: |
+            tube-oxide-windows-x86_64-${{ github.ref_name }}.zip
+            tube-oxide-windows-x86_64-installer-${{ github.ref_name }}.exe
 
   build-release:
     name: Build Release Binary (Linux x86_64)
@@ -113,7 +132,7 @@ jobs:
       - name: Download Windows artifact
         uses: actions/download-artifact@v4
         with:
-          name: windows-zip
+          name: windows-assets
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
@@ -125,6 +144,7 @@ jobs:
             tube-oxide-linux-x86_64-${{ github.ref_name }}.tar.gz
             tube-oxide-bin-linux-x86_64
             tube-oxide-windows-x86_64-${{ github.ref_name }}.zip
+            tube-oxide-windows-x86_64-installer-${{ github.ref_name }}.exe
           body: |
             ## Tube-oxide ${{ github.ref_name }}
             

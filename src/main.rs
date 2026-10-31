@@ -17,7 +17,7 @@ use player::WaylandZeroCopyPlayer;
 use power_manager::{PowerManager, PowerProfile};
 use ui::channel_view::view_channel_page;
 use ui::home_view::view_home_grid;
-use ui::icons::icon_check_circle;
+use ui::icons::{icon_check_circle, icon_play};
 use ui::osd_controls::OsdState;
 use ui::theme::*;
 use ui::watch_view::view_watch_page;
@@ -139,6 +139,7 @@ pub enum Message {
     OpenVideoInNewTab(String),
     SelectTab(usize),
     CloseTab(usize),
+    TabHoverChanged(usize, bool),
     RestoreClosedTab,
     ScrollTabsLeft,
     ScrollTabsRight,
@@ -282,6 +283,8 @@ pub struct MitubApp {
     toast_message: Option<(String, std::time::Instant)>,
     tab_opened_anim: Option<(usize, std::time::Instant)>,
     tab_shake_anim: Option<(usize, std::time::Instant)>,
+    hovered_tab: Option<(usize, std::time::Instant)>,
+    search_focus_anim: Option<(bool, std::time::Instant)>,
     current_cache_size_bytes: u64,
     closed_tabs_history: std::collections::VecDeque<ui::VideoTab>,
     tabs_scroll_x: f32,
@@ -1225,6 +1228,8 @@ impl MitubApp {
             toast_message: None,
             tab_opened_anim: None,
             tab_shake_anim: None,
+            hovered_tab: None,
+            search_focus_anim: None,
             search_request_id: 0,
             current_cache_size_bytes: 0,
             closed_tabs_history: std::collections::VecDeque::with_capacity(5),
@@ -1780,6 +1785,21 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
             }
         }
         16.0 / 9.0
+    }
+
+    fn current_search_bar_width(&self) -> f32 {
+        let target_w = if self.search_input_focused || !self.search_query.is_empty() { 300.0 } else { 145.0 };
+        if let Some((focused, inst)) = self.search_focus_anim {
+            let elapsed = inst.elapsed().as_secs_f32();
+            let dur = 0.16; // 160ms cubic ease-out
+            if elapsed < dur {
+                let t = (elapsed / dur).clamp(0.0, 1.0);
+                let ease = 1.0 - (1.0 - t).powi(3);
+                let (from_w, to_w) = if focused { (145.0, 300.0) } else { (300.0, 145.0) };
+                return from_w + (to_w - from_w) * ease;
+            }
+        }
+        target_w
     }
 
     fn compute_pip_aspect_size(&self, raw_w: f32, raw_h: f32, edge: Option<PipResizeEdge>) -> (f32, f32) {
@@ -3048,7 +3068,10 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
             }
 
             Message::SearchInputChanged(query) => {
-                self.search_input_focused = true;
+                if !self.search_input_focused {
+                    self.search_input_focused = true;
+                    self.search_focus_anim = Some((true, std::time::Instant::now()));
+                }
                 self.search_query = query.clone();
                 self.search_request_id = self.search_request_id.wrapping_add(1);
                 let req_id = self.search_request_id;
@@ -3078,14 +3101,20 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
             }
 
             Message::SelectSuggestion(query) => {
-                self.search_input_focused = false;
+                if self.search_input_focused {
+                    self.search_input_focused = false;
+                    self.search_focus_anim = Some((false, std::time::Instant::now()));
+                }
                 self.search_query = query;
                 self.show_suggestions = false;
                 self.update(Message::SearchSubmitted)
             }
 
             Message::SearchSubmitted => {
-                self.search_input_focused = false;
+                if self.search_input_focused {
+                    self.search_input_focused = false;
+                    self.search_focus_anim = Some((false, std::time::Instant::now()));
+                }
                 let query = self.search_query.trim().to_string();
                 if query.is_empty() {
                     return Task::none();
@@ -4712,7 +4741,7 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
             Message::OpenVideoInNewTab(video_id) => {
                 if let Some(pos) = self.tabs.iter().position(|t| t.video_id == video_id) {
                     self.tab_shake_anim = Some((pos, std::time::Instant::now()));
-                    let tab_x = pos as f32 * 145.0;
+                    let tab_x = pos as f32 * 190.0;
                     let target_scroll = (tab_x - 100.0).max(0.0);
                     self.tabs_scroll_x = target_scroll;
                     return iced::widget::scrollable::scroll_to(
@@ -4966,7 +4995,7 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
             }
 
             Message::ScrollTabsLeft => {
-                self.tabs_scroll_x = (self.tabs_scroll_x - 160.0).max(0.0);
+                self.tabs_scroll_x = (self.tabs_scroll_x - 200.0).max(0.0);
                 iced::widget::scrollable::scroll_to(
                     iced::widget::scrollable::Id::new("tabs_scrollable"),
                     iced::widget::scrollable::AbsoluteOffset { x: self.tabs_scroll_x, y: 0.0 },
@@ -4974,8 +5003,8 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
             }
 
             Message::ScrollTabsRight => {
-                let max_scroll = self.tabs_max_scroll_x.max(self.tabs.len() as f32 * 145.0);
-                self.tabs_scroll_x = (self.tabs_scroll_x + 160.0).min(max_scroll);
+                let max_scroll = self.tabs_max_scroll_x.max(self.tabs.len() as f32 * 190.0);
+                self.tabs_scroll_x = (self.tabs_scroll_x + 200.0).min(max_scroll);
                 iced::widget::scrollable::scroll_to(
                     iced::widget::scrollable::Id::new("tabs_scrollable"),
                     iced::widget::scrollable::AbsoluteOffset { x: self.tabs_scroll_x, y: 0.0 },
@@ -4991,7 +5020,7 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                     self.tab_opened_anim = Some((new_idx, std::time::Instant::now()));
                     self.save_session();
 
-                    let target_x = (new_idx as f32 * 145.0).max(0.0);
+                    let target_x = (new_idx as f32 * 190.0).max(0.0);
                     self.tabs_scroll_x = target_x;
                     let scroll_task = iced::widget::scrollable::scroll_to(
                         iced::widget::scrollable::Id::new("tabs_scrollable"),
@@ -5024,11 +5053,12 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                 self.current_view = ViewMode::Home;
                 self.search_query.clear();
                 self.search_input_focused = true;
+                self.search_focus_anim = Some((true, std::time::Instant::now()));
                 self.show_suggestions = false;
                 self.sync_player_viewport();
 
                 let focus_task = iced::widget::text_input::focus(iced::widget::text_input::Id::new("main_search_input"));
-                let target_x = (new_idx as f32 * 145.0).max(0.0);
+                let target_x = (new_idx as f32 * 190.0).max(0.0);
                 self.tabs_scroll_x = target_x;
                 let scroll_task = iced::widget::scrollable::scroll_to(
                     iced::widget::scrollable::Id::new("tabs_scrollable"),
@@ -5084,6 +5114,10 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                     }
                     self.closed_tabs_history.push_back(removed);
 
+                    if self.hovered_tab.map(|(i, _)| i == idx).unwrap_or(false) {
+                        self.hovered_tab = None;
+                    }
+
                     if self.tabs.is_empty() {
                         self.active_tab_idx = None;
                         self.save_session();
@@ -5099,6 +5133,19 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                     }
                     self.save_session();
                     crate::power_manager::trim_process_memory();
+                }
+                Task::none()
+            }
+
+            Message::TabHoverChanged(idx, is_enter) => {
+                if is_enter {
+                    if self.hovered_tab.map(|(i, _)| i != idx).unwrap_or(true) {
+                        self.hovered_tab = Some((idx, std::time::Instant::now()));
+                    }
+                } else {
+                    if self.hovered_tab.map(|(i, _)| i == idx).unwrap_or(false) {
+                        self.hovered_tab = None;
+                    }
                 }
                 Task::none()
             }
@@ -5416,8 +5463,29 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                             }
                         }
                         if let Some(pos) = self.last_cursor_pos {
-                            if pos.y > 55.0 || pos.x < 70.0 || pos.x > 380.0 {
-                                self.search_input_focused = false;
+                            let cur_search_w = self.current_search_bar_width();
+                            let search_start_x = 160.0;
+                            let search_end_x = search_start_x + cur_search_w + 42.0;
+
+                            if pos.y <= 56.0 && pos.x >= search_start_x && pos.x <= search_end_x {
+                                if !self.search_input_focused {
+                                    self.search_input_focused = true;
+                                    self.search_focus_anim = Some((true, std::time::Instant::now()));
+                                    if self.search_query.trim().len() >= 2 && !self.suggestions.is_empty() {
+                                        self.show_suggestions = true;
+                                    }
+                                }
+                            } else {
+                                let in_suggestions = self.show_suggestions
+                                    && pos.y >= 52.0
+                                    && pos.y <= 280.0
+                                    && pos.x >= 168.0
+                                    && pos.x <= 168.0 + cur_search_w.max(260.0);
+                                if !in_suggestions && self.search_input_focused {
+                                    self.search_input_focused = false;
+                                    self.search_focus_anim = Some((false, std::time::Instant::now()));
+                                    self.show_suggestions = false;
+                                }
                             }
                         }
                     }
@@ -5491,6 +5559,7 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                             } else if self.search_input_focused {
                                 if let Key::Named(Named::Escape) = key {
                                     self.search_input_focused = false;
+                                    self.search_focus_anim = Some((false, std::time::Instant::now()));
                                     self.show_suggestions = false;
                                     return Task::none();
                                 }
@@ -5500,6 +5569,12 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                                 match key {
                                     Key::Named(Named::Space) if is_watching => return self.update(Message::PlayPauseToggle),
                                     Key::Named(Named::Escape) if self.show_suggestions => {
+                                        self.show_suggestions = false;
+                                        return Task::none();
+                                    }
+                                    Key::Named(Named::Escape) if self.search_input_focused => {
+                                        self.search_input_focused = false;
+                                        self.search_focus_anim = Some((false, std::time::Instant::now()));
                                         self.show_suggestions = false;
                                         return Task::none();
                                     }
@@ -6529,8 +6604,12 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
         let is_video_playing = self.osd_state.is_playing
             && self.player.as_ref().map(|p| p.is_playing()).unwrap_or(false);
 
+        let search_bar_w = self.current_search_bar_width();
+
         let header = view_header_bar(
             &self.search_query,
+            search_bar_w,
+            self.search_input_focused,
             &self.suggestions,
             self.show_suggestions,
             self.power_profile,
@@ -6560,6 +6639,7 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
             Message::ReloadFeed,
             Message::SelectTab,
             Message::CloseTab,
+            Message::TabHoverChanged,
             Message::TabsScrolled,
             Message::ScrollTabsLeft,
             Message::ScrollTabsRight,
@@ -6918,9 +6998,103 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
             }
         }
 
+        if let Some((hov_idx, hov_inst)) = self.hovered_tab {
+            let elapsed_ms = hov_inst.elapsed().as_millis();
+            if elapsed_ms >= 220 && hov_idx < self.tabs.len() {
+                let tab = &self.tabs[hov_idx];
+                let is_playing_this = is_video_playing
+                    && !tab.video_id.is_empty()
+                    && self.playing_video_id.as_deref() == Some(&tab.video_id);
+                let is_buffer_complete = self
+                    .buffer_downloads
+                    .get(&tab.video_id)
+                    .map(|b| b.is_complete)
+                    .unwrap_or(false);
+
+                let cursor_x = self.last_cursor_pos.map(|p| p.x).unwrap_or(self.window_size.0 / 2.0);
+                let tooltip_w = 320.0_f32;
+                let clamp_x = (cursor_x - tooltip_w / 2.0).clamp(16.0, (self.window_size.0 - tooltip_w - 16.0).max(16.0));
+                let alpha = ((elapsed_ms - 220) as f32 / 120.0).clamp(0.0, 1.0);
+
+                let mut card_col = column![].spacing(4);
+
+                if is_playing_this {
+                    card_col = card_col.push(
+                        row![
+                            icon_play(10.0),
+                            text("En reproducción activa")
+                                .size(11)
+                                .color(COLOR_ACCENT_RED)
+                        ]
+                        .spacing(5)
+                        .align_y(Alignment::Center),
+                    );
+                } else if is_buffer_complete {
+                    card_col = card_col.push(
+                        row![
+                            icon_check_circle(10.0),
+                            text("Buffer completo en disco")
+                                .size(11)
+                                .color(iced::Color::from_rgb8(0x44, 0xcc, 0x44))
+                        ]
+                        .spacing(5)
+                        .align_y(Alignment::Center),
+                    );
+                }
+
+                let full_title = if tab.title.is_empty() { "Nueva pestaña" } else { &tab.title };
+                card_col = card_col.push(
+                    text(full_title)
+                        .size(12.5)
+                        .color(COLOR_TEXT_PRIMARY)
+                        .wrapping(text::Wrapping::Word),
+                );
+
+                if !tab.channel_name.is_empty() {
+                    card_col = card_col.push(
+                        text(&tab.channel_name)
+                            .size(11)
+                            .color(COLOR_TEXT_SECONDARY),
+                    );
+                }
+
+                let tooltip_box = container(card_col)
+                    .width(Length::Fixed(tooltip_w))
+                    .padding([8, 12])
+                    .style(move |_t| container::Style {
+                        background: Some(iced::Color::from_rgba(0.12, 0.12, 0.15, 0.96 * alpha).into()),
+                        border: iced::border::rounded(8)
+                            .color(iced::Color::from_rgba(0.35, 0.35, 0.40, 0.8 * alpha))
+                            .width(1.0),
+                        shadow: iced::Shadow {
+                            color: iced::Color::from_rgba(0.0, 0.0, 0.0, 0.5 * alpha),
+                            offset: iced::Vector::new(0.0, 4.0),
+                            blur_radius: 12.0,
+                        },
+                        ..container::Style::default()
+                    });
+
+                let tooltip_overlay = container(
+                    column![
+                        Space::with_height(Length::Fixed(52.0)),
+                        row![
+                            Space::with_width(Length::Fixed(clamp_x)),
+                            tooltip_box,
+                            Space::with_width(Length::Fill),
+                        ],
+                    ]
+                )
+                .width(Length::Fill)
+                .height(Length::Fill);
+
+                layers.push(tooltip_overlay.into());
+            }
+        }
+
         if self.show_suggestions && !self.suggestions.is_empty() {
             layers.push(view_suggestions_overlay(
                 &self.suggestions,
+                search_bar_w,
                 Message::SelectSuggestion,
             ));
         }
@@ -7080,6 +7254,13 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
             subs.push(Subscription::run(frame_ready_stream));
         }
 
+        let is_tab_hover_animating = self.hovered_tab
+            .map(|(_, t)| t.elapsed().as_millis() < 360)
+            .unwrap_or(false);
+        let is_search_animating = self.search_focus_anim
+            .map(|(_, t)| t.elapsed().as_secs_f32() < 0.18)
+            .unwrap_or(false);
+
         let has_active_animation = is_transitioning
             || has_ripple
             || has_seek_anim
@@ -7087,7 +7268,9 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
             || is_loading_buffer
             || has_toast
             || has_tab_shake
-            || has_tab_open;
+            || has_tab_open
+            || is_tab_hover_animating
+            || is_search_animating;
 
         let has_playing_tab_glow = self.osd_state.is_playing
             && self.playing_video_id.is_some()

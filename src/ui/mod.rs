@@ -103,6 +103,8 @@ impl<Message> canvas::Program<Message> for PlayingTabGlowBorder {
 
 pub fn view_header_bar<'a, Message: Clone + 'static>(
     search_query: &'a str,
+    search_bar_width: f32,
+    is_search_focused: bool,
     _suggestions: &'a [String],
     _show_suggestions: bool,
     _power_profile: PowerProfile,
@@ -132,6 +134,7 @@ pub fn view_header_bar<'a, Message: Clone + 'static>(
     on_reload: Message,
     on_select_tab: impl Fn(usize) -> Message + Copy + 'static,
     on_close_tab: impl Fn(usize) -> Message + Copy + 'static,
+    on_hover_tab: impl Fn(usize, bool) -> Message + Copy + 'static,
     on_scroll_tabs: impl Fn(iced::widget::scrollable::Viewport) -> Message + Copy + 'static,
     on_scroll_tabs_left: Message,
     on_scroll_tabs_right: Message,
@@ -182,13 +185,19 @@ pub fn view_header_bar<'a, Message: Clone + 'static>(
         .padding([6, 8])
         .on_press(on_open_history);
 
-    let search_bar = text_input("Buscar o pegar enlace...", search_query)
+    let search_placeholder = if is_search_focused || !search_query.is_empty() {
+        "Buscar o pegar enlace..."
+    } else {
+        "Buscar..."
+    };
+
+    let search_bar = text_input(search_placeholder, search_query)
         .id(iced::widget::text_input::Id::new("main_search_input"))
         .on_input(on_search_input)
         .on_submit(on_search_submit.clone())
         .style(search_input)
         .padding([6, 12])
-        .width(Length::Fixed(260.0));
+        .width(Length::Fixed(search_bar_width));
 
     let search_btn = button(icon_search(14.0))
         .style(secondary_button)
@@ -218,8 +227,8 @@ pub fn view_header_bar<'a, Message: Clone + 'static>(
         let is_newly_opened = open_elapsed.is_some();
         let shake_elapsed = shaking_tab.and_then(|(s_idx, el)| if s_idx == idx { Some(el) } else { None });
 
-        let tab_title = if tab.title.chars().count() > 20 {
-            let mut t: String = tab.title.chars().take(18).collect();
+        let tab_title = if tab.title.chars().count() > 32 {
+            let mut t: String = tab.title.chars().take(30).collect();
             t.push_str("..");
             t
         } else if tab.title.is_empty() {
@@ -229,7 +238,7 @@ pub fn view_header_bar<'a, Message: Clone + 'static>(
         };
 
         let char_count = tab_title.chars().count() as f32;
-        let est_this_tab_w = (char_count * 6.4 + if is_playing_this_tab { 46.0 } else { 32.0 }).clamp(88.0, 175.0);
+        let est_this_tab_w = (char_count * 6.5 + if is_playing_this_tab { 48.0 } else { 34.0 }).clamp(110.0, 235.0);
         sum_tabs_width += est_this_tab_w + if idx > 0 { 6.0 } else { 0.0 };
 
         let label_content: Element<'a, Message> = if is_playing_this_tab {
@@ -324,7 +333,7 @@ pub fn view_header_bar<'a, Message: Clone + 'static>(
             if el < 0.22 {
                 let t = (el / 0.22).clamp(0.0, 1.0);
                 let ease = 1.0 - (1.0 - t).powi(3);
-                let target_w = 154.0;
+                let target_w = 210.0;
                 tab_container = tab_container
                     .width(Length::Fixed((target_w * ease).max(2.0)))
                     .clip(true);
@@ -332,6 +341,8 @@ pub fn view_header_bar<'a, Message: Clone + 'static>(
         }
 
         let tab_pill = mouse_area(tab_container)
+            .on_enter(on_hover_tab(idx, true))
+            .on_exit(on_hover_tab(idx, false))
             .on_middle_press(on_close_tab(idx));
 
         tabs_row = tabs_row.push(tab_pill);
@@ -368,9 +379,9 @@ pub fn view_header_bar<'a, Message: Clone + 'static>(
 
     // Chrome-like overflow detection:
     // Real occupied width by non-tab elements in header:
-    // left_section (~116) + search_container (~366) + margins/spacings (~52) + right_section (~160) ≈ 694px
+    // left_section (~116) + search_container (buttons ~72 + search_bar) + margins/spacings (~52) + right_section (~160)
     let right_account_width = if is_authenticated && user_name.is_some() { 160.0 } else { 125.0 };
-    let non_tabs_width = 540.0 + right_account_width;
+    let non_tabs_width = 240.0 + search_bar_width + right_account_width;
     let available_tabs_width = (window_width - non_tabs_width).max(80.0);
     let heuristic_max_scroll = (sum_tabs_width - available_tabs_width).max(0.0);
     let effective_max_scroll = tabs_max_scroll_x.max(heuristic_max_scroll);
@@ -558,6 +569,7 @@ pub fn view_header_bar<'a, Message: Clone + 'static>(
 
 pub fn view_suggestions_overlay<'a, Message: Clone + 'static>(
     suggestions: &'a [String],
+    search_bar_width: f32,
     on_select_suggestion: impl Fn(String) -> Message + 'static,
 ) -> Element<'a, Message> {
     let mut sugg_list = column![].spacing(4);
@@ -577,13 +589,13 @@ pub fn view_suggestions_overlay<'a, Message: Clone + 'static>(
     let dropdown = container(sugg_list)
         .style(card_container)
         .padding(8)
-        .width(Length::Fixed(320.0));
+        .width(Length::Fixed(search_bar_width.max(260.0)));
 
     container(
         column![
             Space::with_height(Length::Fixed(52.0)),
             row![
-                Space::with_width(Length::Fixed(280.0)),
+                Space::with_width(Length::Fixed(168.0)),
                 dropdown,
                 Space::with_width(Length::Fill),
             ],

@@ -810,50 +810,33 @@ pub fn view_floating_dropdown_menu<'a, Message: Clone + 'static>(
         .spacing(5)
         .width(Length::Fixed(270.0));
 
+        // Determine the single unique default stream if matching preferred height and codec
+        let default_itag = video_qualities
+            .iter()
+            .filter(|q| !q.quality_label.is_empty())
+            .find(|q| q.height == state.preferred_resolution.max_height() && friendly_codec_name(&q.codecs) == state.preferred_codec.label())
+            .or_else(|| video_qualities.iter().filter(|q| !q.quality_label.is_empty()).find(|q| q.height == state.preferred_resolution.max_height()))
+            .map(|q| q.itag);
+
+        let effective_selected_itag = if state.selected_quality_itag != 0 {
+            state.selected_quality_itag
+        } else {
+            default_itag.unwrap_or_else(|| {
+                video_qualities
+                    .iter()
+                    .filter(|q| !q.quality_label.is_empty())
+                    .map(|q| q.itag)
+                    .next()
+                    .unwrap_or(0)
+            })
+        };
+
         for q in video_qualities.iter().filter(|q| !q.quality_label.is_empty()) {
             let codec_tag = friendly_codec_name(&q.codecs);
-            let is_selected = if state.selected_quality_itag != 0 {
-                q.itag == state.selected_quality_itag
-            } else {
-                q.quality_label == state.selected_quality_label
-            };
-            let is_default_res = q.height == state.preferred_resolution.max_height();
-
-            // Radio circle button to toggle/set this resolution as default
-            let radio_circle: Element<'a, Message> = if is_default_res {
-                container(
-                    container(Space::new(Length::Fixed(6.0), Length::Fixed(6.0)))
-                        .style(|_t| container::Style {
-                            background: Some(COLOR_ACCENT_RED.into()),
-                            border: iced::border::rounded(3),
-                            ..container::Style::default()
-                        }),
-                )
-                .width(Length::Fixed(14.0))
-                .height(Length::Fixed(14.0))
-                .align_x(iced::alignment::Horizontal::Center)
-                .align_y(iced::alignment::Vertical::Center)
-                .style(|_t| container::Style {
-                    border: iced::border::rounded(7).color(COLOR_ACCENT_RED).width(1.5),
-                    ..container::Style::default()
-                })
-                .into()
-            } else {
-                container(Space::new(Length::Fixed(14.0), Length::Fixed(14.0)))
-                    .style(|_t| container::Style {
-                        border: iced::border::rounded(7).color(COLOR_TEXT_SECONDARY).width(1.2),
-                        ..container::Style::default()
-                    })
-                    .into()
-            };
-
-            let default_radio_btn = button(radio_circle)
-                .style(ghost_button)
-                .padding([2, 4])
-                .on_press(on_toggle_save_default_quality.clone());
+            let is_selected = q.itag == effective_selected_itag;
+            let is_default_res = Some(q.itag) == default_itag;
 
             let mut item_row = row![
-                default_radio_btn,
                 if is_selected {
                     icon_check_circle(12.0)
                 } else {
@@ -864,14 +847,18 @@ pub fn view_floating_dropdown_menu<'a, Message: Clone + 'static>(
                     .color(if is_selected { COLOR_ACCENT_RED } else { COLOR_TEXT_PRIMARY }),
                 Space::with_width(Length::Fill),
             ]
-            .spacing(6)
+            .spacing(8)
             .align_y(Alignment::Center);
 
             if is_default_res {
                 item_row = item_row.push(
-                    text("Default")
-                        .size(10.5)
-                        .color(COLOR_TEXT_SECONDARY),
+                    container(text("Default").size(10.0).color(COLOR_TEXT_SECONDARY))
+                        .padding([2, 5])
+                        .style(|_t| container::Style {
+                            background: Some(iced::Color::from_rgba(1.0, 1.0, 1.0, 0.08).into()),
+                            border: iced::border::rounded(4),
+                            ..container::Style::default()
+                        }),
                 );
             }
 
@@ -882,6 +869,39 @@ pub fn view_floating_dropdown_menu<'a, Message: Clone + 'static>(
                 .on_press(on_select_quality_itag(q.itag));
             list = list.push(btn);
         }
+
+        let save_default_toggle = button(
+            row![
+                if state.set_as_default_quality {
+                    icon_check_circle(12.0)
+                } else {
+                    container(Space::new(Length::Fixed(12.0), Length::Fixed(12.0)))
+                        .style(|_t| container::Style {
+                            border: iced::border::rounded(6).color(COLOR_TEXT_SECONDARY).width(1.2),
+                            ..container::Style::default()
+                        })
+                        .into()
+                },
+                text("Recordar como predeterminada")
+                    .size(11.0)
+                    .color(if state.set_as_default_quality { COLOR_ACCENT_RED } else { COLOR_TEXT_SECONDARY }),
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center),
+        )
+        .style(ghost_button)
+        .padding([4, 6])
+        .on_press(on_toggle_save_default_quality);
+
+        list = list.push(
+            container(Space::with_height(Length::Fixed(1.0)))
+                .width(Length::Fill)
+                .style(|_t| container::Style {
+                    background: Some(COLOR_BORDER.into()),
+                    ..container::Style::default()
+                }),
+        );
+        list = list.push(save_default_toggle);
 
         let card = mouse_area(
             container(
