@@ -93,7 +93,7 @@ pub enum Message {
     ToggleAutoplay,
     SearchInputChanged(String),
     SearchSubmitted,
-    SuggestionsLoaded(Vec<String>),
+    SuggestionsLoaded(u64, Vec<String>),
     SearchResultsLoaded(Result<Vec<VideoCard>, String>),
     SelectSuggestion(String),
     VideoHitboxClicked,
@@ -178,6 +178,7 @@ pub enum Message {
     ClearCache,
     CacheCleared(u64),
     CacheSizeRefreshed(u64),
+    BackgroundAuthRefreshed(Option<AuthSession>),
     EventOccurred(iced::Event, Id),
     WindowIdFound(Option<Id>),
     WindowMaximized(bool),
@@ -209,6 +210,7 @@ pub struct MitubApp {
     navigation_history: Vec<ViewMode>,
     search_query: String,
     search_input_focused: bool,
+    search_request_id: u64,
     last_cursor_pos: Option<iced::Point>,
     suggestions: Vec<String>,
     show_suggestions: bool,
@@ -513,8 +515,8 @@ for (let i = 0; i < clients.length; i++) {
     }
 }
 "#;
-    let tmp_path = "/tmp/mitub_kwin_query_pip.js";
-    if std::fs::write(tmp_path, js).is_ok() {
+    let tmp_path = std::env::temp_dir().join(format!("mitub_kwin_query_pip_{}.js", std::process::id()));
+    if std::fs::write(&tmp_path, js).is_ok() {
         let qdbus_bin = if std::path::Path::new("/usr/bin/qdbus6").exists() {
             "/usr/bin/qdbus6"
         } else {
@@ -524,7 +526,7 @@ for (let i = 0; i < clients.length; i++) {
             .args(["org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting.unloadScript", "mitub_query_pip"])
             .output();
         if let Ok(out) = std::process::Command::new(qdbus_bin)
-            .args(["org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting.loadScript", tmp_path, "mitub_query_pip"])
+            .args(["org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting.loadScript", tmp_path.to_str().unwrap_or(""), "mitub_query_pip"])
             .output()
         {
             let id_str = String::from_utf8_lossy(&out.stdout).trim().to_string();
@@ -541,6 +543,7 @@ for (let i = 0; i < clients.length; i++) {
                     .args(["--user", "-n", "20", "--no-pager"])
                     .output()
                 {
+                    let _ = std::fs::remove_file(&tmp_path);
                     let log_str = String::from_utf8_lossy(&journal.stdout);
                     for line in log_str.lines().rev() {
                         if let Some(pos_idx) = line.find("MITUB_PIP_POS:") {
@@ -565,19 +568,23 @@ for (let i = 0; i < clients.length; i++) {
                 }
             }
         }
+        let _ = std::fs::remove_file(&tmp_path);
     }
     None
 }
 
-fn save_current_kwin_pip_position(config: &mut crate::config::AppConfig) {
-    if let Some((pos, size)) = query_kwin_pip_geometry() {
-        config.pip_position = Some(pos);
-        if size.0 >= 240.0 && size.1 >= 135.0 {
-            config.pip_size = Some(size);
+fn trigger_save_kwin_pip_position() {
+    tokio::task::spawn_blocking(|| {
+        if let Some((pos, size)) = query_kwin_pip_geometry() {
+            let mut config = crate::config::AppConfig::load();
+            config.pip_position = Some(pos);
+            if size.0 >= 240.0 && size.1 >= 135.0 {
+                config.pip_size = Some(size);
+            }
+            config.save();
+            ensure_kwin_pip_rule(Some(pos), Some(size));
         }
-        config.save_async();
-        ensure_kwin_pip_rule(Some(pos), Some(size));
-    }
+    });
 }
 
 fn activate_kwin_main_window() {
@@ -601,8 +608,8 @@ for (let i = 0; i < clients.length; i++) {
     }
 }
 "#;
-                let tmp_path = "/tmp/mitub_kwin_activate.js";
-                if std::fs::write(tmp_path, js).is_ok() {
+                let tmp_path = std::env::temp_dir().join(format!("mitub_kwin_activate_{}.js", std::process::id()));
+                if std::fs::write(&tmp_path, js).is_ok() {
                     let qdbus_bin = if std::path::Path::new("/usr/bin/qdbus6").exists() {
                         "/usr/bin/qdbus6"
                     } else {
@@ -612,7 +619,7 @@ for (let i = 0; i < clients.length; i++) {
                         .args(["org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting.unloadScript", "mitub_activate_helper"])
                         .output();
                     if let Ok(out) = std::process::Command::new(qdbus_bin)
-                        .args(["org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting.loadScript", tmp_path, "mitub_activate_helper"])
+                        .args(["org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting.loadScript", tmp_path.to_str().unwrap_or(""), "mitub_activate_helper"])
                         .output()
                     {
                         let id_str = String::from_utf8_lossy(&out.stdout).trim().to_string();
@@ -626,6 +633,7 @@ for (let i = 0; i < clients.length; i++) {
                                 .output();
                         }
                     }
+                    let _ = std::fs::remove_file(&tmp_path);
                 }
             }
             // Fallback for X11 environments if wmctrl exists
@@ -1061,8 +1069,8 @@ fn start_full_buffer_task(
 
 impl MitubApp {
     pub fn new() -> (Self, Task<Message>) {
-        // Auto-load cookies from disk cache or Firefox PSD profile
-        let initial_session = AuthSession::auto_load();
+        // Fast launch: load saved session from disk cache without blocking on Firefox SQLite
+        let initial_session = AuthSession::load_from_disk().unwrap_or_else(|_| AuthSession::new());
         let is_authed = initial_session.is_authenticated();
 
         let auth_session = Arc::new(RwLock::new(initial_session));
@@ -1208,7 +1216,8 @@ impl MitubApp {
             toast_message: None,
             tab_opened_anim: None,
             tab_shake_anim: None,
-            current_cache_size_bytes: crate::cache_manager::get_cache_size_bytes(),
+            search_request_id: 0,
+            current_cache_size_bytes: 0,
             closed_tabs_history: std::collections::VecDeque::with_capacity(5),
             tabs_scroll_x: 0.0,
             tabs_max_scroll_x: 0.0,
@@ -1268,7 +1277,35 @@ impl MitubApp {
             |(url, name)| Message::UserProfileLoaded(url, name),
         );
 
-        let mut initial_tasks = vec![open_task, home_task, handle_task, profile_task];
+        // Asynchronously sync live Firefox cookies if available (in background, never blocking startup)
+        let auth_task = Task::perform(
+            async move {
+                tokio::task::spawn_blocking(|| {
+                    if let Ok(ff) = AuthSession::from_firefox() {
+                        if ff.is_authenticated() {
+                            return Some(ff);
+                        }
+                    }
+                    None
+                })
+                .await
+                .ok()
+                .flatten()
+            },
+            Message::BackgroundAuthRefreshed,
+        );
+
+        // Asynchronously calculate cache size
+        let cache_task = Task::perform(
+            async move {
+                tokio::task::spawn_blocking(crate::cache_manager::get_cache_size_bytes)
+                    .await
+                    .unwrap_or(0)
+            },
+            Message::CacheSizeRefreshed,
+        );
+
+        let mut initial_tasks = vec![open_task, home_task, handle_task, profile_task, auth_task, cache_task];
         if let Some(cached_avatar) = &app.config.cached_avatar_url {
             let it = innertube.clone();
             let url = cached_avatar.clone();
@@ -1340,6 +1377,7 @@ impl MitubApp {
                 chapters: Vec::new(),
                 parsed_desc_urls: Vec::new(),
                 parsed_desc_timestamps: Vec::new(),
+                videostats_playback_url: None,
             }));
 
             let it_watch = innertube.clone();
@@ -1533,13 +1571,7 @@ impl MitubApp {
         }
         self.config.saved_tabs = self.tabs.clone();
         self.config.active_tab_idx = self.active_tab_idx;
-        let config_clone = self.config.clone();
-        std::thread::Builder::new()
-            .name("session-save".into())
-            .spawn(move || {
-                config_clone.save();
-            })
-            .ok();
+        self.config.save_async();
     }
 
     fn queue_blurred_poster(&mut self, video_id: &str) -> Option<Task<Message>> {
@@ -1802,6 +1834,17 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
         match message {
+            Message::BackgroundAuthRefreshed(opt_session) => {
+                if let Some(new_session) = opt_session {
+                    if let Ok(mut guard) = self.auth_session.try_write() {
+                        *guard = new_session.clone();
+                    }
+                    self.innertube.set_session(new_session);
+                    self.auth_status = "[OK] Sesion activa de YouTube".to_string();
+                }
+                Task::none()
+            }
+
             Message::WindowIdFound(opt_id) => {
                 if let Some(id) = opt_id {
                     self.main_window_id = Some(id);
@@ -1880,7 +1923,7 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
 
             Message::ClosePip => {
                 self.auto_pip_triggered_by_unfocus = false;
-                save_current_kwin_pip_position(&mut self.config);
+                trigger_save_kwin_pip_position();
                 if let Some(pip_id) = self.pip_window_id.take() {
                     crate::diagnostics::log_pip("Close", 0, "Closing PiP and returning to main window");
                     let pip_vid = self.playing_video_id.clone();
@@ -2156,9 +2199,21 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                         self.save_session();
                     }
 
-                    // Synchronize subtitles
+                    // Synchronize subtitles (O(log n) binary search via partition_point)
                     if self.osd_state.selected_caption_lang.is_some() && !self.active_subtitles.is_empty() {
-                        if let Some(cue) = self.active_subtitles.iter().find(|c| c.start_ms <= pos_ms && pos_ms <= c.start_ms + c.duration_ms) {
+                        let idx = self.active_subtitles.partition_point(|c| c.start_ms <= pos_ms);
+                        let found = if idx > 0 {
+                            let candidate = &self.active_subtitles[idx - 1];
+                            if pos_ms <= candidate.start_ms + candidate.duration_ms {
+                                Some(candidate)
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+
+                        if let Some(cue) = found {
                             if self.osd_state.current_subtitle_text != cue.text {
                                 self.osd_state.current_subtitle_text = cue.text.clone();
                             }
@@ -2294,7 +2349,7 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
             Message::OpenVideo(video_id) => {
                 crate::diagnostics::session_start(&video_id);
                 if self.pip_window_id.is_some() {
-                    save_current_kwin_pip_position(&mut self.config);
+                    trigger_save_kwin_pip_position();
                 }
                 // Save previous video's playback position and frame snapshot BEFORE mutating tab state or stopping player!
                 self.snapshot_current_playing_frame();
@@ -2404,6 +2459,7 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                     chapters: Vec::new(),
                     parsed_desc_urls: Vec::new(),
                     parsed_desc_timestamps: Vec::new(),
+                    videostats_playback_url: None,
                 }));
 
                 let mut target_saved_pos_ms = self.config.saved_positions.get(&video_id).copied().unwrap_or(0);
@@ -2475,13 +2531,6 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                 self.sync_player_viewport();
                 power_manager::trim_process_memory();
 
-                // Record watched video in the user's YouTube Account History asynchronously
-                let it_hist = self.innertube.clone();
-                let vid_hist = video_id.clone();
-                tokio::spawn(async move {
-                    it_hist.record_watch_history(&vid_hist).await;
-                });
-
                 self.current_request_id = self.current_request_id.wrapping_add(1);
                 let req_id = self.current_request_id;
 
@@ -2521,6 +2570,15 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                 match res {
                     Ok(mut details) => {
                         crate::diagnostics::session_details_loaded();
+
+                        // Record watched video in user history reusing videostats_playback_url (zero redundant network requests)
+                        let it_hist = self.innertube.clone();
+                        let vid_hist = details.video_id.clone();
+                        let stats_url = details.videostats_playback_url.clone();
+                        tokio::spawn(async move {
+                            it_hist.record_watch_history(&vid_hist, stats_url.as_deref()).await;
+                        });
+
                         // Preserve pre-populated title/channel_name if API fallback was generic
                         if let Some(prev) = &self.watch_details {
                             if prev.video_id == details.video_id {
@@ -2958,12 +3016,18 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
             Message::SearchInputChanged(query) => {
                 self.search_input_focused = true;
                 self.search_query = query.clone();
+                self.search_request_id = self.search_request_id.wrapping_add(1);
+                let req_id = self.search_request_id;
+
                 if query.trim().len() >= 2 {
                     self.show_suggestions = true;
                     let it = self.innertube.clone();
                     return Task::perform(
-                        async move { it.get_search_suggestions(&query).await },
-                        Message::SuggestionsLoaded,
+                        async move {
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                            (req_id, it.get_search_suggestions(&query).await)
+                        },
+                        |(id, suggs)| Message::SuggestionsLoaded(id, suggs),
                     );
                 } else {
                     self.show_suggestions = false;
@@ -2972,8 +3036,10 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                 Task::none()
             }
 
-            Message::SuggestionsLoaded(suggs) => {
-                self.suggestions = suggs;
+            Message::SuggestionsLoaded(req_id, suggs) => {
+                if self.search_request_id == req_id {
+                    self.suggestions = suggs;
+                }
                 Task::none()
             }
 
@@ -4219,7 +4285,7 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
 
             Message::QuitApp => {
                 if self.pip_window_id.is_some() {
-                    save_current_kwin_pip_position(&mut self.config);
+                    trigger_save_kwin_pip_position();
                 }
                 self.save_session();
                 self.config.save();
@@ -4793,6 +4859,7 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                                 chapters: Vec::new(),
                                 parsed_desc_urls: Vec::new(),
                                 parsed_desc_timestamps: Vec::new(),
+                                videostats_playback_url: None,
                             }));
 
                             let mut tasks = vec![scroll_reset_task];
@@ -4982,9 +5049,17 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
             Message::ToggleLoginModal => {
                 self.show_auth_modal = !self.show_auth_modal;
                 if self.show_auth_modal {
-                    self.current_cache_size_bytes = crate::cache_manager::get_cache_size_bytes();
+                    Task::perform(
+                        async move {
+                            tokio::task::spawn_blocking(crate::cache_manager::get_cache_size_bytes)
+                                .await
+                                .unwrap_or(0)
+                        },
+                        Message::CacheSizeRefreshed,
+                    )
+                } else {
+                    Task::none()
                 }
-                Task::none()
             }
 
             Message::CookieInputChanged(raw) => {
@@ -5431,7 +5506,7 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                             }
 
                             if self.pip_window_id.is_some() {
-                                save_current_kwin_pip_position(&mut self.config);
+                                trigger_save_kwin_pip_position();
                             }
                             self.save_session();
                             self.config.save();
@@ -5618,10 +5693,11 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
 
                 // Prune cache if exceeding configured limit and refresh size
                 let max_bytes = self.config.max_cache_size_bytes;
+                let active_vid = self.playing_video_id.clone();
                 Task::perform(
                     async move {
                         tokio::task::spawn_blocking(move || {
-                            crate::cache_manager::prune_cache_if_needed(max_bytes);
+                            crate::cache_manager::prune_cache_if_needed(max_bytes, active_vid.as_deref());
                             crate::cache_manager::get_cache_size_bytes()
                         })
                         .await
@@ -5650,10 +5726,11 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                 self.config.max_cache_size_bytes = crate::cache_manager::index_to_limit(idx);
                 self.config.save();
                 let max_bytes = self.config.max_cache_size_bytes;
+                let active_vid = self.playing_video_id.clone();
                 Task::perform(
                     async move {
                         tokio::task::spawn_blocking(move || {
-                            crate::cache_manager::prune_cache_if_needed(max_bytes);
+                            crate::cache_manager::prune_cache_if_needed(max_bytes, active_vid.as_deref());
                             crate::cache_manager::get_cache_size_bytes()
                         })
                         .await
@@ -5676,7 +5753,7 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
             }
 
             Message::CacheCleared(freed_bytes) => {
-                self.current_cache_size_bytes = crate::cache_manager::get_cache_size_bytes();
+                self.current_cache_size_bytes = 0;
                 self.toast_message = Some((
                     format!(
                         "Caché de video vaciada ({} liberados)",

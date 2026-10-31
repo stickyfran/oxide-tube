@@ -2,6 +2,9 @@ use rusqlite::{Connection, OpenFlags};
 use sha1::{Digest, Sha1};
 use std::collections::HashMap;
 use std::fs;
+use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -299,6 +302,12 @@ impl AuthSession {
     }
 
     fn config_path() -> Option<PathBuf> {
+        #[cfg(target_os = "windows")]
+        {
+            if let Some(app_data) = dirs::data_dir() {
+                return Some(app_data.join("mitub/cookies.json"));
+            }
+        }
         let home = dirs::home_dir()?;
         Some(home.join(".config/mitub/cookies.json"))
     }
@@ -309,7 +318,19 @@ impl AuthSession {
                 let _ = fs::create_dir_all(parent);
             }
             let data = serde_json::to_string_pretty(&self.cookies)?;
-            fs::write(path, data)?;
+            let tmp_path = path.with_extension(format!("tmp.{}", std::process::id()));
+
+            let mut options = fs::OpenOptions::new();
+            options.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            options.mode(0o600);
+
+            let mut file = options.open(&tmp_path)?;
+            file.write_all(data.as_bytes())?;
+            file.flush()?;
+            drop(file);
+
+            fs::rename(&tmp_path, &path)?;
         }
         Ok(())
     }

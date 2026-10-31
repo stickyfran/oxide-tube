@@ -232,7 +232,11 @@ impl AppConfig {
                 let _ = fs::create_dir_all(parent);
             }
             if let Ok(data) = serde_json::to_string(self) {
-                let tmp_path = path.with_extension("tmp");
+                let nonce = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0);
+                let tmp_path = path.with_extension(format!("tmp.{}.{}", std::process::id(), nonce));
                 if fs::write(&tmp_path, data).is_ok() {
                     let _ = fs::rename(&tmp_path, &path);
                 }

@@ -44,6 +44,8 @@ impl LiveChatManager {
             client: reqwest::Client::builder()
                 .gzip(true)
                 .brotli(true)
+                .connect_timeout(std::time::Duration::from_secs(5))
+                .timeout(std::time::Duration::from_secs(10))
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
         }
@@ -219,13 +221,13 @@ impl LiveChatManager {
 
                                     let is_owner = item.get("authorBadges").and_then(|b| b.as_array()).map(|arr| {
                                         arr.iter().any(|badge| {
-                                            badge.to_string().contains("OWNER")
+                                            crate::innertube::json_contains_str(badge, "OWNER")
                                         })
                                     }).unwrap_or(false);
 
                                     let is_moderator = item.get("authorBadges").and_then(|b| b.as_array()).map(|arr| {
                                         arr.iter().any(|badge| {
-                                            badge.to_string().contains("MODERATOR")
+                                            crate::innertube::json_contains_str(badge, "MODERATOR")
                                         })
                                     }).unwrap_or(false);
 

@@ -215,10 +215,9 @@ impl PowerManager {
         Ok(())
     }
 
-    /// Pins thread execution to energy-efficient CPU cores and invokes memory trims.
+    /// Trims memory and activates power-saving policies without restricting foreground render workers.
     pub fn apply_battery_profile() {
-        println!("[PowerManager] Switching to BATTERY mode: Pinning to efficiency cores, codec priority AV1/VP9, trims active.");
-        pin_to_lp_ecores();
+        println!("[PowerManager] Switching to BATTERY mode: Codec priority AV1/VP9, memory trims active.");
         trim_process_memory();
     }
 

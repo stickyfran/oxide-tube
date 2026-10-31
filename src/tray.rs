@@ -48,24 +48,30 @@ mod linux {
     // Channel to notify the async SNI task of visibility changes
     static SNI_SIGNAL: OnceLock<tokio::sync::mpsc::UnboundedSender<bool>> = OnceLock::new();
 
+    static TRAY_PIXMAP_CACHE: OnceLock<Vec<(i32, i32, Vec<u8>)>> = OnceLock::new();
+
     fn load_tray_icon_pixmap() -> Vec<(i32, i32, Vec<u8>)> {
-        // Use the white symbolic icon (KDE style)
-        let icon_bytes = include_bytes!("../assets/tray_icon_white.png");
-        if let Ok(img) = image::load_from_memory(icon_bytes) {
-            let resized = img.resize(32, 32, image::imageops::FilterType::Lanczos3);
-            let rgba = resized.to_rgba8();
-            let (w, h) = rgba.dimensions();
-            let mut argb = Vec::with_capacity((w * h * 4) as usize);
-            for pixel in rgba.pixels() {
-                argb.push(pixel[3]); // Alpha
-                argb.push(pixel[0]); // Red
-                argb.push(pixel[1]); // Green
-                argb.push(pixel[2]); // Blue
-            }
-            vec![(w as i32, h as i32, argb)]
-        } else {
-            vec![]
-        }
+        TRAY_PIXMAP_CACHE
+            .get_or_init(|| {
+                // Use the white symbolic icon (KDE style)
+                let icon_bytes = include_bytes!("../assets/tray_icon_white.png");
+                if let Ok(img) = image::load_from_memory(icon_bytes) {
+                    let resized = img.resize(32, 32, image::imageops::FilterType::Lanczos3);
+                    let rgba = resized.to_rgba8();
+                    let (w, h) = rgba.dimensions();
+                    let mut argb = Vec::with_capacity((w * h * 4) as usize);
+                    for pixel in rgba.pixels() {
+                        argb.push(pixel[3]); // Alpha
+                        argb.push(pixel[0]); // Red
+                        argb.push(pixel[1]); // Green
+                        argb.push(pixel[2]); // Blue
+                    }
+                    vec![(w as i32, h as i32, argb)]
+                } else {
+                    vec![]
+                }
+            })
+            .clone()
     }
 
     #[derive(Type, Serialize, Deserialize, Debug, Clone)]

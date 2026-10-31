@@ -139,6 +139,8 @@ pub struct WatchDetails {
     pub parsed_desc_urls: Vec<String>,
     #[serde(default)]
     pub parsed_desc_timestamps: Vec<(String, u64)>,
+    #[serde(default)]
+    pub videostats_playback_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -167,6 +169,30 @@ pub struct InnerTubeClient {
     bot_detected: Arc<AtomicBool>,
     watch_cache: Arc<RwLock<HashMap<String, (Instant, Arc<WatchDetails>)>>>,
     feed_continuation: Arc<RwLock<Option<(String, String)>>>,
+}
+
+pub fn json_contains_str(val: &Value, needle: &str) -> bool {
+    match val {
+        Value::String(s) => s.contains(needle),
+        Value::Array(arr) => arr.iter().any(|v| json_contains_str(v, needle)),
+        Value::Object(map) => map.iter().any(|(k, v)| k.contains(needle) || json_contains_str(v, needle)),
+        _ => false,
+    }
+}
+
+pub fn json_has_subscribed_true(val: &Value) -> bool {
+    match val {
+        Value::Object(map) => {
+            if let Some(v) = map.get("subscribed") {
+                if v.as_bool() == Some(true) {
+                    return true;
+                }
+            }
+            map.values().any(json_has_subscribed_true)
+        }
+        Value::Array(arr) => arr.iter().any(json_has_subscribed_true),
+        _ => false,
+    }
 }
 
 impl InnerTubeClient {
@@ -222,7 +248,10 @@ impl InnerTubeClient {
                 }
             }
             if changed {
-                let _ = session.save_to_disk();
+                let session_clone = session.clone();
+                tokio::task::spawn_blocking(move || {
+                    let _ = session_clone.save_to_disk();
+                });
             }
         }
     }
@@ -246,10 +275,13 @@ impl InnerTubeClient {
                 let mut lock = self.visitor_data.write().await;
                 if *lock != vd {
                     *lock = vd.to_string();
-                    if let Some(home) = dirs::home_dir() {
-                        let path = home.join(".config/mitub/visitor_data.txt");
-                        let _ = std::fs::write(path, vd);
-                    }
+                    let vd_clone = vd.to_string();
+                    tokio::task::spawn_blocking(move || {
+                        if let Some(home) = dirs::home_dir() {
+                            let path = home.join(".config/mitub/visitor_data.txt");
+                            let _ = std::fs::write(path, vd_clone);
+                        }
+                    });
                 }
             }
         }
@@ -362,11 +394,10 @@ impl InnerTubeClient {
                         return true;
                     }
                 }
-                let vm_str = vm.to_string();
-                if vm_str.contains("BADGE_STYLE_TYPE_MEMBERS_ONLY")
-                    || vm_str.contains("Solo para miembros")
-                    || vm_str.contains("Members only")
-                    || vm_str.contains("SPONSORSHIP_STAR")
+                if json_contains_str(vm, "BADGE_STYLE_TYPE_MEMBERS_ONLY")
+                    || json_contains_str(vm, "Solo para miembros")
+                    || json_contains_str(vm, "Members only")
+                    || json_contains_str(vm, "SPONSORSHIP_STAR")
                 {
                     return true;
                 }
@@ -912,37 +943,49 @@ impl InnerTubeClient {
 
     /// Reports a watched video back to the user's YouTube Account History (`FEhistory`)
     /// using YouTube's official `playbackTracking.videostatsPlaybackUrl` endpoint.
-    pub async fn record_watch_history(&self, video_id: &str) {
+    /// If `videostats_url` is already known from `WatchDetails`, avoids redundant `/player` fetch.
+    pub async fn record_watch_history(&self, video_id: &str, videostats_url: Option<&str>) {
         if !self.session.read().await.is_authenticated() || video_id.is_empty() {
             return;
         }
-        let player_url = format!("{YOUTUBE_ORIGIN}/youtubei/v1/player?prettyPrint=false");
         let headers = self.build_headers().await;
-        let body = serde_json::json!({
-            "context": Self::innertube_context(),
-            "videoId": video_id
-        });
 
-        if let Ok(resp) = self.client.post(&player_url).headers(headers.clone()).json(&body).send().await {
-            self.capture_set_cookies(resp.headers()).await;
-            if let Ok(json_val) = Self::resp_simd_json(resp).await {
-                if let Some(base_url) = json_val
-                    .get("playbackTracking")
-                    .and_then(|pt| pt.get("videostatsPlaybackUrl"))
-                    .and_then(|vp| vp.get("baseUrl"))
-                    .and_then(|u| u.as_str())
-                {
-                    let stats_url = base_url.replace("https://s.youtube.com", YOUTUBE_ORIGIN);
-                    let ts = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_millis())
-                        .unwrap_or(0);
-                    let cpn = format!("mitub{:011x}", ts & 0xfff_ffff_ffff);
-                    let full_url = format!("{stats_url}&ver=2&c=WEB&cpn={cpn}&cmt=0");
-                    if let Ok(stats_resp) = self.client.get(&full_url).headers(headers).send().await {
-                        self.capture_set_cookies(stats_resp.headers()).await;
-                    }
+        let base_url_opt = if let Some(u) = videostats_url {
+            Some(u.to_string())
+        } else {
+            let player_url = format!("{YOUTUBE_ORIGIN}/youtubei/v1/player?prettyPrint=false");
+            let body = serde_json::json!({
+                "context": Self::innertube_context(),
+                "videoId": video_id
+            });
+
+            if let Ok(resp) = self.client.post(&player_url).headers(headers.clone()).json(&body).send().await {
+                self.capture_set_cookies(resp.headers()).await;
+                if let Ok(json_val) = Self::resp_simd_json(resp).await {
+                    json_val
+                        .get("playbackTracking")
+                        .and_then(|pt| pt.get("videostatsPlaybackUrl"))
+                        .and_then(|vp| vp.get("baseUrl"))
+                        .and_then(|u| u.as_str())
+                        .map(|s| s.to_string())
+                } else {
+                    None
                 }
+            } else {
+                None
+            }
+        };
+
+        if let Some(base_url) = base_url_opt {
+            let stats_url = base_url.replace("https://s.youtube.com", YOUTUBE_ORIGIN);
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
+            let cpn = format!("mitub{:011x}", ts & 0xfff_ffff_ffff);
+            let full_url = format!("{stats_url}&ver=2&c=WEB&cpn={cpn}&cmt=0");
+            if let Ok(stats_resp) = self.client.get(&full_url).headers(headers).send().await {
+                self.capture_set_cookies(stats_resp.headers()).await;
             }
         }
     }
@@ -1815,6 +1858,13 @@ impl InnerTubeClient {
         let parsed_desc_urls = extract_unique_urls(&description);
         let parsed_desc_timestamps = extract_timestamps(&description);
 
+        let videostats_playback_url = player_json
+            .get("playbackTracking")
+            .and_then(|pt| pt.get("videostatsPlaybackUrl"))
+            .and_then(|vp| vp.get("baseUrl"))
+            .and_then(|u| u.as_str())
+            .map(|s| s.to_string());
+
         let details = Arc::new(WatchDetails {
             video_id: video_id.to_string(),
             title,
@@ -1839,6 +1889,7 @@ impl InnerTubeClient {
             chapters,
             parsed_desc_urls,
             parsed_desc_timestamps,
+            videostats_playback_url,
         });
 
         if !details.is_live {
@@ -2471,8 +2522,7 @@ impl InnerTubeClient {
 
                 if let Some(item_renderer) = item.get("videoSecondaryInfoRenderer") {
                     if let Some(sub_btn) = item_renderer.get("subscribeButton") {
-                        let sub_str = sub_btn.to_string();
-                        if sub_str.contains("\"subscribed\":true") || sub_str.contains("\"subscribed\": true") {
+                        if json_has_subscribed_true(sub_btn) {
                             is_subscribed = true;
                         }
                     }
@@ -2975,8 +3025,7 @@ impl InnerTubeClient {
                         continue;
                     }
                     if let Some(endpoint) = tab_renderer.get("endpoint") {
-                        let endpoint_str = endpoint.to_string();
-                        if endpoint_str.contains("reelWatchEndpoint") || endpoint_str.contains("shorts") {
+                        if json_contains_str(endpoint, "reelWatchEndpoint") || json_contains_str(endpoint, "shorts") {
                             continue;
                         }
                     }
@@ -2995,10 +3044,7 @@ impl InnerTubeClient {
         }
 
         let is_subscribed = header
-            .map(|h| {
-                let s = h.to_string();
-                s.contains("\"subscribed\":true") || s.contains("\"subscribed\": true")
-            })
+            .map(json_has_subscribed_true)
             .unwrap_or(false);
 
         Ok(ChannelDetails {

@@ -95,7 +95,7 @@ pub fn format_size(bytes: u64) -> String {
     }
 }
 
-pub fn prune_cache_if_needed(max_bytes: u64) -> u64 {
+pub fn prune_cache_if_needed(max_bytes: u64, active_video_id: Option<&str>) -> u64 {
     if max_bytes == u64::MAX {
         return 0;
     }
@@ -145,6 +145,25 @@ pub fn prune_cache_if_needed(max_bytes: u64) -> u64 {
         if total_size <= target_size {
             break;
         }
+
+        // Never prune active in-flight partial downloads (.part)
+        if let Some(ext) = f.path.extension().and_then(|e| e.to_str()) {
+            if ext.eq_ignore_ascii_case("part") {
+                continue;
+            }
+        }
+
+        // Never prune cached video/audio/subtitles belonging to the actively playing video
+        if let Some(active_id) = active_video_id {
+            if !active_id.is_empty() {
+                if let Some(file_name) = f.path.file_name().and_then(|n| n.to_str()) {
+                    if file_name.contains(active_id) {
+                        continue;
+                    }
+                }
+            }
+        }
+
         if fs::remove_file(&f.path).is_ok() {
             total_size = total_size.saturating_sub(f.size);
             freed += f.size;
@@ -225,7 +244,7 @@ mod tests {
 
     #[test]
     fn test_prune_unlimited_does_nothing() {
-        assert_eq!(prune_cache_if_needed(u64::MAX), 0);
+        assert_eq!(prune_cache_if_needed(u64::MAX, None), 0);
     }
 }
 
