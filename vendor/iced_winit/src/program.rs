@@ -998,10 +998,21 @@ async fn run_instance<P, C>(
                                 delta: winit::event::MouseScrollDelta::LineDelta(dx, dy),
                                 ..
                             } = window_event {
-                                let rem = smooth_scroll.entry(id).or_insert((0.0, 0.0));
-                                rem.0 += dx * 135.0;
-                                rem.1 += dy * 135.0;
-                                window.raw.request_redraw();
+                                let is_pip = window.state.title() == "PiP";
+                                if !is_pip {
+                                    let rem = smooth_scroll.entry(id).or_insert((0.0, 0.0));
+                                    rem.0 += dx * 135.0;
+                                    rem.1 += dy * 135.0;
+                                    window.raw.request_redraw();
+                                } else {
+                                    // In PiP window, pass wheel events directly without inertial interpolation
+                                    events.push((
+                                        id,
+                                        core::Event::Mouse(mouse::Event::WheelScrolled {
+                                            delta: mouse::ScrollDelta::Lines { x: dx, y: dy },
+                                        }),
+                                    ));
+                                }
                             } else if let Some(event) = conversion::window_event(
                                 window_event,
                                 window.state.scale_factor(),
@@ -1128,7 +1139,7 @@ async fn run_instance<P, C>(
 
                             let has_pip = window_manager
                                 .iter_mut()
-                                .any(|(_, w)| w.state.title().contains("PiP"));
+                                .any(|(_, w)| w.state.title() == "PiP");
 
                             for (id, window) in window_manager.iter_mut() {
                                 window.state.synchronize(
@@ -1142,7 +1153,7 @@ async fn run_instance<P, C>(
                                 }
 
                                 let is_background_main_during_pip = has_pip
-                                    && !window.state.title().contains("PiP")
+                                    && window.state.title() != "PiP"
                                     && !window.raw.has_focus()
                                     && matches!(
                                         window.state.cursor(),

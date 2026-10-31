@@ -250,6 +250,8 @@ pub struct MitubApp {
     watch_scroll_y: f32,
     last_watch_thumb_check_y: f32,
     saved_volume: f32,
+    last_pip_toggle: Option<std::time::Instant>,
+    volume_wheel_accum: f32,
     main_window_id: Option<Id>,
     pip_window_id: Option<Id>,
     pip_watch_details: Option<Arc<innertube::WatchDetails>>,
@@ -511,8 +513,7 @@ const clients = workspace.windowList();
 for (let i = 0; i < clients.length; i++) {
     const w = clients[i];
     const isMitub = (w.resourceClass === "mitub" || (w.caption && (w.caption.indexOf("Mitub") !== -1 || w.caption.indexOf("Oxide") !== -1)));
-    const isPip = (w.caption && (w.caption.indexOf("PiP") !== -1))
-        || (isMitub && w.frameGeometry.width < 1000 && w.frameGeometry.height < 700);
+    const isPip = (w.caption === "PiP") || (w.caption && w.caption.indexOf("PiP") !== -1 && w.frameGeometry.width < 1000);
     if (isPip) {
         console.info("MITUB_PIP_POS:" + Math.round(w.frameGeometry.x) + "," + Math.round(w.frameGeometry.y) + "," + Math.round(w.frameGeometry.width) + "," + Math.round(w.frameGeometry.height));
         break;
@@ -604,7 +605,7 @@ const clients = workspace.windowList();
 for (let i = 0; i < clients.length; i++) {
     const w = clients[i];
     const isMitub = (w.resourceClass === "tube-oxide" || w.resourceClass === "Tube-oxide" || w.resourceClass === "mitub" || (w.caption && (w.caption.indexOf("Tube-oxide") !== -1 || w.caption.indexOf("Oxide") !== -1 || w.caption.indexOf("Mitub") !== -1)));
-    const isPip = w.caption && w.caption.indexOf("PiP") !== -1;
+    const isPip = w.caption === "PiP" || (w.caption && w.caption.indexOf("PiP") !== -1 && w.frameGeometry.width < 1000);
     if (isMitub && !isPip) {
         try { w.minimized = false; } catch(e) {}
         try { workspace.activeWindow = w; } catch(e) {}
@@ -677,8 +678,7 @@ const clients = workspace.windowList();
 for (let i = 0; i < clients.length; i++) {{
     const w = clients[i];
     const isMitub = (w.resourceClass === "mitub" || (w.caption && (w.caption.indexOf("Mitub") !== -1 || w.caption.indexOf("Oxide") !== -1)));
-    const isPip = (w.caption && (w.caption.indexOf("PiP") !== -1))
-        || (isMitub && w.frameGeometry.width < 1000 && w.frameGeometry.height < 700);
+    const isPip = (w.caption === "PiP") || (w.caption && w.caption.indexOf("PiP") !== -1 && w.frameGeometry.width < 1000);
     if (isPip) {{
         try {{ w.keepAbove = true; }} catch(e) {{}}
         try {{ w.onAllDesktops = true; }} catch(e) {{}}
@@ -1193,6 +1193,8 @@ impl MitubApp {
             watch_scroll_y: 0.0,
             last_watch_thumb_check_y: 0.0,
             saved_volume: app_volume,
+            last_pip_toggle: None,
+            volume_wheel_accum: 0.0,
             main_window_id: Some(main_id),
             pip_window_id: None,
             pip_watch_details: None,
@@ -1831,7 +1833,7 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
 
     pub fn title(&self, id: Id) -> String {
         if Some(id) == self.pip_window_id || (self.main_window_id.is_some() && Some(id) != self.main_window_id) {
-            return "Oxide tube - PiP".to_string();
+            return "PiP".to_string();
         }
         match &self.current_view {
             ViewMode::Watch(_) => {
@@ -1950,6 +1952,7 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
             Message::ClosePip => {
                 let was_unfocused_auto = self.auto_pip_triggered_by_unfocus;
                 self.auto_pip_triggered_by_unfocus = false;
+                self.last_pip_toggle = Some(std::time::Instant::now());
                 trigger_save_kwin_pip_position();
                 if let Some(pip_id) = self.pip_window_id.take() {
                     crate::diagnostics::log_pip("Close", 0, "Closing PiP and returning to main window");
@@ -3908,6 +3911,7 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
 
                 let (pip_id, open_task) = window::open(pip_settings);
                 self.pip_window_id = Some(pip_id);
+                self.last_pip_toggle = Some(std::time::Instant::now());
 
                 let disp_addr = self.main_window_handles.0;
                 let handle_task = open_task
@@ -5597,7 +5601,14 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                                 self.sync_player_viewport();
                             }
                         }
-                        if Some(win_id) == self.main_window_id && self.auto_pip_triggered_by_unfocus && self.pip_window_id.is_some() {
+                        let is_recent_toggle = self.last_pip_toggle
+                            .map(|t| t.elapsed() < Duration::from_millis(350))
+                            .unwrap_or(false);
+                        if Some(win_id) == self.main_window_id
+                            && self.auto_pip_triggered_by_unfocus
+                            && self.pip_window_id.is_some()
+                            && !is_recent_toggle
+                        {
                             self.auto_pip_triggered_by_unfocus = false;
                             return self.update(Message::ClosePip);
                         }
@@ -5607,9 +5618,13 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                             self.focused_window = None;
                             self.is_window_focused = false;
                         }
+                        let is_recent_toggle = self.last_pip_toggle
+                            .map(|t| t.elapsed() < Duration::from_millis(350))
+                            .unwrap_or(false);
                         if Some(win_id) == self.main_window_id
                             && self.config.auto_pip_on_unfocus
                             && self.pip_window_id.is_none()
+                            && !is_recent_toggle
                             && (self.watch_details.is_some() || self.playing_video_id.is_some())
                         {
                             let is_active = self.player.as_ref().map(|p| p.is_playing() || p.get_position_ms() > 0).unwrap_or(false);
@@ -5677,35 +5692,58 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                     iced::Event::Mouse(iced::mouse::Event::WheelScrolled { delta }) => {
                         let lines = match delta {
                             iced::mouse::ScrollDelta::Lines { y, .. } => y,
-                            iced::mouse::ScrollDelta::Pixels { y, .. } => y / 20.0,
+                            iced::mouse::ScrollDelta::Pixels { y, .. } => y / 135.0,
                         };
-                        if lines.abs() > 0.05 {
+                        if lines.abs() > 0.005 {
                             if Some(win_id) == self.pip_window_id {
                                 if self.is_ctrl_pressed {
                                     let scale = if lines > 0.0 { 1.10 } else { 0.90 };
                                     return self.update(Message::ScalePip(scale));
                                 } else {
-                                    let step = if lines > 0.0 { 0.05 } else { -0.05 };
-                                    let new_vol = (self.osd_state.volume + step).clamp(0.0, 1.0);
+                                    self.volume_wheel_accum += lines;
+                                    // Each notch (~1.0 line delta) changes volume by ~2.5% (smooth, not jumpy)
+                                    let steps = (self.volume_wheel_accum / 0.50) as i32;
+                                    if steps != 0 {
+                                        self.volume_wheel_accum -= (steps as f32) * 0.50;
+                                        let vol_delta = (steps as f32) * 0.025;
+                                        let new_vol = (self.osd_state.volume + vol_delta).clamp(0.0, 1.0);
+                                        return self.update(Message::VolumeChanged(new_vol));
+                                    }
+                                }
+                            } else if self.is_fullscreen {
+                                self.volume_wheel_accum += lines;
+                                let steps = (self.volume_wheel_accum / 0.50) as i32;
+                                if steps != 0 {
+                                    self.volume_wheel_accum -= (steps as f32) * 0.50;
+                                    let vol_delta = (steps as f32) * 0.025;
+                                    let new_vol = (self.osd_state.volume + vol_delta).clamp(0.0, 1.0);
                                     return self.update(Message::VolumeChanged(new_vol));
                                 }
-                            } else if matches!(self.current_view, ViewMode::Watch(_) | ViewMode::VideoFullscreen) {
-                                let (win_w, win_h) = self.window_size;
-                                let (px, py, pw, ph) = if self.is_fullscreen {
-                                    (0.0, 0.0, win_w, win_h)
+                            } else if matches!(self.current_view, ViewMode::Watch(_)) {
+                                // In normal windowed watch mode, ONLY change volume if hovering over the volume control area
+                                // (bottom-left corner of the video player: mute icon + volume slider)
+                                let (px, py, _pw, ph) = self.get_windowed_player_rect();
+                                let in_volume_control_area = if let Some(pos) = self.last_cursor_pos {
+                                    // Controls row is at bottom of player: py + ph - 60.0 to py + ph
+                                    // Volume section is on left: px + 36.0 to px + 195.0
+                                    let y_min = py + ph - 64.0;
+                                    let y_max = py + ph;
+                                    let x_min = px + 36.0;
+                                    let x_max = px + 195.0;
+                                    pos.x >= x_min && pos.x <= x_max && pos.y >= y_min && pos.y <= y_max
                                 } else {
-                                    self.get_windowed_player_rect()
-                                };
-                                let in_player = if let Some(pos) = self.last_cursor_pos {
-                                    pos.x >= px && pos.x <= px + pw && pos.y >= py && pos.y <= py + ph
-                                } else {
-                                    self.is_fullscreen
+                                    false
                                 };
 
-                                if in_player {
-                                    let step = if lines > 0.0 { 0.05 } else { -0.05 };
-                                    let new_vol = (self.osd_state.volume + step).clamp(0.0, 1.0);
-                                    return self.update(Message::VolumeChanged(new_vol));
+                                if in_volume_control_area {
+                                    self.volume_wheel_accum += lines;
+                                    let steps = (self.volume_wheel_accum / 0.50) as i32;
+                                    if steps != 0 {
+                                        self.volume_wheel_accum -= (steps as f32) * 0.50;
+                                        let vol_delta = (steps as f32) * 0.025;
+                                        let new_vol = (self.osd_state.volume + vol_delta).clamp(0.0, 1.0);
+                                        return self.update(Message::VolumeChanged(new_vol));
+                                    }
                                 }
                             }
                         }
@@ -6390,7 +6428,7 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
                             .and_then(|t| self.thumbnail_cache.get(&t.thumbnail_url))
                     });
                 let buffer_status = self.buffer_downloads.get(&details.video_id).map(|s| (s.percent, s.is_complete));
-                let video_frame = if is_active_video {
+                let video_frame = if is_active_video && !is_this_video_in_pip {
                     self.player.as_ref().and_then(|p| p.get_current_frame())
                 } else {
                     None
@@ -6607,7 +6645,7 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
                                 .and_then(|t| self.thumbnail_cache.get(&t.thumbnail_url))
                         });
                     let buffer_status = self.buffer_downloads.get(&details.video_id).map(|s| (s.percent, s.is_complete));
-                    let video_frame = if is_active_video {
+                    let video_frame = if is_active_video && !is_this_video_in_pip {
                         self.player.as_ref().and_then(|p| p.get_current_frame())
                     } else {
                         None
