@@ -11,7 +11,7 @@ use crate::config::{PreferredAudioLanguage, PreferredCodec, PreferredResolution}
 use crate::power_manager::PowerProfile;
 use crate::ui::icons::*;
 use crate::ui::theme::*;
-use iced::widget::{button, canvas, column, container, image, mouse_area, row, slider, stack, text, text_input, Column, Space};
+use iced::widget::{button, canvas, column, container, image, mouse_area, row, scrollable, slider, stack, text, text_input, Column, Space};
 use iced::{Alignment, Element, Length, Point, Rectangle, Renderer, Theme};
 
 pub use crate::config::VideoTab;
@@ -593,7 +593,84 @@ pub fn view_suggestions_overlay<'a, Message: Clone + 'static>(
     .into()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SettingsCategory {
+    #[default]
+    Playback,
+    Appearance,
+    System,
+    Storage,
+    Account,
+}
+
+impl SettingsCategory {
+    pub fn label(&self) -> &'static str {
+        match self {
+            SettingsCategory::Playback => "Reproducción",
+            SettingsCategory::Appearance => "Apariencia",
+            SettingsCategory::System => "Sistema",
+            SettingsCategory::Storage => "Almacenamiento",
+            SettingsCategory::Account => "Cuenta",
+        }
+    }
+}
+
+pub fn render_toggle_switch<'a, Message: Clone + 'static>(
+    enabled: bool,
+    on_toggle: Message,
+) -> Element<'a, Message> {
+    let track_bg = if enabled {
+        iced::Color::from_rgb8(0xcc, 0x00, 0x00)
+    } else {
+        iced::Color::from_rgb8(0x38, 0x38, 0x40)
+    };
+    let thumb = container(Space::with_width(Length::Fixed(0.0)))
+        .width(Length::Fixed(16.0))
+        .height(Length::Fixed(16.0))
+        .style(|_t| container::Style {
+            background: Some(iced::Color::WHITE.into()),
+            border: iced::border::rounded(8),
+            ..container::Style::default()
+        });
+
+    let left_spacer: Element<'a, Message> = if enabled {
+        Space::with_width(Length::Fixed(18.0)).into()
+    } else {
+        Space::with_width(Length::Fixed(0.0)).into()
+    };
+    let right_spacer: Element<'a, Message> = if !enabled {
+        Space::with_width(Length::Fixed(18.0)).into()
+    } else {
+        Space::with_width(Length::Fixed(0.0)).into()
+    };
+
+    let switch_pill = container(
+        row![
+            left_spacer,
+            thumb,
+            right_spacer,
+        ]
+        .align_y(Alignment::Center),
+    )
+    .width(Length::Fixed(42.0))
+    .height(Length::Fixed(22.0))
+    .padding([3, 4])
+    .style(move |_t| container::Style {
+        background: Some(track_bg.into()),
+        border: iced::border::rounded(11),
+        ..container::Style::default()
+    });
+
+    button(switch_pill)
+        .style(ghost_button)
+        .padding(0)
+        .on_press(on_toggle)
+        .into()
+}
+
 pub fn view_auth_modal<'a, Message: Clone + 'static>(
+    selected_category: SettingsCategory,
+    on_select_category: impl Fn(SettingsCategory) -> Message + Copy + 'static,
     raw_cookie_input: &'a str,
     status_msg: &'a str,
     user_name: Option<&'a str>,
@@ -633,49 +710,51 @@ pub fn view_auth_modal<'a, Message: Clone + 'static>(
     let avatar_widget: Element<'a, Message> = if let Some(handle) = user_avatar_handle {
         container(
             image(handle.clone())
-                .width(Length::Fixed(44.0))
-                .height(Length::Fixed(44.0))
+                .width(Length::Fixed(40.0))
+                .height(Length::Fixed(40.0))
                 .content_fit(iced::ContentFit::Cover),
         )
-        .width(Length::Fixed(44.0))
-        .height(Length::Fixed(44.0))
+        .width(Length::Fixed(40.0))
+        .height(Length::Fixed(40.0))
         .style(|_t| container::Style {
-            border: iced::border::rounded(22).color(COLOR_BORDER_FOCUS).width(2.0),
+            border: iced::border::rounded(20).color(COLOR_BORDER_FOCUS).width(2.0),
             ..container::Style::default()
         })
         .into()
     } else if user_name.is_some() {
-        view_avatar_badge(display_name, 44.0, 18.0).into()
+        view_avatar_badge(display_name, 40.0, 16.0).into()
     } else {
-        container(icon_user(22.0))
-            .width(Length::Fixed(44.0))
-            .height(Length::Fixed(44.0))
+        container(icon_user(20.0))
+            .width(Length::Fixed(40.0))
+            .height(Length::Fixed(40.0))
             .align_x(iced::alignment::Horizontal::Center)
             .align_y(iced::alignment::Vertical::Center)
             .style(|_t| container::Style {
                 background: Some(iced::Color::from_rgb8(0x28, 0x28, 0x28).into()),
-                border: iced::border::rounded(22).color(COLOR_BORDER).width(1.0),
+                border: iced::border::rounded(20).color(COLOR_BORDER).width(1.0),
                 ..container::Style::default()
             })
             .into()
     };
+
+    let is_authenticated = status_msg.starts_with("[OK]");
     let profile_header = row![
         avatar_widget,
         column![
-            text(display_name).size(16).color(COLOR_TEXT_PRIMARY),
-            text(if status_msg.starts_with("[OK]") {
+            text(display_name).size(15).color(COLOR_TEXT_PRIMARY),
+            text(if is_authenticated {
                 "Sesión activa • Recomendaciones e Historial sincronizados"
             } else {
                 "Modo Invitado • Inicia sesión para sincronizar tu cuenta"
             })
-            .size(12)
-            .color(if status_msg.starts_with("[OK]") {
+            .size(11)
+            .color(if is_authenticated {
                 COLOR_BORDER_FOCUS
             } else {
                 COLOR_TEXT_SECONDARY
             }),
         ]
-        .spacing(3),
+        .spacing(2),
         Space::with_width(Length::Fill),
         button(icon_close(14.0))
             .style(ghost_button)
@@ -685,356 +764,35 @@ pub fn view_auth_modal<'a, Message: Clone + 'static>(
     .spacing(12)
     .align_y(Alignment::Center);
 
-    // 2. Direct Navigation Links (Suscripciones, Historial, Playlists)
-    let nav_heading = text("Tu Contenido y Biblioteca")
-        .size(13)
-        .color(COLOR_TEXT_PRIMARY);
-
-    let subs_nav_btn = button(
-        row![
-            icon_subscriptions(16.0),
-            text("Suscripciones").size(12).color(COLOR_TEXT_PRIMARY),
-        ]
-        .spacing(8)
-        .align_y(Alignment::Center),
-    )
-    .style(secondary_button)
-    .padding([8, 14])
-    .on_press(on_open_subscriptions);
-
-    let history_nav_btn = button(
-        row![
-            icon_history(16.0),
-            text("Historial").size(12).color(COLOR_TEXT_PRIMARY),
-        ]
-        .spacing(8)
-        .align_y(Alignment::Center),
-    )
-    .style(secondary_button)
-    .padding([8, 14])
-    .on_press(on_open_history);
-
-    let playlists_nav_btn = button(
-        row![
-            icon_playlist(16.0),
-            text("Playlists").size(12).color(COLOR_TEXT_PRIMARY),
-        ]
-        .spacing(8)
-        .align_y(Alignment::Center),
-    )
-    .style(secondary_button)
-    .padding([8, 14])
-    .on_press(on_open_playlists);
-
-    let nav_row = row![subs_nav_btn, history_nav_btn, playlists_nav_btn]
-        .spacing(10)
-        .align_y(Alignment::Center);
-
-    // 3. Section: Default Video Quality & Codec
-    let defaults_heading = text("Preferencias de Reproducción Predeterminadas (Default)")
-        .size(13)
-        .color(COLOR_TEXT_PRIMARY);
-
-    let res_options = [
-        PreferredResolution::Res8K,
-        PreferredResolution::Res4K,
-        PreferredResolution::Res1440p,
-        PreferredResolution::Res1080p,
-        PreferredResolution::Res720p,
-    ];
-
-    let mut res_row = row![].spacing(8).align_y(Alignment::Center);
-    for r in res_options {
-        let is_selected = r == current_res;
-        let btn = button(text(r.label()).size(12))
-            .style(if is_selected { primary_button } else { secondary_button })
-            .padding([5, 10])
-            .on_press(on_select_res(r));
-        res_row = res_row.push(btn);
-    }
-
-    let codec_options = [
-        PreferredCodec::Av1,
-        PreferredCodec::Vp9,
-        PreferredCodec::H264,
-    ];
-
-    let mut codec_row = row![].spacing(8).align_y(Alignment::Center);
-    for c in codec_options {
-        let is_selected = c == current_codec;
-        let btn = button(text(c.label()).size(12))
-            .style(if is_selected { primary_button } else { secondary_button })
-            .padding([5, 10])
-            .on_press(on_select_codec(c));
-        codec_row = codec_row.push(btn);
-    }
-
-    let audio_options = [
-        PreferredAudioLanguage::Original,
-        PreferredAudioLanguage::Spanish,
-        PreferredAudioLanguage::English,
-    ];
-
-    let mut audio_row = row![].spacing(8).align_y(Alignment::Center);
-    for a in audio_options {
-        let is_selected = a == current_audio_lang;
-        let btn = button(text(a.label()).size(12))
-            .style(if is_selected { primary_button } else { secondary_button })
-            .padding([5, 10])
-            .on_press(on_select_audio_lang(a));
-        audio_row = audio_row.push(btn);
-    }
-
-    let fallback_hint = text(
-        "Fallback Inteligente Automático: Si el video no dispone de la calidad o códec seleccionado,\n\
-        Mitub descenderá progresivamente en cascada (8K -> 4K -> 1440p -> 1080p -> 720p y AV1 -> VP9 -> H.264)\n\
-        garantizando siempre la máxima calidad soportada sin interrupciones ni fallos.",
-    )
-    .size(11)
-    .color(COLOR_TEXT_SECONDARY);
-
-    // Ventana Flotante PiP Automática (Multitarea)
-    let auto_pip_btn = button(
-        row![
-            if auto_pip_on_unfocus {
-                icon_check_circle(15.0)
-            } else {
-                icon_pip(15.0)
-            },
-            text(if auto_pip_on_unfocus {
-                "PiP Automático al cambiar de ventana (Alt+Tab): ACTIVADO"
-            } else {
-                "PiP Automático al cambiar de ventana (Alt+Tab): Desactivado"
-            })
-            .size(12),
-        ]
-        .spacing(8)
-        .align_y(Alignment::Center),
-    )
-    .style(if auto_pip_on_unfocus { primary_button } else { secondary_button })
-    .padding([6, 14])
-    .on_press(on_toggle_auto_pip);
-
-    let auto_pip_hint = text(
-        "Al cambiar a otra aplicación con Alt+Tab mientras reproduces un video,\n\
-        Mitub activará automáticamente la ventana flotante PiP y la restaurará al volver.",
-    )
-    .size(11)
-    .color(COLOR_TEXT_SECONDARY);
-
-    // Modo Pestañas con Buffer Completo
-    let buffer_tabs_btn = button(
-        row![
-            if full_buffer_tabs {
-                icon_check_circle(15.0)
-            } else {
-                icon_buffer(15.0)
-            },
-            text(if full_buffer_tabs {
-                "Precarga / Buffer Completo en Pestañas: ACTIVADO"
-            } else {
-                "Precarga / Buffer Completo en Pestañas: Desactivado"
-            })
-            .size(12),
-        ]
-        .spacing(8)
-        .align_y(Alignment::Center),
-    )
-    .style(if full_buffer_tabs { primary_button } else { secondary_button })
-    .padding([6, 14])
-    .on_press(on_toggle_full_buffer_tabs);
-
-    let buffer_tabs_hint = text(
-        "Al abrir un video en una pestaña, descarga y bufferea el video completo en segundo plano.\n\
-        Te permite saltar entre pestañas y desplazarte sobre cualquier segundo del video al instante\n\
-        sin esperas ni buffering de red durante toda la sesión.",
-    )
-    .size(11)
-    .color(COLOR_TEXT_SECONDARY);
-
-    // Modo Minimizar / Cerrar a la Bandeja del Sistema (Tray)
-    let close_to_tray_btn = button(
-        row![
-            if close_to_tray {
-                icon_check_circle(15.0)
-            } else {
-                icon_close(15.0)
-            },
-            text(if close_to_tray {
-                "Cerrar a la Bandeja del Sistema (Segundo plano): ACTIVADO"
-            } else {
-                "Cerrar a la Bandeja del Sistema (Segundo plano): Desactivado"
-            })
-            .size(12),
-        ]
-        .spacing(8)
-        .align_y(Alignment::Center),
-    )
-    .style(if close_to_tray { primary_button } else { secondary_button })
-    .padding([6, 14])
-    .on_press(on_toggle_close_to_tray);
-
-    let close_to_tray_hint = text(
-        "Al pulsar la X de la ventana, Mitub continuará reproduciendo audio y video en segundo plano\n\
-        y se mantendrá en la bandeja del sistema (tray). Al hacer clic en el icono o abrir la app se restaura.",
-    )
-    .size(11)
-    .color(COLOR_TEXT_SECONDARY);
-
-    // 4. Section: Límite y Gestión de Caché
-    let cache_heading = text("Almacenamiento y Límite de Caché de Video")
-        .size(13)
-        .color(COLOR_TEXT_PRIMARY);
-
-    let current_idx = limit_to_index(max_cache_size_bytes);
-    let current_limit_label = CACHE_LIMIT_LABELS.get(current_idx).copied().unwrap_or("5 GB (Estándar)");
-
-    let cache_slider = slider(
-        0..=5_u8,
-        current_idx as u8,
-        move |val| on_change_cache_limit(val as usize),
-    )
-    .step(1_u8)
-    .style(youtube_seek_slider)
-    .width(Length::Fixed(250.0));
-
-    let clear_cache_btn = button(
-        row![
-            icon_trash(14.0),
-            text(format!("Limpiar caché ({})", format_size(current_cache_size_bytes))).size(12),
-        ]
-        .spacing(6)
-        .align_y(Alignment::Center),
-    )
-    .style(secondary_button)
-    .padding([6, 12])
-    .on_press(on_clear_cache);
-
-    let cache_slider_col = column![
-        row![
-            text("Tope: ").size(12).color(COLOR_TEXT_SECONDARY),
-            text(current_limit_label).size(12).color(COLOR_ACCENT_RED),
-            Space::with_width(Length::Fixed(12.0)),
-            text(format!("En disco: {}", format_size(current_cache_size_bytes))).size(12).color(COLOR_TEXT_SECONDARY),
-        ]
-        .align_y(Alignment::Center),
-        cache_slider,
-        row![
-            text("1 GB").size(10).color(COLOR_TEXT_SECONDARY),
-            Space::with_width(Length::Fill),
-            text("2 GB").size(10).color(COLOR_TEXT_SECONDARY),
-            Space::with_width(Length::Fill),
-            text("5 GB").size(10).color(COLOR_ACCENT_RED),
-            Space::with_width(Length::Fill),
-            text("10 GB").size(10).color(COLOR_TEXT_SECONDARY),
-            Space::with_width(Length::Fill),
-            text("20 GB").size(10).color(COLOR_TEXT_SECONDARY),
-            Space::with_width(Length::Fill),
-            text("Ilimitado").size(10).color(COLOR_TEXT_SECONDARY),
-        ]
-        .width(Length::Fixed(250.0)),
-    ]
-    .spacing(4);
-
-    let cache_controls_row = row![
-        cache_slider_col,
-        Space::with_width(Length::Fixed(20.0)),
-        clear_cache_btn,
-    ]
-    .align_y(Alignment::Center);
-
-    let cache_hint = text(
-        "Almacenamiento persistente en disco (~/.cache/mitub/video_cache).\n\
-        Al alcanzar el tope máximo configurado, Mitub purga automáticamente los videos más antiguos (LRU).",
-    )
-    .size(11)
-    .color(COLOR_TEXT_SECONDARY);
-
-    // 5. Section: YouTube Auth / Cookies
-    let auth_heading = text("Cuenta de Google / YouTube")
-        .size(13)
-        .color(COLOR_TEXT_PRIMARY);
-
-    let is_authenticated = status_msg.starts_with("[OK]");
-    let auth_action_row: Element<'a, Message> = if is_authenticated {
-        let logout_btn = button(
+    // 2. Sidebar Navigation Buttons
+    let sidebar_btn = |cat: SettingsCategory, icon: Element<'a, Message>| {
+        let is_selected = selected_category == cat;
+        button(
             row![
-                icon_logout(13.0),
-                text("Cerrar Sesión").size(12).color(COLOR_TEXT_PRIMARY),
+                icon,
+                text(cat.label()).size(13),
             ]
-            .spacing(6)
+            .spacing(10)
             .align_y(Alignment::Center),
         )
-        .style(secondary_button)
-        .padding([6, 14])
-        .on_press(on_logout);
-
-        row![
-            text("Sesión sincronizada activamente.")
-                .size(12)
-                .color(COLOR_TEXT_SECONDARY),
-            Space::with_width(Length::Fill),
-            logout_btn,
-        ]
-        .align_y(Alignment::Center)
-        .into()
-    } else {
-        let firefox_btn = button(
-            row![
-                icon_user(13.0),
-                text("Importar desde Firefox").size(12).color(COLOR_TEXT_PRIMARY),
-            ]
-            .spacing(6)
-            .align_y(Alignment::Center),
-        )
-        .style(secondary_button)
-        .padding([6, 12])
-        .on_press(on_import_firefox);
-
-        let chrome_btn = button(
-            row![
-                icon_user(13.0),
-                text("Importar desde Chrome").size(12).color(COLOR_TEXT_PRIMARY),
-            ]
-            .spacing(6)
-            .align_y(Alignment::Center),
-        )
-        .style(secondary_button)
-        .padding([6, 12])
-        .on_press(on_import_chrome);
-
-        let input = text_input("O pega aquí tu Cookie: SAPISID=...; HSID=...", raw_cookie_input)
-            .on_input(on_cookie_input)
-            .style(search_input)
-            .padding(8);
-
-        let save_btn = button(text("Guardar Cookies").size(12))
-            .style(primary_button)
-            .padding([6, 12])
-            .on_press(on_save_raw_cookie);
-
-        column![
-            text(
-                "Inicia sesión para sincronizar tus suscripciones, historial y recomendaciones.\n\
-                Compatible con perfiles de Linux, Windows y macOS. Tus credenciales nunca salen de tu equipo.",
-            )
-            .size(12)
-            .color(COLOR_TEXT_SECONDARY),
-            row![firefox_btn, chrome_btn].spacing(10).align_y(Alignment::Center),
-            input,
-            row![save_btn].align_y(Alignment::Center),
-        ]
-        .spacing(8)
-        .into()
+        .style(settings_category_button(is_selected))
+        .padding([9, 14])
+        .width(Length::Fill)
+        .on_press(on_select_category(cat))
     };
 
-    let close_btn = button(text("Cerrar").size(12))
-        .style(ghost_button)
-        .padding([6, 14])
-        .on_press(on_close_modal.clone());
+    let sidebar = column![
+        sidebar_btn(SettingsCategory::Playback, icon_play(15.0)),
+        sidebar_btn(SettingsCategory::Appearance, icon_theater(15.0)),
+        sidebar_btn(SettingsCategory::System, icon_pip(15.0)),
+        sidebar_btn(SettingsCategory::Storage, icon_trash(15.0)),
+        sidebar_btn(SettingsCategory::Account, icon_user(15.0)),
+        Space::with_height(Length::Fill),
+    ]
+    .spacing(4)
+    .width(Length::Fixed(180.0));
 
-    let status = text(status_msg).size(12).color(COLOR_TEXT_SECONDARY);
-
+    // Section Card Helper
     let section_card = |content: Column<'a, Message>| -> Element<'a, Message> {
         container(content)
             .style(|_t| container::Style {
@@ -1049,150 +807,469 @@ pub fn view_auth_modal<'a, Message: Clone + 'static>(
             .into()
     };
 
-    let card_nav = section_card(
-        column![
-            nav_heading,
-            nav_row,
-        ]
-        .spacing(10),
-    );
+    // 3. Tab Contents
+    let content: Element<'a, Message> = match selected_category {
+        SettingsCategory::Playback => {
+            let res_options = [
+                PreferredResolution::Res8K,
+                PreferredResolution::Res4K,
+                PreferredResolution::Res1440p,
+                PreferredResolution::Res1080p,
+                PreferredResolution::Res720p,
+            ];
+            let mut res_row = row![].spacing(6).align_y(Alignment::Center);
+            for r in res_options {
+                let is_selected = r == current_res;
+                let btn = button(text(r.label()).size(12))
+                    .style(segmented_button(is_selected))
+                    .padding([5, 10])
+                    .on_press(on_select_res(r));
+                res_row = res_row.push(btn);
+            }
 
-    let style_row = row![
-        button(text("Squircle (YouTube)").size(12))
-            .style(if current_card_style == crate::config::CardStyle::Squircle { primary_button } else { secondary_button })
-            .padding([6, 14])
-            .on_press(on_select_card_style(crate::config::CardStyle::Squircle)),
-        button(text("Rectangular").size(12))
-            .style(if current_card_style == crate::config::CardStyle::Rectangular { primary_button } else { secondary_button })
-            .padding([6, 14])
-            .on_press(on_select_card_style(crate::config::CardStyle::Rectangular)),
-    ]
-    .spacing(8);
+            let codec_options = [
+                PreferredCodec::Av1,
+                PreferredCodec::Vp9,
+                PreferredCodec::H264,
+            ];
+            let mut codec_row = row![].spacing(6).align_y(Alignment::Center);
+            for c in codec_options {
+                let is_selected = c == current_codec;
+                let btn = button(text(c.label()).size(12))
+                    .style(segmented_button(is_selected))
+                    .padding([5, 10])
+                    .on_press(on_select_codec(c));
+                codec_row = codec_row.push(btn);
+            }
 
-    let cols_row = row![
-        button(text("4 (Original)").size(12))
-            .style(if current_columns == crate::config::GridColumnsConfig::Cols4 { primary_button } else { secondary_button })
-            .padding([6, 12])
-            .on_press(on_select_home_columns(crate::config::GridColumnsConfig::Cols4)),
-        button(text("Auto (Adaptativo)").size(12))
-            .style(if current_columns == crate::config::GridColumnsConfig::Auto { primary_button } else { secondary_button })
-            .padding([6, 12])
-            .on_press(on_select_home_columns(crate::config::GridColumnsConfig::Auto)),
-        button(text("2").size(12))
-            .style(if current_columns == crate::config::GridColumnsConfig::Cols2 { primary_button } else { secondary_button })
-            .padding([6, 12])
-            .on_press(on_select_home_columns(crate::config::GridColumnsConfig::Cols2)),
-        button(text("5").size(12))
-            .style(if current_columns == crate::config::GridColumnsConfig::Cols5 { primary_button } else { secondary_button })
-            .padding([6, 12])
-            .on_press(on_select_home_columns(crate::config::GridColumnsConfig::Cols5)),
-        button(text("6").size(12))
-            .style(if current_columns == crate::config::GridColumnsConfig::Cols6 { primary_button } else { secondary_button })
-            .padding([6, 12])
-            .on_press(on_select_home_columns(crate::config::GridColumnsConfig::Cols6)),
-    ]
-    .spacing(8);
+            let audio_options = [
+                PreferredAudioLanguage::Original,
+                PreferredAudioLanguage::Spanish,
+                PreferredAudioLanguage::English,
+            ];
+            let mut audio_row = row![].spacing(6).align_y(Alignment::Center);
+            for a in audio_options {
+                let is_selected = a == current_audio_lang;
+                let btn = button(text(a.label()).size(12))
+                    .style(segmented_button(is_selected))
+                    .padding([5, 10])
+                    .on_press(on_select_audio_lang(a));
+                audio_row = audio_row.push(btn);
+            }
 
-    let card_appearance = section_card(
-        column![
-            text("Diseño y Cuadrícula del Home").size(13).color(COLOR_TEXT_PRIMARY),
-            row![
-                text("Bordes:").size(12).color(COLOR_TEXT_SECONDARY).width(Length::Fixed(80.0)),
-                style_row,
+            let fallback_hint = text(
+                "Fallback Inteligente: Si el video no dispone de la calidad o códec seleccionado, Mitub desciende en cascada (8K -> 4K -> 1440p -> 1080p -> 720p y AV1 -> VP9 -> H.264) asegurando máxima fidelidad sin interrupciones.",
+            )
+            .size(11)
+            .color(COLOR_TEXT_SECONDARY);
+
+            column![
+                text("Preferencias de Reproducción").size(15).color(COLOR_TEXT_PRIMARY),
+                section_card(
+                    column![
+                        column![
+                            text("Resolución Máxima").size(12).color(COLOR_TEXT_SECONDARY),
+                            res_row,
+                        ].spacing(6),
+                        column![
+                            text("Códec Preferido").size(12).color(COLOR_TEXT_SECONDARY),
+                            codec_row,
+                        ].spacing(6),
+                        column![
+                            text("Pista de Audio Predeterminada").size(12).color(COLOR_TEXT_SECONDARY),
+                            audio_row,
+                        ].spacing(6),
+                        fallback_hint,
+                    ]
+                    .spacing(12),
+                ),
             ]
-            .spacing(10)
-            .align_y(Alignment::Center),
-            row![
-                text("Columnas:").size(12).color(COLOR_TEXT_SECONDARY).width(Length::Fixed(80.0)),
-                cols_row,
+            .spacing(12)
+            .into()
+        }
+
+        SettingsCategory::Appearance => {
+            let style_row = row![
+                button(text("Squircle (YouTube)").size(12))
+                    .style(segmented_button(current_card_style == crate::config::CardStyle::Squircle))
+                    .padding([5, 12])
+                    .on_press(on_select_card_style(crate::config::CardStyle::Squircle)),
+                button(text("Rectangular").size(12))
+                    .style(segmented_button(current_card_style == crate::config::CardStyle::Rectangular))
+                    .padding([5, 12])
+                    .on_press(on_select_card_style(crate::config::CardStyle::Rectangular)),
             ]
-            .spacing(10)
-            .align_y(Alignment::Center),
-            text("YouTube Desktop usa 4 columnas por defecto con esquinas Squircle (12px). Puedes personalizar a rectangulares o cambiar columnas sin saltos de layout.")
-                .size(11)
-                .color(COLOR_TEXT_SECONDARY),
-        ]
-        .spacing(10),
-    );
+            .spacing(6);
 
-    let card_playback = section_card(
-        column![
-            defaults_heading,
-            row![
-                text("Calidad:").size(12).color(COLOR_TEXT_SECONDARY).width(Length::Fixed(80.0)),
-                res_row,
+            let cols_row = row![
+                button(text("4 (Original)").size(12))
+                    .style(segmented_button(current_columns == crate::config::GridColumnsConfig::Cols4))
+                    .padding([5, 10])
+                    .on_press(on_select_home_columns(crate::config::GridColumnsConfig::Cols4)),
+                button(text("Auto").size(12))
+                    .style(segmented_button(current_columns == crate::config::GridColumnsConfig::Auto))
+                    .padding([5, 10])
+                    .on_press(on_select_home_columns(crate::config::GridColumnsConfig::Auto)),
+                button(text("2").size(12))
+                    .style(segmented_button(current_columns == crate::config::GridColumnsConfig::Cols2))
+                    .padding([5, 10])
+                    .on_press(on_select_home_columns(crate::config::GridColumnsConfig::Cols2)),
+                button(text("5").size(12))
+                    .style(segmented_button(current_columns == crate::config::GridColumnsConfig::Cols5))
+                    .padding([5, 10])
+                    .on_press(on_select_home_columns(crate::config::GridColumnsConfig::Cols5)),
+                button(text("6").size(12))
+                    .style(segmented_button(current_columns == crate::config::GridColumnsConfig::Cols6))
+                    .padding([5, 10])
+                    .on_press(on_select_home_columns(crate::config::GridColumnsConfig::Cols6)),
             ]
-            .spacing(10)
-            .align_y(Alignment::Center),
-            row![
-                text("Códec:").size(12).color(COLOR_TEXT_SECONDARY).width(Length::Fixed(80.0)),
-                codec_row,
+            .spacing(6);
+
+            column![
+                text("Diseño y Cuadrícula").size(15).color(COLOR_TEXT_PRIMARY),
+                section_card(
+                    column![
+                        column![
+                            text("Bordes de Miniaturas").size(12).color(COLOR_TEXT_SECONDARY),
+                            style_row,
+                        ].spacing(6),
+                        column![
+                            text("Columnas de la Cuadrícula del Home").size(12).color(COLOR_TEXT_SECONDARY),
+                            cols_row,
+                        ].spacing(6),
+                        text("YouTube Desktop usa 4 columnas por defecto con esquinas Squircle (12px). Puedes personalizar a rectangulares o cambiar columnas sin saltos de layout.")
+                            .size(11)
+                            .color(COLOR_TEXT_SECONDARY),
+                    ]
+                    .spacing(12),
+                ),
             ]
-            .spacing(10)
-            .align_y(Alignment::Center),
-            row![
-                text("Audio:").size(12).color(COLOR_TEXT_SECONDARY).width(Length::Fixed(80.0)),
-                audio_row,
+            .spacing(12)
+            .into()
+        }
+
+        SettingsCategory::System => {
+            let row_auto_pip = row![
+                column![
+                    text("PiP Automático al cambiar de ventana (Alt+Tab)").size(13).color(COLOR_TEXT_PRIMARY),
+                    text("Activa la ventana flotante automáticamente al cambiar a otra app y la restaura al volver.")
+                        .size(11)
+                        .color(COLOR_TEXT_SECONDARY),
+                ]
+                .spacing(2)
+                .width(Length::Fill),
+                render_toggle_switch(auto_pip_on_unfocus, on_toggle_auto_pip),
             ]
-            .spacing(10)
-            .align_y(Alignment::Center),
-            fallback_hint,
-        ]
-        .spacing(10),
-    );
+            .spacing(12)
+            .align_y(Alignment::Center);
 
-    let card_features = section_card(
-        column![
-            text("Multitarea, Pestañas y Sistema").size(13).color(COLOR_TEXT_PRIMARY),
-            auto_pip_btn,
-            auto_pip_hint,
-            Space::with_height(Length::Fixed(4.0)),
-            buffer_tabs_btn,
-            buffer_tabs_hint,
-            Space::with_height(Length::Fixed(4.0)),
-            close_to_tray_btn,
-            close_to_tray_hint,
-        ]
-        .spacing(8),
-    );
+            let row_buffer_tabs = row![
+                column![
+                    text("Buffer y Precarga Completa en Pestañas").size(13).color(COLOR_TEXT_PRIMARY),
+                    text("Descarga el video completo en segundo plano para saltar de pestaña y buscar con 0ms de espera.")
+                        .size(11)
+                        .color(COLOR_TEXT_SECONDARY),
+                ]
+                .spacing(2)
+                .width(Length::Fill),
+                render_toggle_switch(full_buffer_tabs, on_toggle_full_buffer_tabs),
+            ]
+            .spacing(12)
+            .align_y(Alignment::Center);
 
-    let card_cache = section_card(
-        column![
-            cache_heading,
-            cache_controls_row,
-            cache_hint,
-        ]
-        .spacing(8),
-    );
+            let row_tray = row![
+                column![
+                    text("Cerrar a la Bandeja del Sistema (Segundo plano)").size(13).color(COLOR_TEXT_PRIMARY),
+                    text("Al pulsar la X de la ventana, mantiene la app y el audio sonando en la bandeja del sistema.")
+                        .size(11)
+                        .color(COLOR_TEXT_SECONDARY),
+                ]
+                .spacing(2)
+                .width(Length::Fill),
+                render_toggle_switch(close_to_tray, on_toggle_close_to_tray),
+            ]
+            .spacing(12)
+            .align_y(Alignment::Center);
 
-    let card_auth = section_card(
-        column![
-            auth_heading,
-            auth_action_row,
-        ]
-        .spacing(10),
-    );
+            column![
+                text("Multitarea y Sistema").size(15).color(COLOR_TEXT_PRIMARY),
+                section_card(
+                    column![
+                        row_auto_pip,
+                        container(Space::with_height(Length::Fixed(1.0)))
+                            .width(Length::Fill)
+                            .style(|_t| container::Style {
+                                background: Some(iced::Color::from_rgba(1.0, 1.0, 1.0, 0.05).into()),
+                                ..container::Style::default()
+                            }),
+                        row_buffer_tabs,
+                        container(Space::with_height(Length::Fixed(1.0)))
+                            .width(Length::Fill)
+                            .style(|_t| container::Style {
+                                background: Some(iced::Color::from_rgba(1.0, 1.0, 1.0, 0.05).into()),
+                                ..container::Style::default()
+                            }),
+                        row_tray,
+                    ]
+                    .spacing(10),
+                ),
+            ]
+            .spacing(12)
+            .into()
+        }
 
-    let modal_content = iced::widget::scrollable(
-        column![
-            profile_header,
-            card_nav,
-            card_appearance,
-            card_playback,
-            card_features,
-            card_cache,
-            card_auth,
-            row![status, Space::with_width(Length::Fill), close_btn].align_y(Alignment::Center),
-        ]
-        .spacing(14),
+        SettingsCategory::Storage => {
+            let current_idx = limit_to_index(max_cache_size_bytes);
+            let current_limit_label = CACHE_LIMIT_LABELS.get(current_idx).copied().unwrap_or("5 GB (Estándar)");
+
+            let cache_slider = slider(
+                0..=5_u8,
+                current_idx as u8,
+                move |val| on_change_cache_limit(val as usize),
+            )
+            .step(1_u8)
+            .style(youtube_seek_slider)
+            .width(Length::Fixed(240.0));
+
+            let clear_cache_btn = button(
+                row![
+                    icon_trash(13.0),
+                    text(format!("Limpiar caché ({})", format_size(current_cache_size_bytes))).size(12),
+                ]
+                .spacing(6)
+                .align_y(Alignment::Center),
+            )
+            .style(secondary_button)
+            .padding([6, 12])
+            .on_press(on_clear_cache);
+
+            let cache_slider_col = column![
+                row![
+                    text("Tope: ").size(12).color(COLOR_TEXT_SECONDARY),
+                    text(current_limit_label).size(12).color(COLOR_ACCENT_RED),
+                    Space::with_width(Length::Fixed(12.0)),
+                    text(format!("En disco: {}", format_size(current_cache_size_bytes))).size(12).color(COLOR_TEXT_SECONDARY),
+                ]
+                .align_y(Alignment::Center),
+                cache_slider,
+                row![
+                    text("1 GB").size(10).color(COLOR_TEXT_SECONDARY),
+                    Space::with_width(Length::Fill),
+                    text("2 GB").size(10).color(COLOR_TEXT_SECONDARY),
+                    Space::with_width(Length::Fill),
+                    text("5 GB").size(10).color(COLOR_ACCENT_RED),
+                    Space::with_width(Length::Fill),
+                    text("10 GB").size(10).color(COLOR_TEXT_SECONDARY),
+                    Space::with_width(Length::Fill),
+                    text("20 GB").size(10).color(COLOR_TEXT_SECONDARY),
+                    Space::with_width(Length::Fill),
+                    text("Ilimitado").size(10).color(COLOR_TEXT_SECONDARY),
+                ]
+                .width(Length::Fixed(240.0)),
+            ]
+            .spacing(4);
+
+            let cache_controls_row = row![
+                cache_slider_col,
+                Space::with_width(Length::Fixed(16.0)),
+                clear_cache_btn,
+            ]
+            .align_y(Alignment::Center);
+
+            column![
+                text("Almacenamiento y Caché").size(15).color(COLOR_TEXT_PRIMARY),
+                section_card(
+                    column![
+                        text("Límite de Caché de Video").size(12).color(COLOR_TEXT_SECONDARY),
+                        cache_controls_row,
+                        text("Almacenamiento persistente en disco (~/.cache/mitub/video_cache). Al alcanzar el tope configurado, Mitub purga automáticamente los videos más antiguos (LRU).")
+                            .size(11)
+                            .color(COLOR_TEXT_SECONDARY),
+                    ]
+                    .spacing(10),
+                ),
+            ]
+            .spacing(12)
+            .into()
+        }
+
+        SettingsCategory::Account => {
+            let subs_nav_btn = button(
+                row![
+                    icon_subscriptions(15.0),
+                    text("Suscripciones").size(12).color(COLOR_TEXT_PRIMARY),
+                ]
+                .spacing(6)
+                .align_y(Alignment::Center),
+            )
+            .style(secondary_button)
+            .padding([7, 12])
+            .on_press(on_open_subscriptions);
+
+            let history_nav_btn = button(
+                row![
+                    icon_history(15.0),
+                    text("Historial").size(12).color(COLOR_TEXT_PRIMARY),
+                ]
+                .spacing(6)
+                .align_y(Alignment::Center),
+            )
+            .style(secondary_button)
+            .padding([7, 12])
+            .on_press(on_open_history);
+
+            let playlists_nav_btn = button(
+                row![
+                    icon_playlist(15.0),
+                    text("Playlists").size(12).color(COLOR_TEXT_PRIMARY),
+                ]
+                .spacing(6)
+                .align_y(Alignment::Center),
+            )
+            .style(secondary_button)
+            .padding([7, 12])
+            .on_press(on_open_playlists);
+
+            let nav_card = section_card(
+                column![
+                    text("Tu Biblioteca de YouTube").size(13).color(COLOR_TEXT_PRIMARY),
+                    row![subs_nav_btn, history_nav_btn, playlists_nav_btn]
+                        .spacing(8)
+                        .align_y(Alignment::Center),
+                ]
+                .spacing(8),
+            );
+
+            let auth_action_content: Element<'a, Message> = if is_authenticated {
+                let logout_btn = button(
+                    row![
+                        icon_logout(13.0),
+                        text("Cerrar Sesión").size(12).color(COLOR_TEXT_PRIMARY),
+                    ]
+                    .spacing(6)
+                    .align_y(Alignment::Center),
+                )
+                .style(secondary_button)
+                .padding([6, 14])
+                .on_press(on_logout);
+
+                row![
+                    text("Sesión sincronizada activamente.")
+                        .size(12)
+                        .color(COLOR_TEXT_SECONDARY),
+                    Space::with_width(Length::Fill),
+                    logout_btn,
+                ]
+                .align_y(Alignment::Center)
+                .into()
+            } else {
+                let firefox_btn = button(
+                    row![
+                        icon_user(13.0),
+                        text("Importar desde Firefox").size(12).color(COLOR_TEXT_PRIMARY),
+                    ]
+                    .spacing(6)
+                    .align_y(Alignment::Center),
+                )
+                .style(secondary_button)
+                .padding([6, 12])
+                .on_press(on_import_firefox);
+
+                let chrome_btn = button(
+                    row![
+                        icon_user(13.0),
+                        text("Importar desde Chrome").size(12).color(COLOR_TEXT_PRIMARY),
+                    ]
+                    .spacing(6)
+                    .align_y(Alignment::Center),
+                )
+                .style(secondary_button)
+                .padding([6, 12])
+                .on_press(on_import_chrome);
+
+                let input = text_input("O pega aquí tu Cookie: SAPISID=...; HSID=...", raw_cookie_input)
+                    .on_input(on_cookie_input)
+                    .style(search_input)
+                    .padding(8);
+
+                let save_btn = button(text("Guardar Cookies").size(12))
+                    .style(primary_button)
+                    .padding([6, 12])
+                    .on_press(on_save_raw_cookie);
+
+                column![
+                    text(
+                        "Inicia sesión para sincronizar tus suscripciones, historial y recomendaciones.\nTus credenciales se conservan localmente y nunca salen de tu equipo.",
+                    )
+                    .size(11)
+                    .color(COLOR_TEXT_SECONDARY),
+                    row![firefox_btn, chrome_btn].spacing(8).align_y(Alignment::Center),
+                    input,
+                    row![save_btn].align_y(Alignment::Center),
+                ]
+                .spacing(8)
+                .into()
+            };
+
+            let auth_card = section_card(
+                column![
+                    text("Gestión de Cuenta").size(13).color(COLOR_TEXT_PRIMARY),
+                    auth_action_content,
+                ]
+                .spacing(8),
+            );
+
+            column![
+                text("Cuenta y Biblioteca").size(15).color(COLOR_TEXT_PRIMARY),
+                nav_card,
+                auth_card,
+                text(status_msg).size(11).color(COLOR_TEXT_SECONDARY),
+            ]
+            .spacing(12)
+            .into()
+        }
+    };
+
+    let content_scroll = scrollable(
+        container(content)
+            .padding(iced::Padding { top: 0.0, right: 8.0, bottom: 0.0, left: 0.0 })
+            .width(Length::Fill)
     )
-    .height(Length::Shrink);
+    .height(Length::Fill);
+
+    let modal_body = row![
+        sidebar,
+        container(Space::with_width(Length::Fixed(1.0)))
+            .height(Length::Fill)
+            .style(|_t| container::Style {
+                background: Some(iced::Color::from_rgba(1.0, 1.0, 1.0, 0.08).into()),
+                ..container::Style::default()
+            }),
+        container(content_scroll)
+            .width(Length::Fill)
+            .height(Length::Fill),
+    ]
+    .spacing(14)
+    .height(Length::Fill);
+
+    let modal_content = column![
+        profile_header,
+        container(Space::with_height(Length::Fixed(1.0)))
+            .width(Length::Fill)
+            .style(|_t| container::Style {
+                background: Some(iced::Color::from_rgba(1.0, 1.0, 1.0, 0.08).into()),
+                ..container::Style::default()
+            }),
+        modal_body,
+    ]
+    .spacing(12)
+    .height(Length::Fill);
 
     let modal_box = container(modal_content)
         .style(card_container)
-        .padding(22)
-        .max_height(720.0)
-        .width(Length::Fixed(680.0));
+        .padding(20)
+        .width(Length::Fixed(760.0))
+        .height(Length::Fixed(520.0));
 
     let clickable_modal = mouse_area(modal_box);
 

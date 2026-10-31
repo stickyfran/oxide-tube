@@ -255,3 +255,64 @@ pub fn youtube_seek_slider(_theme: &iced::Theme, _status: iced::widget::slider::
         },
     }
 }
+
+pub fn settings_category_button(is_active: bool) -> impl Fn(&iced::Theme, button::Status) -> button::Style {
+    move |_theme, status| {
+        if is_active {
+            button::Style {
+                background: Some(Color::from_rgb8(0xcc, 0x00, 0x00).into()),
+                text_color: Color::WHITE,
+                border: border::rounded(10)
+                    .color(Color::from_rgb8(0xff, 0x33, 0x33))
+                    .width(1.0),
+                ..button::Style::default()
+            }
+        } else {
+            match status {
+                button::Status::Hovered => button::Style {
+                    background: Some(Color::from_rgba(1.0, 1.0, 1.0, 0.08).into()),
+                    text_color: COLOR_TEXT_PRIMARY,
+                    border: border::rounded(10),
+                    ..button::Style::default()
+                },
+                _ => button::Style {
+                    background: Some(Color::TRANSPARENT.into()),
+                    text_color: COLOR_TEXT_SECONDARY,
+                    border: border::rounded(10),
+                    ..button::Style::default()
+                },
+            }
+        }
+    }
+}
+
+pub fn segmented_button(is_selected: bool) -> impl Fn(&iced::Theme, button::Status) -> button::Style {
+    move |_theme, status| {
+        if is_selected {
+            button::Style {
+                background: Some(Color::from_rgb8(0xcc, 0x00, 0x00).into()),
+                text_color: Color::WHITE,
+                border: border::rounded(8)
+                    .color(Color::from_rgb8(0xff, 0x33, 0x33))
+                    .width(1.0),
+                ..button::Style::default()
+            }
+        } else {
+            match status {
+                button::Status::Hovered => button::Style {
+                    background: Some(Color::from_rgba(1.0, 1.0, 1.0, 0.10).into()),
+                    text_color: COLOR_TEXT_PRIMARY,
+                    border: border::rounded(8).color(COLOR_BORDER).width(1.0),
+                    ..button::Style::default()
+                },
+                _ => button::Style {
+                    background: Some(Color::from_rgb8(0x1e, 0x1e, 0x22).into()),
+                    text_color: COLOR_TEXT_SECONDARY,
+                    border: border::rounded(8).color(COLOR_BORDER).width(1.0),
+                    ..button::Style::default()
+                },
+            }
+        }
+    }
+}
+

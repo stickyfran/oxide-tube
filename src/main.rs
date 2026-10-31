@@ -144,6 +144,7 @@ pub enum Message {
     ScrollTabsRight,
     OpenEmptyTab,
     ToggleLoginModal,
+    SelectSettingsCategory(ui::SettingsCategory),
     CookieInputChanged(String),
     SaveRawCookie,
     ImportFirefoxCookies,
@@ -227,8 +228,10 @@ pub struct MitubApp {
     theater_mode: bool,
     is_fullscreen: bool,
     description_expanded: bool,
+    is_ctrl_pressed: bool,
     chat_collapsed: bool,
     show_auth_modal: bool,
+    selected_settings_tab: ui::SettingsCategory,
     auth_cookie_input: String,
     auth_status: String,
     user_avatar_url: Option<String>,
@@ -245,6 +248,7 @@ pub struct MitubApp {
     in_flight_thumbnails: std::collections::HashSet<String>,
     active_subtitles: Vec<innertube::SubtitleCue>,
     watch_scroll_y: f32,
+    last_watch_thumb_check_y: f32,
     saved_volume: f32,
     main_window_id: Option<Id>,
     pip_window_id: Option<Id>,
@@ -1163,8 +1167,10 @@ impl MitubApp {
             theater_mode: app_theater,
             is_fullscreen: false,
             description_expanded: false,
+            is_ctrl_pressed: false,
             chat_collapsed: false,
             show_auth_modal: false,
+            selected_settings_tab: ui::SettingsCategory::Playback,
             auth_cookie_input: String::new(),
             auth_status: if is_authed {
                 "[OK] Sesion activa de YouTube".to_string()
@@ -1185,6 +1191,7 @@ impl MitubApp {
             in_flight_thumbnails: std::collections::HashSet::new(),
             active_subtitles: Vec::new(),
             watch_scroll_y: 0.0,
+            last_watch_thumb_check_y: 0.0,
             saved_volume: app_volume,
             main_window_id: Some(main_id),
             pip_window_id: None,
@@ -1658,6 +1665,25 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
         self.queue_thumbnail_download_delayed(url, 0)
     }
 
+    fn ensure_watch_thumbnails_queued(&mut self, details: &innertube::WatchDetails) -> Task<Message> {
+        let mut tasks = Vec::new();
+        for rec in &details.recommended_videos {
+            if let Some(task) = self.queue_thumbnail_download(&rec.thumbnail_url) {
+                tasks.push(task);
+            }
+        }
+        if !details.channel_avatar.is_empty() {
+            if let Some(task) = self.queue_thumbnail_download(&details.channel_avatar) {
+                tasks.push(task);
+            }
+        }
+        if tasks.is_empty() {
+            Task::none()
+        } else {
+            Task::batch(tasks)
+        }
+    }
+
     fn queue_thumbnail_download_delayed(&mut self, url: &str, delay_ms: u64) -> Option<Task<Message>> {
         static THUMB_DECODE_SEM: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(3);
         if url.is_empty() || self.thumbnail_cache.contains_key(url) || self.in_flight_thumbnails.contains(url) {
@@ -1922,25 +1948,30 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
             }
 
             Message::ClosePip => {
+                let was_unfocused_auto = self.auto_pip_triggered_by_unfocus;
                 self.auto_pip_triggered_by_unfocus = false;
                 trigger_save_kwin_pip_position();
                 if let Some(pip_id) = self.pip_window_id.take() {
                     crate::diagnostics::log_pip("Close", 0, "Closing PiP and returning to main window");
                     let pip_vid = self.playing_video_id.clone();
-                    if let Some(details) = self.pip_watch_details.take().or_else(|| self.watch_details.clone()) {
-                        self.watch_details = Some(details.clone());
-                        if !matches!(self.current_view, ViewMode::Watch(_) | ViewMode::VideoFullscreen) {
-                            self.current_view = ViewMode::Watch(details.video_id.clone());
+                    if was_unfocused_auto {
+                        if let Some(details) = self.pip_watch_details.take().or_else(|| self.watch_details.clone()) {
+                            self.watch_details = Some(details.clone());
+                            if !matches!(self.current_view, ViewMode::Watch(_) | ViewMode::VideoFullscreen) {
+                                self.current_view = ViewMode::Watch(details.video_id.clone());
+                            }
+                        } else if let Some(ref vid) = pip_vid {
+                            if !matches!(self.current_view, ViewMode::Watch(_) | ViewMode::VideoFullscreen) {
+                                self.current_view = ViewMode::Watch(vid.clone());
+                            }
                         }
-                    } else if let Some(ref vid) = pip_vid {
-                        if !matches!(self.current_view, ViewMode::Watch(_) | ViewMode::VideoFullscreen) {
-                            self.current_view = ViewMode::Watch(vid.clone());
+                        if let Some(ref vid) = pip_vid {
+                            if let Some(idx) = self.tabs.iter().position(|t| &t.video_id == vid) {
+                                self.active_tab_idx = Some(idx);
+                            }
                         }
-                    }
-                    if let Some(ref vid) = pip_vid {
-                        if let Some(idx) = self.tabs.iter().position(|t| &t.video_id == vid) {
-                            self.active_tab_idx = Some(idx);
-                        }
+                    } else {
+                        self.pip_watch_details = None;
                     }
                     if let Some(player) = &self.player {
                         let target_pos = if player.get_position_ms() > 0 {
@@ -3172,11 +3203,38 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                 // or thrashing iced_wgpu texture atlas Handle IDs.
                 let limit = if self.power_profile == PowerProfile::Battery { 220 } else { 320 };
                 let mut evicted = false;
-                while self.thumbnail_cache.len() >= limit {
+
+                // Collect protected URLs (current watch recommendations + channel avatar + open tabs)
+                let mut protected_urls = std::collections::HashSet::new();
+                for tab in &self.tabs {
+                    if !tab.thumbnail_url.is_empty() {
+                        protected_urls.insert(tab.thumbnail_url.as_str());
+                    }
+                }
+                if let Some(details) = &self.watch_details {
+                    if !details.channel_avatar.is_empty() {
+                        protected_urls.insert(details.channel_avatar.as_str());
+                    }
+                    for rec in &details.recommended_videos {
+                        if !rec.thumbnail_url.is_empty() {
+                            protected_urls.insert(rec.thumbnail_url.as_str());
+                        }
+                    }
+                }
+
+                let mut attempts = 0;
+                let max_attempts = self.thumbnail_order.len();
+                while self.thumbnail_cache.len() >= limit && attempts < max_attempts {
+                    attempts += 1;
                     if let Some(first_key) = self.thumbnail_order.pop_front() {
-                        self.thumbnail_cache.remove(&first_key);
-                        self.blurred_thumbnails.remove(&first_key);
-                        evicted = true;
+                        if protected_urls.contains(first_key.as_str()) && self.thumbnail_order.len() > protected_urls.len() {
+                            // Cycle protected URL to the back of the queue so it survives LRU eviction
+                            self.thumbnail_order.push_back(first_key);
+                        } else {
+                            self.thumbnail_cache.remove(&first_key);
+                            self.blurred_thumbnails.remove(&first_key);
+                            evicted = true;
+                        }
                     } else {
                         break;
                     }
@@ -3212,6 +3270,12 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
             Message::WatchScrolled(viewport) => {
                 self.watch_scroll_y = viewport.absolute_offset().y;
                 self.sync_player_viewport();
+                if (self.watch_scroll_y - self.last_watch_thumb_check_y).abs() >= 180.0 {
+                    self.last_watch_thumb_check_y = self.watch_scroll_y;
+                    if let Some(details) = self.watch_details.clone() {
+                        return self.ensure_watch_thumbnails_queued(&details);
+                    }
+                }
                 Task::none()
             }
 
@@ -3482,13 +3546,30 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
             }
 
             Message::VolumeChanged(vol) => {
-                self.osd_state.volume = vol;
-                self.config.saved_volume = Some(vol);
-                self.config.is_muted = Some(vol <= 0.001);
+                let clamped_vol = vol.clamp(0.0, 1.0);
+                self.osd_state.volume = clamped_vol;
+                self.config.saved_volume = Some(clamped_vol);
+                self.config.is_muted = Some(clamped_vol <= 0.001);
                 self.config.save_async();
                 if let Some(player) = &self.player {
-                    player.set_volume(vol as f64);
+                    player.set_volume(clamped_vol as f64);
                 }
+                let pct = (clamped_vol * 100.0).round() as u32;
+                let vol_icon = if clamped_vol <= 0.001 {
+                    "🔇 Silenciado"
+                } else if clamped_vol < 0.35 {
+                    "🔉"
+                } else {
+                    "🔊"
+                };
+                self.toast_message = Some((
+                    if clamped_vol <= 0.001 {
+                        "🔇 Silenciado".to_string()
+                    } else {
+                        format!("{vol_icon}  {pct}%")
+                    },
+                    std::time::Instant::now(),
+                ));
                 Task::none()
             }
 
@@ -3827,8 +3908,6 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
 
                 let (pip_id, open_task) = window::open(pip_settings);
                 self.pip_window_id = Some(pip_id);
-                self.focused_window = Some(pip_id);
-                self.is_window_focused = true;
 
                 let disp_addr = self.main_window_handles.0;
                 let handle_task = open_task
@@ -3843,8 +3922,7 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                     })
                     .map(|(disp, surf)| Message::PipHandleAcquired(disp, surf));
 
-                let focus_task = window::gain_focus(pip_id);
-                let mut tasks = vec![handle_task, focus_task];
+                let mut tasks = vec![handle_task];
                 if self.is_fullscreen {
                     self.is_fullscreen = false;
                     if let Some(details) = &self.watch_details {
@@ -4731,21 +4809,10 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                         }
                     }
 
-                    let is_currently_playing = self.osd_state.is_playing
-                        && self.player.as_ref().map(|p| p.is_playing()).unwrap_or(false)
-                        && matches!(self.current_view, ViewMode::Watch(_) | ViewMode::VideoFullscreen)
-                        && self.watch_details.is_some();
-
                     self.active_tab_idx = Some(idx);
                     self.save_session();
                     let vid = self.tabs[idx].video_id.clone();
                     if vid.is_empty() {
-                        let auto_pip_task = if is_currently_playing && self.pip_window_id.is_none() {
-                            self.update(Message::TogglePip)
-                        } else {
-                            Task::none()
-                        };
-
                         self.current_view = ViewMode::Home;
                         self.search_query.clear();
                         self.search_input_focused = true;
@@ -4753,7 +4820,7 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                         self.sync_player_viewport();
                         let focus_task = iced::widget::text_input::focus(iced::widget::text_input::Id::new("main_search_input"));
                         let scroll_top = self.reset_home_scroll_task();
-                        return Task::batch([auto_pip_task, focus_task, scroll_top]);
+                        return Task::batch([focus_task, scroll_top]);
                     } else {
                         // Si es el video que ya está reproduciéndose (ej. en background o PiP), retornar fluidamente
                         if self.playing_video_id.as_deref() == Some(vid.as_str()) {
@@ -4763,8 +4830,11 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                             } else {
                                 self.previous_view = self.current_view.clone();
                                 self.current_view = ViewMode::Watch(vid.clone());
-                                if let Some(cached) = self.tab_details_cache.get(&vid) {
-                                    self.watch_details = Some(Arc::clone(cached));
+                                if let Some(cached) = self.tab_details_cache.get(&vid).cloned() {
+                                    let thumb_task = self.ensure_watch_thumbnails_queued(&cached);
+                                    self.watch_details = Some(cached);
+                                    self.sync_player_viewport();
+                                    return Task::batch([scroll_reset_task, thumb_task]);
                                 }
                                 self.sync_player_viewport();
                                 return scroll_reset_task;
@@ -4807,9 +4877,10 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                             self.inactive_tab_osd_state.is_buffering = false;
                             self.inactive_tab_osd_state.has_playback_error = false;
 
+                            let thumb_task = self.ensure_watch_thumbnails_queued(&cached);
                             self.watch_details = Some(cached);
                             self.sync_player_viewport();
-                            return scroll_reset_task;
+                            return Task::batch([scroll_reset_task, thumb_task]);
                         } else {
                             // Video diferente: NO poner pausa al anterior ni reproducir automáticamente este,
                             // ni abrir ventana PiP forzada al cambiar de pestañas.
@@ -4933,17 +5004,6 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
             }
 
             Message::OpenEmptyTab => {
-                let is_currently_playing = self.osd_state.is_playing
-                    && self.player.as_ref().map(|p| p.is_playing()).unwrap_or(false)
-                    && matches!(self.current_view, ViewMode::Watch(_) | ViewMode::VideoFullscreen)
-                    && self.watch_details.is_some();
-
-                let pip_task = if is_currently_playing && self.pip_window_id.is_none() {
-                    self.update(Message::TogglePip)
-                } else {
-                    Task::none()
-                };
-
                 let new_tab = ui::VideoTab {
                     video_id: String::new(),
                     title: "Nueva pestaña".to_string(),
@@ -4961,13 +5021,6 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                 self.search_query.clear();
                 self.search_input_focused = true;
                 self.show_suggestions = false;
-                if self.pip_window_id.is_none() && !is_currently_playing {
-                    self.watch_details = None;
-                    if let Some(player) = &self.player {
-                        player.stop();
-                    }
-                    self.power_manager.set_screensaver_inhibit(false);
-                }
                 self.sync_player_viewport();
 
                 let focus_task = iced::widget::text_input::focus(iced::widget::text_input::Id::new("main_search_input"));
@@ -4977,7 +5030,7 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                     iced::widget::scrollable::Id::new("tabs_scrollable"),
                     iced::widget::scrollable::AbsoluteOffset { x: target_x, y: 0.0 },
                 );
-                return Task::batch([pip_task, focus_task, scroll_task]);
+                return Task::batch([focus_task, scroll_task]);
             }
 
             Message::WindowMaximized(is_max) => {
@@ -5060,6 +5113,11 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                 } else {
                     Task::none()
                 }
+            }
+
+            Message::SelectSettingsCategory(cat) => {
+                self.selected_settings_tab = cat;
+                Task::none()
             }
 
             Message::CookieInputChanged(raw) => {
@@ -5378,7 +5436,16 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                         self.osd_state.hover_seek_ratio = None;
                         self.is_seeking_drag = false;
                     }
+                    iced::Event::Keyboard(iced::keyboard::Event::ModifiersChanged(modifiers)) => {
+                        self.is_ctrl_pressed = modifiers.control() || modifiers.command();
+                        return Task::none();
+                    }
+                    iced::Event::Keyboard(iced::keyboard::Event::KeyReleased { modifiers, .. }) => {
+                        self.is_ctrl_pressed = modifiers.control() || modifiers.command();
+                        return Task::none();
+                    }
                     iced::Event::Keyboard(iced::keyboard::Event::KeyPressed { key, modifiers, .. }) => {
+                        self.is_ctrl_pressed = modifiers.control() || modifiers.command();
                         if self.show_auth_modal {
                             if let Key::Named(Named::Escape) = key {
                                 self.show_auth_modal = false;
@@ -5608,14 +5675,38 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                         }
                     }
                     iced::Event::Mouse(iced::mouse::Event::WheelScrolled { delta }) => {
-                        if Some(win_id) == self.pip_window_id {
-                            let lines = match delta {
-                                iced::mouse::ScrollDelta::Lines { y, .. } => y,
-                                iced::mouse::ScrollDelta::Pixels { y, .. } => y / 20.0,
-                            };
-                            if lines.abs() > 0.05 {
-                                let scale = if lines > 0.0 { 1.10 } else { 0.90 };
-                                return self.update(Message::ScalePip(scale));
+                        let lines = match delta {
+                            iced::mouse::ScrollDelta::Lines { y, .. } => y,
+                            iced::mouse::ScrollDelta::Pixels { y, .. } => y / 20.0,
+                        };
+                        if lines.abs() > 0.05 {
+                            if Some(win_id) == self.pip_window_id {
+                                if self.is_ctrl_pressed {
+                                    let scale = if lines > 0.0 { 1.10 } else { 0.90 };
+                                    return self.update(Message::ScalePip(scale));
+                                } else {
+                                    let step = if lines > 0.0 { 0.05 } else { -0.05 };
+                                    let new_vol = (self.osd_state.volume + step).clamp(0.0, 1.0);
+                                    return self.update(Message::VolumeChanged(new_vol));
+                                }
+                            } else if matches!(self.current_view, ViewMode::Watch(_) | ViewMode::VideoFullscreen) {
+                                let (win_w, win_h) = self.window_size;
+                                let (px, py, pw, ph) = if self.is_fullscreen {
+                                    (0.0, 0.0, win_w, win_h)
+                                } else {
+                                    self.get_windowed_player_rect()
+                                };
+                                let in_player = if let Some(pos) = self.last_cursor_pos {
+                                    pos.x >= px && pos.x <= px + pw && pos.y >= py && pos.y <= py + ph
+                                } else {
+                                    self.is_fullscreen
+                                };
+
+                                if in_player {
+                                    let step = if lines > 0.0 { 0.05 } else { -0.05 };
+                                    let new_vol = (self.osd_state.volume + step).clamp(0.0, 1.0);
+                                    return self.update(Message::VolumeChanged(new_vol));
+                                }
                             }
                         }
                     }
@@ -5881,7 +5972,7 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
     }
 
     pub fn view(&self, id: Id) -> Element<'_, Message> {
-        if Some(id) == self.pip_window_id {
+        if Some(id) == self.pip_window_id || (self.main_window_id.is_some() && Some(id) != self.main_window_id) {
             return self.view_pip();
         }
         self.view_main()
@@ -6216,6 +6307,47 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
                     .style(ui::theme::transparent_player_container)
                     .into(),
             );
+        }
+
+        // Layer 3.5: Volume/toast HUD
+        if let Some((ref msg, instant)) = &self.toast_message {
+            let elapsed = instant.elapsed().as_secs_f32();
+            if elapsed < 1.4 {
+                let alpha = if elapsed > 1.1 {
+                    ((1.4 - elapsed) / 0.3).clamp(0.0, 1.0)
+                } else if elapsed < 0.15 {
+                    (elapsed / 0.15).clamp(0.0, 1.0)
+                } else {
+                    1.0
+                };
+                let toast_badge = container(
+                    text(msg.clone())
+                        .size(13)
+                        .color(COLOR_TEXT_PRIMARY),
+                )
+                .padding([6, 14])
+                .style(move |_t| container::Style {
+                    background: Some(iced::Color::from_rgba(0.06, 0.06, 0.08, 0.90 * alpha).into()),
+                    border: iced::border::rounded(14)
+                        .color(iced::Color::from_rgba(1.0, 1.0, 1.0, 0.20 * alpha))
+                        .width(1.0),
+                    shadow: iced::Shadow {
+                        color: iced::Color::from_rgba(0.0, 0.0, 0.0, 0.40 * alpha),
+                        offset: iced::Vector::new(0.0, 2.0),
+                        blur_radius: 8.0,
+                    },
+                    ..container::Style::default()
+                });
+
+                layers.push(
+                    container(toast_badge)
+                        .width(Length::Fill)
+                        .height(Length::Fill)
+                        .align_x(iced::alignment::Horizontal::Center)
+                        .align_y(iced::alignment::Vertical::Center)
+                        .into()
+                );
+            }
         }
 
         // Layer 4: Native border resize handles with proper directional cursor icons
@@ -6689,23 +6821,30 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
 
         if let Some((ref msg, instant)) = &self.toast_message {
             let elapsed = instant.elapsed().as_secs_f32();
-            if elapsed < 3.0 {
-                let alpha = if elapsed > 2.6 {
-                    ((3.0 - elapsed) / 0.4).clamp(0.0, 1.0)
-                } else if elapsed < 0.2 {
-                    (elapsed / 0.2).clamp(0.0, 1.0)
+            let is_vol = msg.starts_with('🔊') || msg.starts_with('🔉') || msg.starts_with('🔇');
+            let max_duration = if is_vol { 1.4 } else { 2.5 };
+            if elapsed < max_duration {
+                let fade_out = 0.3;
+                let alpha = if elapsed > max_duration - fade_out {
+                    ((max_duration - elapsed) / fade_out).clamp(0.0, 1.0)
+                } else if elapsed < 0.15 {
+                    (elapsed / 0.15).clamp(0.0, 1.0)
                 } else {
                     1.0
                 };
 
                 let toast_widget = container(
                     row![
-                        icon_check_circle(16.0),
+                        if !is_vol {
+                            Element::from(icon_check_circle(16.0))
+                        } else {
+                            Element::from(Space::with_width(Length::Fixed(0.0)))
+                        },
                         text(msg.clone())
                             .size(13)
                             .color(COLOR_TEXT_PRIMARY),
                     ]
-                    .spacing(8)
+                    .spacing(if !is_vol { 8 } else { 0 })
                     .align_y(Alignment::Center),
                 )
                 .padding([10, 18])
@@ -6750,6 +6889,8 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
 
         if self.show_auth_modal {
             layers.push(view_auth_modal(
+                self.selected_settings_tab,
+                Message::SelectSettingsCategory,
                 &self.auth_cookie_input,
                 &self.auth_status,
                 self.user_display_name.as_deref(),
@@ -6837,6 +6978,12 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
                         None
                     }
                 }
+                iced::Event::Keyboard(iced::keyboard::Event::ModifiersChanged(_)) => {
+                    Some(Message::EventOccurred(event, window_id))
+                }
+                iced::Event::Keyboard(iced::keyboard::Event::KeyReleased { .. }) => {
+                    Some(Message::EventOccurred(event, window_id))
+                }
                 iced::Event::Mouse(
                     iced::mouse::Event::ButtonPressed(_)
                     | iced::mouse::Event::ButtonReleased(_)
@@ -6874,7 +7021,10 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
             && !self.osd_state.has_playback_error;
         let has_toast = self.toast_message
             .as_ref()
-            .map(|(_, t)| t.elapsed().as_secs_f32() < 3.0)
+            .map(|(msg, t)| {
+                let max_d = if msg.starts_with('🔊') || msg.starts_with('🔉') || msg.starts_with('🔇') { 1.4 } else { 2.5 };
+                t.elapsed().as_secs_f32() < max_d
+            })
             .unwrap_or(false);
         let has_tab_shake = self.tab_shake_anim
             .map(|(_, t)| t.elapsed().as_secs_f32() < 0.6)

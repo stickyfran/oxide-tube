@@ -674,6 +674,7 @@ async fn run_instance<P, C>(
     let mut ui_caches = FxHashMap::default();
     let mut user_interfaces = ManuallyDrop::new(FxHashMap::default());
     let mut clipboard = Clipboard::unconnected();
+    let mut smooth_scroll: FxHashMap<window::Id, (f32, f32)> = FxHashMap::default();
 
     debug.startup_finished();
 
@@ -993,7 +994,15 @@ async fn run_instance<P, C>(
                                 &mut debug,
                             );
 
-                            if let Some(event) = conversion::window_event(
+                            if let winit::event::WindowEvent::MouseWheel {
+                                delta: winit::event::MouseScrollDelta::LineDelta(dx, dy),
+                                ..
+                            } = window_event {
+                                let rem = smooth_scroll.entry(id).or_insert((0.0, 0.0));
+                                rem.0 += dx * 135.0;
+                                rem.1 += dy * 135.0;
+                                window.raw.request_redraw();
+                            } else if let Some(event) = conversion::window_event(
                                 window_event,
                                 window.state.scale_factor(),
                                 window.state.modifiers(),
@@ -1003,6 +1012,35 @@ async fn run_instance<P, C>(
                         }
                     }
                     event::Event::AboutToWait => {
+                        smooth_scroll.retain(|k, _| window_manager.get(*k).is_some());
+                        for (win_id, rem) in smooth_scroll.iter_mut() {
+                            if rem.0.abs() > 0.5 || rem.1.abs() > 0.5 {
+                                let factor = 0.28;
+                                let step_x = rem.0 * factor;
+                                let step_y = rem.1 * factor;
+                                rem.0 -= step_x;
+                                rem.1 -= step_y;
+                                if rem.0.abs() <= 0.5 {
+                                    rem.0 = 0.0;
+                                }
+                                if rem.1.abs() <= 0.5 {
+                                    rem.1 = 0.0;
+                                }
+                                events.push((
+                                    *win_id,
+                                    core::Event::Mouse(mouse::Event::WheelScrolled {
+                                        delta: mouse::ScrollDelta::Pixels {
+                                            x: step_x,
+                                            y: step_y,
+                                        },
+                                    }),
+                                ));
+                                if let Some(window) = window_manager.get_mut(*win_id) {
+                                    window.raw.request_redraw();
+                                }
+                            }
+                        }
+
                         if events.is_empty() && messages.is_empty() {
                             continue;
                         }
@@ -1090,7 +1128,7 @@ async fn run_instance<P, C>(
 
                             let has_pip = window_manager
                                 .iter_mut()
-                                .any(|(_, w)| w.state.title() == "PiP");
+                                .any(|(_, w)| w.state.title().contains("PiP"));
 
                             for (id, window) in window_manager.iter_mut() {
                                 window.state.synchronize(
@@ -1104,7 +1142,7 @@ async fn run_instance<P, C>(
                                 }
 
                                 let is_background_main_during_pip = has_pip
-                                    && window.state.title() != "PiP"
+                                    && !window.state.title().contains("PiP")
                                     && !window.raw.has_focus()
                                     && matches!(
                                         window.state.cursor(),
