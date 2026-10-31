@@ -3341,6 +3341,7 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                             }
 
                             if let Some(stream) = select_best_stream(&details.video_streams, &self.config) {
+                                let stream_height = stream.height;
                                 let v_uri = stream.playback_uri("v");
                                 let a_uri = select_best_audio_stream(&details.audio_streams, self.config.preferred_audio_lang).map(|s| s.playback_uri("a"));
                                 let seek_target = self
@@ -3354,9 +3355,14 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                                 self.playing_video_id = Some(vid.clone());
                                 self.video_started_at = Some(std::time::Instant::now());
                                 self.osd_state.is_playing = true;
+                                self.inactive_tab_osd_state.is_playing = true;
                                 self.osd_state.first_frame_rendered = false;
                                 self.osd_state.has_playback_error = false;
+                                self.osd_state.play_pause_anim = Some((std::time::Instant::now(), true));
                                 self.seek_suppress_until = Some(std::time::Instant::now() + Duration::from_millis(800));
+                                self.power_manager.set_screensaver_inhibit(true);
+
+                                player.set_stream_buffer_profile(stream_height, self.power_profile);
 
                                 let _ = player.play_stream_with_seek(&v_uri, a_uri.as_deref(), seek_target);
                                 self.sync_player_viewport();

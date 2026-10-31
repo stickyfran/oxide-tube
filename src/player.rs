@@ -778,6 +778,11 @@ impl WaylandZeroCopyPlayer {
                                 first_frame_rendered.store(true, Ordering::SeqCst);
                                 has_error.store(false, Ordering::SeqCst);
                                 *last_error.safe_lock() = None;
+                                let mut is_paused: i32 = 0;
+                                unsafe {
+                                    mpv_get_property(ctx, b"pause\0".as_ptr() as _, MPV_FORMAT_FLAG, &mut is_paused as *mut _ as _);
+                                }
+                                is_playing.store(is_paused == 0, Ordering::SeqCst);
                                 crate::diagnostics::session_first_frame();
                             }
                             MPV_EVENT_END_FILE => {
@@ -1067,7 +1072,7 @@ impl WaylandZeroCopyPlayer {
                     }
 
                     // 3. Reactive sleep: wakes immediately on MPV core events or new render frame notification
-                    let timeout_ms = if is_playing.load(Ordering::Relaxed) { 50 } else { 350 };
+                    let timeout_ms = if is_playing.load(Ordering::Relaxed) { 30 } else { 80 };
                     #[cfg(unix)]
                     {
                         let mut pfds = [
@@ -1274,12 +1279,14 @@ impl WaylandZeroCopyPlayer {
                 mpv_set_property_string(ctx, b"pause\0".as_ptr() as _, b"no\0".as_ptr() as _);
             }
             self.is_playing.store(true, Ordering::SeqCst);
+            self.trigger_worker_wakeup();
         } else {
             // Keep paused to load first frame without autoplaying
             unsafe {
                 mpv_set_property_string(ctx, b"pause\0".as_ptr() as _, b"yes\0".as_ptr() as _);
             }
             self.is_playing.store(false, Ordering::SeqCst);
+            self.trigger_worker_wakeup();
         }
 
         crate::diagnostics::session_pipeline_built();
