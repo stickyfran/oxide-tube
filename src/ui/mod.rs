@@ -736,6 +736,7 @@ pub fn view_auth_modal<'a, Message: Clone + 'static>(
         .color(COLOR_TEXT_PRIMARY);
 
     let res_options = [
+        PreferredResolution::Res8K,
         PreferredResolution::Res4K,
         PreferredResolution::Res1440p,
         PreferredResolution::Res1080p,
@@ -786,7 +787,7 @@ pub fn view_auth_modal<'a, Message: Clone + 'static>(
 
     let fallback_hint = text(
         "Fallback Inteligente Automático: Si el video no dispone de la calidad o códec seleccionado,\n\
-        Mitub descenderá progresivamente en cascada (4K -> 1440p -> 1080p -> 720p y AV1 -> VP9 -> H.264)\n\
+        Mitub descenderá progresivamente en cascada (8K -> 4K -> 1440p -> 1080p -> 720p y AV1 -> VP9 -> H.264)\n\
         garantizando siempre la máxima calidad soportada sin interrupciones ni fallos.",
     )
     .size(11)

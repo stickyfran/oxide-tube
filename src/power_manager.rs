@@ -314,3 +314,19 @@ pub fn trim_process_memory() {
     }
 }
 
+/// Explicitly purges the process Working Set in Windows.
+/// CRITICAL: Must be invoked EXCLUSIVELY when entering idle/minimized state or
+/// after video playback has completely stopped, NEVER during active playback
+/// to avoid micro-stuttering from soft page faults.
+pub fn purge_working_set_on_idle() {
+    unsafe {
+        mi_collect(true);
+    }
+    #[cfg(target_os = "windows")]
+    unsafe {
+        windows_sys::Win32::System::ProcessStatus::EmptyWorkingSet(
+            windows_sys::Win32::System::Threading::GetCurrentProcess(),
+        );
+    }
+}
+

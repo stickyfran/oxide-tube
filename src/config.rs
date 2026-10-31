@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PreferredResolution {
+    Res8K,    // 4320p
     Res4K,    // 2160p
     Res1440p, // 1440p
     Res1080p, // 1080p
@@ -13,6 +14,7 @@ pub enum PreferredResolution {
 impl PreferredResolution {
     pub fn label(&self) -> &'static str {
         match self {
+            PreferredResolution::Res8K => "8K (4320p)",
             PreferredResolution::Res4K => "4K (2160p)",
             PreferredResolution::Res1440p => "1440p (2K)",
             PreferredResolution::Res1080p => "1080p (FHD)",
@@ -22,6 +24,7 @@ impl PreferredResolution {
 
     pub fn max_height(&self) -> u32 {
         match self {
+            PreferredResolution::Res8K => 4320,
             PreferredResolution::Res4K => 2160,
             PreferredResolution::Res1440p => 1440,
             PreferredResolution::Res1080p => 1080,

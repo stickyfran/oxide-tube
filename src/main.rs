@@ -3385,6 +3385,7 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                 self.video_started_at = None;
                 self.osd_state.is_playing = false;
                 self.power_manager.set_screensaver_inhibit(false);
+                crate::power_manager::purge_working_set_on_idle();
                 Task::none()
             }
 
@@ -3461,7 +3462,9 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                         self.osd_state.selected_quality_label = format!("{} ({})", quality.quality_label, codec_tag);
 
                         if self.osd_state.set_as_default_quality {
-                            let pref_res = if quality.height >= 2000 {
+                            let pref_res = if quality.height >= 4000 {
+                                PreferredResolution::Res8K
+                            } else if quality.height >= 2000 {
                                 PreferredResolution::Res4K
                             } else if quality.height >= 1300 {
                                 PreferredResolution::Res1440p
@@ -5468,6 +5471,10 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                                 return self.update(Message::TogglePip);
                             }
                         } else if Some(win_id) == self.main_window_id && self.pip_window_id.is_none() {
+                            let is_active = self.player.as_ref().map(|p| p.is_playing()).unwrap_or(false);
+                            if !is_active {
+                                crate::power_manager::purge_working_set_on_idle();
+                            }
                             return window::get_minimized(win_id).map(|min| Message::WindowMinimizedStatus(min.unwrap_or(false)));
                         }
                     }

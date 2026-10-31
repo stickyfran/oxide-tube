@@ -435,34 +435,40 @@ impl WaylandZeroCopyPlayer {
                 return Err("Failed to create mpv context".into());
             }
 
-            // High performance options for hardware decoding (VA-API on Intel Arc / Mesa)
+            let hwdec_val = if cfg!(target_os = "windows") {
+                c"auto-copy"
+            } else {
+                c"auto-safe"
+            };
+
+            // High performance options for hardware decoding (Direct3D 11 on Windows, VA-API/NVDEC on Linux)
             // Disable unused internal Lua scripts/OSC/OSD VMs to save ~15MB RAM and 6 threads
-            let opts = [
-                ("vo\0", "libmpv\0"),
-                ("hwdec\0", "vaapi\0"),
-                ("hwdec-codecs\0", "all\0"),
-                ("keep-open\0", "yes\0"),
-                ("ytdl\0", "no\0"),
-                ("load-scripts\0", "no\0"),
-                ("osc\0", "no\0"),
-                ("osd-level\0", "0\0"),
-                ("osd-bar\0", "no\0"),
-                ("load-stats-overlay\0", "no\0"),
-                ("load-osd-console\0", "no\0"),
-                ("load-auto-profiles\0", "no\0"),
-                ("sub-auto\0", "no\0"),
-                ("audio-file-auto\0", "no\0"),
-                ("network-timeout\0", "15\0"),
-                ("demuxer-max-bytes\0", "25165824\0"),       // 24 MB forward buffer (<=1080p default; scales up dynamically for 1440p/4K)
-                ("demuxer-max-back-bytes\0", "8388608\0"),   // 8 MB backward cache for instant reverse seek
-                ("demuxer-readahead-secs\0", "20\0"),        // 20 seconds readahead
-                ("cache-pause-wait\0", "2\0"),               // Resume after 2s buffered
-                ("demuxer-seekable-cache\0", "yes\0"),       // Seek directly in RAM cache without HTTP reconnect
-                ("force-seekable\0", "yes\0"),               // Force HTTP range-request seekability
-                ("hr-seek\0", "default\0"),                  // Accurate seek with fast hardware keyframe decode
-                ("hr-seek-framedrop\0", "yes\0"),            // Drop pre-target frames during seek for instantaneous resume
-                ("vd-lavc-dr\0", "yes\0"),
-                ("user-agent\0", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36\0"),
+            let opts: &[(&CStr, &CStr)] = &[
+                (c"vo", c"libmpv"),
+                (c"hwdec", hwdec_val),
+                (c"hwdec-codecs", c"all"),
+                (c"keep-open", c"yes"),
+                (c"ytdl", c"no"),
+                (c"load-scripts", c"no"),
+                (c"osc", c"no"),
+                (c"osd-level", c"0"),
+                (c"osd-bar", c"no"),
+                (c"load-stats-overlay", c"no"),
+                (c"load-osd-console", c"no"),
+                (c"load-auto-profiles", c"no"),
+                (c"sub-auto", c"no"),
+                (c"audio-file-auto", c"no"),
+                (c"network-timeout", c"15"),
+                (c"demuxer-max-bytes", c"25165824"),       // 24 MB forward buffer (<=1080p default; scales up dynamically for 1440p/4K/8K)
+                (c"demuxer-max-back-bytes", c"8388608"),   // 8 MB backward cache for instant reverse seek
+                (c"demuxer-readahead-secs", c"20"),        // 20 seconds readahead
+                (c"cache-pause-wait", c"2"),               // Resume after 2s buffered
+                (c"demuxer-seekable-cache", c"yes"),       // Seek directly in RAM cache without HTTP reconnect
+                (c"force-seekable", c"yes"),               // Force HTTP range-request seekability
+                (c"hr-seek", c"default"),                  // Accurate seek with fast hardware keyframe decode
+                (c"hr-seek-framedrop", c"yes"),            // Drop pre-target frames during seek for instantaneous resume
+                (c"vd-lavc-dr", c"yes"),
+                (c"user-agent", c"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"),
             ];
 
             for (name, val) in opts {
@@ -896,7 +902,18 @@ impl WaylandZeroCopyPlayer {
                         // never above the source, while strictly preserving the exact video aspect ratio so libmpv
                         // never bakes letterbox or pillarbox black bars into the FBO texture.
                         let (target_w, target_h) = if vid_w > 0 && vid_h > 0 {
-                            let max_scale = (1920.0 / vid_w as f32).min(1080.0 / vid_h as f32).min(1.0);
+                            #[cfg(target_os = "linux")]
+                            let is_zero_copy = is_opengl;
+                            #[cfg(not(target_os = "linux"))]
+                            let is_zero_copy = false;
+
+                            let (limit_w, limit_h) = if is_zero_copy {
+                                ((vp_w as f32).max(1920.0), (vp_h as f32).max(1080.0))
+                            } else {
+                                (1920.0, 1080.0)
+                            };
+
+                            let max_scale = (limit_w / vid_w as f32).min(limit_h / vid_h as f32).min(1.0);
                             let min_scale = (240.0 / vid_w.max(vid_h) as f32).min(max_scale);
                             let vp_scale = if vp_w > 16 && vp_h > 16 {
                                 let sx = (vp_w as f32 * 1.15) / vid_w as f32;
@@ -905,8 +922,8 @@ impl WaylandZeroCopyPlayer {
                             } else {
                                 max_scale
                             };
-                            let tw = ((vid_w as f32 * vp_scale).round() as u32 & !1).max(2);
-                            let th = ((vid_h as f32 * vp_scale).round() as u32 & !1).max(2);
+                            let tw = (((vid_w as f32 * vp_scale).round() as u32) & !1).max(2);
+                            let th = (((vid_h as f32 * vp_scale).round() as u32) & !1).max(2);
                             (tw, th)
                         } else {
                             (1280, 720)
@@ -1400,28 +1417,33 @@ impl WaylandZeroCopyPlayer {
     /// - <=1080p: 24 MB forward / 8 MB backward (~75s of 1080p AV1/VP9, saving 64 MB of RAM)
     /// - 1440p (2K): 36 MB forward / 12 MB backward
     /// - 2160p (4K): 56 MB forward / 16 MB backward (ensuring smooth 4K60 playback)
+    /// - 4320p (8K): 96 MB forward / 32 MB backward (ensuring smooth 8K AV1 playback)
     pub fn set_stream_buffer_profile(&self, height: u32, profile: PowerProfile) {
         let (max_bytes, back_bytes, readahead) = if profile == PowerProfile::Battery {
-            if height >= 2000 {
-                ("41943040\0", "10485760\0", "18\0") // 40 MB / 10 MB on Battery 4K
+            if height >= 4000 {
+                (c"67108864", c"16777216", c"20")  // 64 MB / 16 MB on Battery 8K
+            } else if height >= 2000 {
+                (c"41943040", c"10485760", c"18") // 40 MB / 10 MB on Battery 4K
             } else if height >= 1300 {
-                ("25165824\0", "8388608\0", "15\0")  // 24 MB / 8 MB on Battery 1440p
+                (c"25165824", c"8388608", c"15")  // 24 MB / 8 MB on Battery 1440p
             } else {
-                ("16777216\0", "6291456\0", "12\0")  // 16 MB / 6 MB on Battery <=1080p
+                (c"16777216", c"6291456", c"12")  // 16 MB / 6 MB on Battery <=1080p
             }
+        } else if height >= 4000 {
+            (c"100663296", c"33554432", c"30")     // 96 MB / 32 MB on AC 8K
         } else if height >= 2000 {
-            ("58720256\0", "16777216\0", "25\0")     // 56 MB / 16 MB on AC 4K
+            (c"58720256", c"16777216", c"25")     // 56 MB / 16 MB on AC 4K
         } else if height >= 1300 {
-            ("37748736\0", "12582912\0", "22\0")     // 36 MB / 12 MB on AC 1440p
+            (c"37748736", c"12582912", c"22")     // 36 MB / 12 MB on AC 1440p
         } else {
-            ("25165824\0", "8388608\0", "20\0")      // 24 MB / 8 MB on AC <=1080p
+            (c"25165824", c"8388608", c"20")      // 24 MB / 8 MB on AC <=1080p
         };
         if let Some(addr) = *self.mpv.safe_lock() {
             unsafe {
                 let h = addr as *mut MpvHandle;
-                mpv_set_property_string(h, b"demuxer-max-bytes\0".as_ptr() as _, max_bytes.as_ptr() as _);
-                mpv_set_property_string(h, b"demuxer-max-back-bytes\0".as_ptr() as _, back_bytes.as_ptr() as _);
-                mpv_set_property_string(h, b"demuxer-readahead-secs\0".as_ptr() as _, readahead.as_ptr() as _);
+                mpv_set_property_string(h, c"demuxer-max-bytes".as_ptr() as _, max_bytes.as_ptr() as _);
+                mpv_set_property_string(h, c"demuxer-max-back-bytes".as_ptr() as _, back_bytes.as_ptr() as _);
+                mpv_set_property_string(h, c"demuxer-readahead-secs".as_ptr() as _, readahead.as_ptr() as _);
             }
         }
     }
