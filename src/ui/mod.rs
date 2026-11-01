@@ -113,6 +113,7 @@ pub fn view_header_bar<'a, Message: Clone + 'static>(
     user_avatar_handle: Option<&'a iced::widget::image::Handle>,
     is_subscriptions: bool,
     is_history: bool,
+    is_downloads: bool,
     is_home: bool,
     tabs: &'a [VideoTab],
     active_tab_idx: Option<usize>,
@@ -125,11 +126,13 @@ pub fn view_header_bar<'a, Message: Clone + 'static>(
     tabs_max_scroll_x: f32,
     on_search_input: impl Fn(String) -> Message + 'static,
     on_search_submit: Message,
+    on_search_hover: impl Fn(bool) -> Message + Copy + 'static,
     _on_select_suggestion: impl Fn(String) -> Message + 'static,
     on_go_home: Message,
     on_go_back: Message,
     on_open_subscriptions: Message,
     on_open_history: Message,
+    on_open_downloads: Message,
     on_toggle_login_modal: Message,
     on_reload: Message,
     on_select_tab: impl Fn(usize) -> Message + Copy + 'static,
@@ -185,13 +188,28 @@ pub fn view_header_bar<'a, Message: Clone + 'static>(
         .padding([6, 8])
         .on_press(on_open_history);
 
+    let downloads_btn = button(icon_buffer(16.0))
+        .style(move |_t, status| {
+            if is_downloads {
+                button::Style {
+                    background: Some(iced::Color::from_rgb8(0xcc, 0x00, 0x00).into()),
+                    border: iced::border::rounded(6).color(iced::Color::from_rgb8(0xff, 0x33, 0x33)).width(1.0),
+                    ..button::Style::default()
+                }
+            } else {
+                ghost_button(_t, status)
+            }
+        })
+        .padding([6, 8])
+        .on_press(on_open_downloads);
+
     let search_placeholder = if is_search_focused || !search_query.is_empty() {
         "Buscar o pegar enlace..."
     } else {
         "Buscar..."
     };
 
-    let search_bar = text_input(search_placeholder, search_query)
+    let search_input_widget = text_input(search_placeholder, search_query)
         .id(iced::widget::text_input::Id::new("main_search_input"))
         .on_input(on_search_input)
         .on_submit(on_search_submit.clone())
@@ -199,12 +217,16 @@ pub fn view_header_bar<'a, Message: Clone + 'static>(
         .padding([6, 12])
         .width(Length::Fixed(search_bar_width));
 
+    let search_bar = mouse_area(search_input_widget)
+        .on_enter(on_search_hover(true))
+        .on_exit(on_search_hover(false));
+
     let search_btn = button(icon_search(14.0))
         .style(secondary_button)
         .padding([6, 10])
         .on_press(on_search_submit);
 
-    let search_container = row![subs_btn, history_btn, search_bar, search_btn]
+    let search_container = row![subs_btn, history_btn, downloads_btn, search_bar, search_btn]
         .spacing(4)
         .align_y(Alignment::Center);
 
@@ -1032,7 +1054,7 @@ pub fn view_auth_modal<'a, Message: Clone + 'static>(
 
         SettingsCategory::Storage => {
             let current_idx = limit_to_index(max_cache_size_bytes);
-            let current_limit_label = CACHE_LIMIT_LABELS.get(current_idx).copied().unwrap_or("5 GB (Estándar)");
+            let current_limit_label = CACHE_LIMIT_LABELS.get(current_idx).copied().unwrap_or("10 GB (Estándar)");
 
             let cache_slider = slider(
                 0..=5_u8,
@@ -1060,7 +1082,7 @@ pub fn view_auth_modal<'a, Message: Clone + 'static>(
                     text("Tope: ").size(12).color(COLOR_TEXT_SECONDARY),
                     text(current_limit_label).size(12).color(COLOR_ACCENT_RED),
                     Space::with_width(Length::Fixed(12.0)),
-                    text(format!("En disco: {}", format_size(current_cache_size_bytes))).size(12).color(COLOR_TEXT_SECONDARY),
+                    text(format!("Videos en disco: {} / {}", format_size(current_cache_size_bytes), if max_cache_size_bytes == u64::MAX { "sin límite".to_string() } else { format_size(max_cache_size_bytes) })).size(12).color(COLOR_TEXT_SECONDARY),
                 ]
                 .align_y(Alignment::Center),
                 cache_slider,
@@ -1069,9 +1091,9 @@ pub fn view_auth_modal<'a, Message: Clone + 'static>(
                     Space::with_width(Length::Fill),
                     text("2 GB").size(10).color(COLOR_TEXT_SECONDARY),
                     Space::with_width(Length::Fill),
-                    text("5 GB").size(10).color(COLOR_ACCENT_RED),
+                    text("5 GB").size(10).color(COLOR_TEXT_SECONDARY),
                     Space::with_width(Length::Fill),
-                    text("10 GB").size(10).color(COLOR_TEXT_SECONDARY),
+                    text("10 GB").size(10).color(COLOR_ACCENT_RED),
                     Space::with_width(Length::Fill),
                     text("20 GB").size(10).color(COLOR_TEXT_SECONDARY),
                     Space::with_width(Length::Fill),
@@ -1301,3 +1323,120 @@ pub fn view_auth_modal<'a, Message: Clone + 'static>(
     backdrop.into()
 }
 
+
+
+/// A video entry shown in the Downloads view (in-flight or stored in the local cache).
+pub struct DownloadItem {
+    pub video_id: String,
+    pub title: String,
+    pub percent: u8,
+    pub downloaded_bytes: u64,
+    pub total_bytes: u64,
+    pub speed_bytes_per_sec: u64,
+    pub is_complete: bool,
+}
+
+pub fn view_downloads<'a, Message: Clone + 'static>(
+    items: Vec<DownloadItem>,
+    on_open: impl Fn(String) -> Message + Copy + 'static,
+    on_delete: impl Fn(String) -> Message + Copy + 'static,
+) -> Element<'a, Message> {
+    let mut list = Column::new().spacing(8).padding([16, 24]);
+    list = list.push(text("Descargas").size(22).color(COLOR_TEXT_PRIMARY));
+
+    if items.is_empty() {
+        list = list.push(
+            text("No hay videos descargados ni bufferizados localmente.")
+                .size(13)
+                .color(COLOR_TEXT_SECONDARY),
+        );
+    }
+
+    for item in items {
+        let speed_str = crate::cache_manager::format_speed(item.speed_bytes_per_sec);
+        let status_text = if item.is_complete {
+            format!("Descargado ✓ · {}", format_size(item.downloaded_bytes))
+        } else if item.total_bytes > 0 {
+            if !speed_str.is_empty() {
+                format!(
+                    "Descargando {}% · {} / {} · {}",
+                    item.percent,
+                    format_size(item.downloaded_bytes),
+                    format_size(item.total_bytes),
+                    speed_str
+                )
+            } else {
+                format!(
+                    "Descargando {}% · {} / {}",
+                    item.percent,
+                    format_size(item.downloaded_bytes),
+                    format_size(item.total_bytes)
+                )
+            }
+        } else if !speed_str.is_empty() {
+            format!("Descargando {}% · {}", item.percent, speed_str)
+        } else {
+            format!("Descargando {}%", item.percent)
+        };
+        let bar_color = if item.is_complete {
+            iced::Color::from_rgb8(0x2b, 0xa6, 0x40)
+        } else {
+            iced::Color::from_rgb8(0x3e, 0xa6, 0xff)
+        };
+        let content = column![
+            text(item.title).size(14).color(COLOR_TEXT_PRIMARY),
+            iced::widget::progress_bar(0.0..=100.0, item.percent as f32)
+                .height(6)
+                .style(move |_t: &Theme| iced::widget::progress_bar::Style {
+                    background: COLOR_SURFACE_HOVER.into(),
+                    bar: bar_color.into(),
+                    border: iced::border::rounded(3),
+                }),
+            text(status_text).size(12).color(COLOR_TEXT_SECONDARY),
+        ]
+        .spacing(6);
+
+        let open_btn = button(content)
+            .style(secondary_button)
+            .padding([10, 14])
+            .width(Length::Fill)
+            .on_press(on_open(item.video_id.clone()));
+
+        let delete_btn = button(
+            row![
+                icon_trash(14.0),
+                text("Eliminar").size(12).color(iced::Color::from_rgb8(0xff, 0x66, 0x66)),
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center),
+        )
+        .style(move |_theme, status| {
+            let bg = match status {
+                button::Status::Hovered => iced::Color::from_rgb8(0x5a, 0x1a, 0x1a),
+                button::Status::Pressed => iced::Color::from_rgb8(0x7a, 0x20, 0x20),
+                _ => COLOR_SURFACE,
+            };
+            let border_col = if status == button::Status::Hovered {
+                iced::Color::from_rgb8(0xff, 0x44, 0x44)
+            } else {
+                COLOR_BORDER
+            };
+            button::Style {
+                background: Some(bg.into()),
+                border: iced::border::rounded(10).color(border_col).width(1.0),
+                ..button::Style::default()
+            }
+        })
+        .padding([10, 14])
+        .on_press(on_delete(item.video_id));
+
+        list = list.push(
+            row![open_btn, delete_btn]
+                .spacing(8)
+                .align_y(Alignment::Center)
+                .width(Length::Fill),
+        );
+    }
+
+    scrollable(list).width(Length::Fill).height(Length::Fill).into()
+}

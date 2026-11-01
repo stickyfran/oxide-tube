@@ -182,8 +182,9 @@ pub fn view_watch_page<'a, Message: Clone + 'static>(
     on_toggle_subscribe: Message,
     on_like: Message,
     on_dislike: Message,
-    buffer_status: Option<(u8, bool)>,
+    buffer_status: Option<(u8, bool, u64, u64, u64)>,
     on_trigger_full_buffer: Message,
+    on_delete_cached: Message,
     on_open_video: impl Fn(String) -> Message + Copy + 'static,
     on_open_video_new_tab: impl Fn(String) -> Message + Copy + 'static,
     on_open_channel: impl Fn(String) -> Message + Copy + 'static,
@@ -805,23 +806,47 @@ pub fn view_watch_page<'a, Message: Clone + 'static>(
 
     let is_buffered = buffer_status.as_ref().map(|s| s.1).unwrap_or(false);
     let buf_pct = buffer_status.as_ref().map(|s| s.0).unwrap_or(0);
+    let buf_done = buffer_status.as_ref().map(|s| s.2).unwrap_or(0);
+    let buf_total = buffer_status.as_ref().map(|s| s.3).unwrap_or(0);
+    let buf_speed = buffer_status.as_ref().map(|s| s.4).unwrap_or(0);
     let is_loading = buf_pct > 0 && !is_buffered;
 
     let (buf_label, buf_color, buf_icon) = if is_buffered {
         (
-            "Buffer listo ✓".to_string(),
+            format!("Descargado ✓ · {}", crate::cache_manager::format_size(buf_done)),
             iced::Color::from_rgb8(0x2b, 0xa6, 0x40),
             icon_check_circle(14.0),
         )
     } else if is_loading {
+        let speed_str = crate::cache_manager::format_speed(buf_speed);
+        let label = if buf_total > 0 {
+            if !speed_str.is_empty() {
+                format!(
+                    "Descargando {buf_pct}% · {} / {} · {}",
+                    crate::cache_manager::format_size(buf_done),
+                    crate::cache_manager::format_size(buf_total),
+                    speed_str
+                )
+            } else {
+                format!(
+                    "Descargando {buf_pct}% · {} / {}",
+                    crate::cache_manager::format_size(buf_done),
+                    crate::cache_manager::format_size(buf_total)
+                )
+            }
+        } else if !speed_str.is_empty() {
+            format!("Descargando {buf_pct}% · {speed_str}")
+        } else {
+            format!("Descargando {buf_pct}%")
+        };
         (
-            format!("Buffereando {buf_pct}%"),
+            label,
             iced::Color::from_rgb8(0x3e, 0xa6, 0xff),
             icon_reload(14.0),
         )
     } else {
         (
-            "Buffer completo".to_string(),
+            "Descargar completo".to_string(),
             COLOR_TEXT_PRIMARY,
             icon_buffer(14.0),
         )
@@ -871,19 +896,57 @@ pub fn view_watch_page<'a, Message: Clone + 'static>(
     .padding([8, 14])
     .on_press(on_copy_share_url);
 
+    let delete_cached_btn = if is_buffered {
+        Some(
+            button(
+                row![
+                    icon_trash(14.0),
+                    text("Eliminar").size(13).color(iced::Color::from_rgb8(0xff, 0x66, 0x66)),
+                ]
+                .spacing(5)
+                .align_y(Alignment::Center),
+            )
+            .style(move |_theme, status| {
+                let bg = match status {
+                    button::Status::Hovered => iced::Color::from_rgb8(0x5a, 0x1a, 0x1a),
+                    button::Status::Pressed => iced::Color::from_rgb8(0x7a, 0x20, 0x20),
+                    _ => COLOR_SURFACE,
+                };
+                let border_col = if status == button::Status::Hovered {
+                    iced::Color::from_rgb8(0xff, 0x44, 0x44)
+                } else {
+                    iced::Color::TRANSPARENT
+                };
+                button::Style {
+                    background: Some(bg.into()),
+                    border: iced::border::rounded(18).color(border_col).width(1.0),
+                    ..button::Style::default()
+                }
+            })
+            .padding([8, 12])
+            .on_press(on_delete_cached),
+        )
+    } else {
+        None
+    };
+
     // Channel action row: clean, with Compartir placed to the left of Me gusta!
-    let channel_row = row![
-        channel_avatar,
-        channel_info,
-        sub_btn,
-        Space::with_width(Length::Fill),
-        share_btn,
-        like_btn,
-        dislike_btn,
-        buffer_btn,
-    ]
-    .spacing(10)
-    .align_y(Alignment::Center);
+    let mut channel_row_items: Vec<Element<'a, Message>> = vec![
+        channel_avatar.into(),
+        channel_info.into(),
+        sub_btn.into(),
+        Space::with_width(Length::Fill).into(),
+        share_btn.into(),
+        like_btn.into(),
+        dislike_btn.into(),
+        buffer_btn.into(),
+    ];
+    if let Some(del_btn) = delete_cached_btn {
+        channel_row_items.push(del_btn.into());
+    }
+    let channel_row = iced::widget::Row::with_children(channel_row_items)
+        .spacing(10)
+        .align_y(Alignment::Center);
 
     // Description Box
     let description_box = if details.description.is_empty() && details.video_streams.is_empty() {

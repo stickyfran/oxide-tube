@@ -44,7 +44,8 @@ Este documento establece las directrices arquitectónicas, restricciones de rend
   - No incluyas identificadores específicos de hardware personal (ej. modelos de procesador concretos o drivers forzados sin detección).
   - No añadas credenciales, tokens o archivos `.cookies` / `.sqlite` al repositorio.
 - **Compilación y Reemplazo de Binarios**:
-  - Al reemplazar el binario compilado en directorios locales (`~/.local/bin/mitub`), utiliza siempre `install -m 755` en lugar de `cp`. Esto evita errores de "fichero de texto ocupado" (*ETXTBSY*) si la aplicación se encuentra en ejecución.
+  - Al reemplazar el binario compilado en directorios locales (`~/.local/bin/oxide-tube`), utiliza siempre `install -m 755 target/release/tube-oxide ~/.local/bin/oxide-tube` en lugar de `cp`. Esto evita errores de "fichero de texto ocupado" (*ETXTBSY*) si la aplicación se encuentra en ejecución.
+  - Asegura también el symlink `ln -sf ~/.local/bin/oxide-tube ~/.local/bin/tube-oxide` para el lanzador `.desktop`. Nunca instales el binario con el nombre `mitub` (borrar `~/.local/bin/mitub` si existiese).
 
 ---
 

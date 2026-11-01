@@ -45,6 +45,7 @@ pub enum ViewMode {
     Home,
     Subscriptions,
     History,
+    Downloads,
     Playlists,
     Watch(String),
     Channel(String),
@@ -82,6 +83,9 @@ pub enum Message {
     OpenSubscriptions,
     SubscriptionsLoaded(Result<Vec<VideoCard>, String>),
     OpenHistory,
+    OpenDownloads,
+    DownloadsScanned(Vec<(String, String, u64)>),
+    SearchHoverChanged(bool),
     HistoryLoaded(Result<Vec<VideoCard>, String>),
     OpenPlaylists,
     PlaylistsLoaded(Result<Vec<VideoCard>, String>),
@@ -172,7 +176,10 @@ pub enum Message {
     MoreFeedLoaded(Result<Vec<VideoCard>, String>),
     TabsScrolled(iced::widget::scrollable::Viewport),
     TriggerFullBuffer(String),
-    FullBufferProgress(String, u8),
+    FullBufferTitle(String, String),
+    DeleteDownloadedVideo(String),
+    VideoDeleted(u64, u64),
+    FullBufferProgress(String, u8, u64, u64, u64),
     FullBufferComplete(String, PathBuf, Option<PathBuf>),
     FullBufferError(String, String),
     ToggleFullBufferTabs,
@@ -191,7 +198,11 @@ pub enum Message {
 
 #[derive(Debug, Clone)]
 pub struct BufferDownloadState {
+    pub title: String,
     pub percent: u8,
+    pub downloaded_bytes: u64,
+    pub total_bytes: u64,
+    pub speed_bytes_per_sec: u64,
     pub is_complete: bool,
     pub video_path: Option<PathBuf>,
     pub audio_path: Option<PathBuf>,
@@ -203,6 +214,8 @@ pub struct MitubApp {
     auth_session: Arc<RwLock<AuthSession>>,
     innertube: Arc<InnerTubeClient>,
     buffer_downloads: HashMap<String, BufferDownloadState>,
+    cached_videos: Vec<(String, String, u64)>,
+    search_hovered: bool,
     power_manager: Arc<PowerManager>,
     power_profile: PowerProfile,
     player: Option<Arc<WaylandZeroCopyPlayer>>,
@@ -899,6 +912,7 @@ fn extract_youtube_video_id(input: &str) -> Option<String> {
 fn start_full_buffer_task(
     innertube: Arc<InnerTubeClient>,
     video_id: String,
+    initial_title: String,
     known_streams: Option<(String, Option<String>)>,
 ) -> Task<Message> {
     Task::run(
@@ -908,6 +922,10 @@ fn start_full_buffer_task(
             let cache_dir = crate::cache_manager::video_cache_dir();
             let _ = tokio::fs::create_dir_all(&cache_dir).await;
 
+            if !initial_title.is_empty() && initial_title != video_id {
+                crate::cache_manager::save_video_title(&video_id, &initial_title);
+            }
+
             let v_dest = cache_dir.join(format!("{video_id}_video.mp4"));
             let a_dest = cache_dir.join(format!("{video_id}_audio.mp4"));
             let v_part = cache_dir.join(format!("{video_id}_video.part"));
@@ -916,7 +934,9 @@ fn start_full_buffer_task(
             // If already complete on disk and non-empty:
             if v_dest.exists() && std::fs::metadata(&v_dest).map(|m| m.len() > 1024).unwrap_or(false) {
                 let has_audio = a_dest.exists() && std::fs::metadata(&a_dest).map(|m| m.len() > 1024).unwrap_or(false);
-                let _ = output.send(Message::FullBufferProgress(video_id.clone(), 100)).await;
+                let total = std::fs::metadata(&v_dest).map(|m| m.len()).unwrap_or(0)
+                    + std::fs::metadata(&a_dest).map(|m| m.len()).unwrap_or(0);
+                let _ = output.send(Message::FullBufferProgress(video_id.clone(), 100, total, total, 0)).await;
                 let _ = output.send(Message::FullBufferComplete(
                     video_id,
                     v_dest,
@@ -931,6 +951,11 @@ fn start_full_buffer_task(
             } else {
                 match innertube.get_watch_details(&video_id).await {
                     Ok(details) => {
+                        let title = details.title.clone();
+                        if !title.is_empty() {
+                            crate::cache_manager::save_video_title(&video_id, &title);
+                            let _ = output.send(Message::FullBufferTitle(video_id.clone(), title)).await;
+                        }
                         let v_stream = details.video_streams.iter().find(|s| s.height <= 1080).or_else(|| details.video_streams.first());
                         let a_stream = select_best_audio_stream(&details.audio_streams, crate::config::PreferredAudioLanguage::Original);
                         match v_stream {
@@ -956,7 +981,7 @@ fn start_full_buffer_task(
                 .build()
                 .unwrap_or_default();
 
-            let _ = output.send(Message::FullBufferProgress(video_id.clone(), 3)).await;
+            let _ = output.send(Message::FullBufferProgress(video_id.clone(), 3, 0, 0, 0)).await;
 
             let has_separate_audio = a_url.is_some();
             let v_range = if has_separate_audio { (3u8, 75u8) } else { (3u8, 98u8) };
@@ -981,37 +1006,55 @@ fn start_full_buffer_task(
                 let mut stream = resp.bytes_stream();
                 let mut downloaded: u64 = 0;
                 let mut last_pct = v_range.0;
+                let mut last_speed_time = std::time::Instant::now();
+                let mut last_speed_bytes: u64 = 0;
+                let mut current_speed_bps: u64 = 0;
+                let mut last_emit_time = std::time::Instant::now();
 
                 while let Some(chunk_res) = stream.next().await {
                     let chunk = chunk_res.map_err(|e| e.to_string())?;
                     file.write_all(&chunk).await.map_err(|e| e.to_string())?;
                     downloaded += chunk.len() as u64;
 
+                    let now = std::time::Instant::now();
+                    let elapsed_speed = now.duration_since(last_speed_time).as_secs_f64();
+                    if elapsed_speed >= 0.3 {
+                        let diff = downloaded.saturating_sub(last_speed_bytes);
+                        current_speed_bps = (diff as f64 / elapsed_speed) as u64;
+                        last_speed_bytes = downloaded;
+                        last_speed_time = now;
+                    }
+
                     if total_size > 0 {
                         let p = v_range.0 as f32
                             + (downloaded as f32 / total_size as f32)
                                 * (v_range.1 - v_range.0) as f32;
                         let p_u8 = p.clamp(v_range.0 as f32, v_range.1 as f32) as u8;
-                        if p_u8 > last_pct {
+                        if p_u8 > last_pct || now.duration_since(last_emit_time).as_millis() >= 300 {
                             last_pct = p_u8;
-                            let _ = output.send(Message::FullBufferProgress(video_id.clone(), p_u8)).await;
+                            last_emit_time = now;
+                            let _ = output.send(Message::FullBufferProgress(video_id.clone(), p_u8, downloaded, total_size, current_speed_bps)).await;
                         }
                     }
                 }
                 file.flush().await.map_err(|e| e.to_string())?;
                 tokio::fs::rename(&v_part, &v_dest).await.map_err(|e| e.to_string())?;
-                Ok::<(), String>(())
+                Ok::<u64, String>(downloaded)
             };
 
-            if let Err(e) = dl_video.await {
-                eprintln!("[Mitub Full Buffer Download Error for {video_id}]: {e}");
-                let _ = tokio::fs::remove_file(&v_part).await;
-                let _ = output.send(Message::FullBufferError(video_id, format!("Error descargando video: {e}"))).await;
-                return;
-            }
+            let v_bytes = match dl_video.await {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!("[Mitub Full Buffer Download Error for {video_id}]: {e}");
+                    let _ = tokio::fs::remove_file(&v_part).await;
+                    let _ = output.send(Message::FullBufferError(video_id, format!("Error descargando video: {e}"))).await;
+                    return;
+                }
+            };
 
+            let mut a_bytes: u64 = 0;
             let final_a_dest = if let Some(audio_url) = a_url {
-                let _ = output.send(Message::FullBufferProgress(video_id.clone(), 78)).await;
+                let _ = output.send(Message::FullBufferProgress(video_id.clone(), 78, v_bytes, v_bytes, 0)).await;
 
                 let a_range = (78u8, 98u8);
                 let dl_audio = async {
@@ -1034,40 +1077,57 @@ fn start_full_buffer_task(
                     let mut stream = resp.bytes_stream();
                     let mut downloaded: u64 = 0;
                     let mut last_pct = a_range.0;
+                    let mut last_speed_time = std::time::Instant::now();
+                    let mut last_speed_bytes: u64 = 0;
+                    let mut current_speed_bps: u64 = 0;
+                    let mut last_emit_time = std::time::Instant::now();
 
                     while let Some(chunk_res) = stream.next().await {
                         let chunk = chunk_res.map_err(|e| e.to_string())?;
                         file.write_all(&chunk).await.map_err(|e| e.to_string())?;
                         downloaded += chunk.len() as u64;
 
+                        let now = std::time::Instant::now();
+                        let elapsed_speed = now.duration_since(last_speed_time).as_secs_f64();
+                        if elapsed_speed >= 0.3 {
+                            let diff = downloaded.saturating_sub(last_speed_bytes);
+                            current_speed_bps = (diff as f64 / elapsed_speed) as u64;
+                            last_speed_bytes = downloaded;
+                            last_speed_time = now;
+                        }
+
                         if total_size > 0 {
                             let p = a_range.0 as f32
                                 + (downloaded as f32 / total_size as f32)
                                     * (a_range.1 - a_range.0) as f32;
                             let p_u8 = p.clamp(a_range.0 as f32, a_range.1 as f32) as u8;
-                            if p_u8 > last_pct {
+                            if p_u8 > last_pct || now.duration_since(last_emit_time).as_millis() >= 300 {
                                 last_pct = p_u8;
-                                let _ = output.send(Message::FullBufferProgress(video_id.clone(), p_u8)).await;
+                                last_emit_time = now;
+                                let _ = output.send(Message::FullBufferProgress(video_id.clone(), p_u8, v_bytes + downloaded, v_bytes + total_size, current_speed_bps)).await;
                             }
                         }
                     }
                     file.flush().await.map_err(|e| e.to_string())?;
                     tokio::fs::rename(&a_part, &a_dest).await.map_err(|e| e.to_string())?;
-                    Ok::<(), String>(())
+                    Ok::<u64, String>(downloaded)
                 };
 
-                if let Err(e) = dl_audio.await {
-                    eprintln!("[Mitub Full Buffer Audio Download Error for {video_id}]: {e}");
-                    let _ = tokio::fs::remove_file(&a_part).await;
-                    let _ = output.send(Message::FullBufferError(video_id, format!("Error descargando audio: {e}"))).await;
-                    return;
+                match dl_audio.await {
+                    Ok(b) => a_bytes = b,
+                    Err(e) => {
+                        eprintln!("[Mitub Full Buffer Audio Download Error for {video_id}]: {e}");
+                        let _ = tokio::fs::remove_file(&a_part).await;
+                        let _ = output.send(Message::FullBufferError(video_id, format!("Error descargando audio: {e}"))).await;
+                        return;
+                    }
                 }
                 Some(a_dest)
             } else {
                 None
             };
 
-            let _ = output.send(Message::FullBufferProgress(video_id.clone(), 100)).await;
+            let _ = output.send(Message::FullBufferProgress(video_id.clone(), 100, v_bytes + a_bytes, v_bytes + a_bytes, 0)).await;
             let _ = output.send(Message::FullBufferComplete(video_id, v_dest, final_a_dest)).await;
         }),
         std::convert::identity,
@@ -1075,6 +1135,31 @@ fn start_full_buffer_task(
 }
 
 impl MitubApp {
+    /// Prunes the video cache to the configured limit (protecting open tabs and the playing video) and re-measures it.
+    fn prune_and_refresh_cache_task(&self) -> Task<Message> {
+        let max_bytes = self.config.max_cache_size_bytes;
+        let mut protected: Vec<String> = self.tabs.iter().map(|t| t.video_id.clone()).collect();
+        if let Some(v) = &self.playing_video_id {
+            protected.push(v.clone());
+        }
+        for (id, st) in &self.buffer_downloads {
+            if !st.is_complete && st.percent > 0 {
+                protected.push(id.clone());
+            }
+        }
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    crate::cache_manager::prune_cache_if_needed(max_bytes, &protected);
+                    crate::cache_manager::get_cache_size_bytes()
+                })
+                .await
+                .unwrap_or(0)
+            },
+            Message::CacheSizeRefreshed,
+        )
+    }
+
     pub fn new() -> (Self, Task<Message>) {
         // Fast launch: load saved session from disk cache without blocking on Firefox SQLite
         let initial_session = AuthSession::load_from_disk().unwrap_or_else(|_| AuthSession::new());
@@ -1157,6 +1242,8 @@ impl MitubApp {
             suggestions: Vec::new(),
             show_suggestions: false,
             buffer_downloads: HashMap::new(),
+            cached_videos: Vec::new(),
+            search_hovered: false,
             tabs: saved_tabs.clone(),
             active_tab_idx: saved_active_idx,
             playback_queue: Vec::new(),
@@ -1788,18 +1875,51 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
     }
 
     fn current_search_bar_width(&self) -> f32 {
-        let target_w = if self.search_input_focused || !self.search_query.is_empty() { 300.0 } else { 145.0 };
-        if let Some((focused, inst)) = self.search_focus_anim {
+        let is_expanded = self.search_hovered || self.search_input_focused || !self.search_query.is_empty();
+        let target_w = if is_expanded { 300.0 } else { 145.0 };
+        if let Some((expanded, inst)) = self.search_focus_anim {
             let elapsed = inst.elapsed().as_secs_f32();
             let dur = 0.16; // 160ms cubic ease-out
             if elapsed < dur {
                 let t = (elapsed / dur).clamp(0.0, 1.0);
                 let ease = 1.0 - (1.0 - t).powi(3);
-                let (from_w, to_w) = if focused { (145.0, 300.0) } else { (300.0, 145.0) };
+                let (from_w, to_w) = if expanded { (145.0, 300.0) } else { (300.0, 145.0) };
                 return from_w + (to_w - from_w) * ease;
             }
         }
         target_w
+    }
+
+    fn find_video_title(&self, video_id: &str) -> String {
+        if let Some(st) = self.buffer_downloads.get(video_id) {
+            if !st.title.is_empty() && st.title != video_id {
+                return st.title.clone();
+            }
+        }
+        if let Some(d) = &self.watch_details {
+            if d.video_id == video_id && !d.title.is_empty() {
+                return d.title.clone();
+            }
+        }
+        if let Some(t) = self.tabs.iter().find(|t| t.video_id == video_id) {
+            if !t.title.is_empty() && t.title != "Video" && t.title != "Nueva pestaña" {
+                return t.title.clone();
+            }
+        }
+        if let Some(d) = self.tab_details_cache.get(video_id) {
+            if !d.title.is_empty() {
+                return d.title.clone();
+            }
+        }
+        if let Some(v) = self.home_videos.iter().find(|v| v.video_id == video_id) {
+            if !v.title.is_empty() {
+                return v.title.clone();
+            }
+        }
+        if let Some(t) = crate::cache_manager::get_video_title(video_id) {
+            return t;
+        }
+        video_id.to_string()
     }
 
     fn compute_pip_aspect_size(&self, raw_w: f32, raw_h: f32, edge: Option<PipResizeEdge>) -> (f32, f32) {
@@ -1875,6 +1995,7 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
             ViewMode::Home => "Oxide tube".to_string(),
             ViewMode::Subscriptions => "Suscripciones - Oxide tube".to_string(),
             ViewMode::History => "Historial de reproducciones - Oxide tube".to_string(),
+            ViewMode::Downloads => "Descargas - Oxide tube".to_string(),
             ViewMode::Playlists => "Playlists - Oxide tube".to_string(),
             _ => "Oxide tube".to_string(),
         }
@@ -2366,6 +2487,10 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
 
             Message::WatchDetailsLoadedPassive(res) => {
                 if let Ok(details) = res {
+                    crate::cache_manager::save_video_title(&details.video_id, &details.title);
+                    if let Some(state) = self.buffer_downloads.get_mut(&details.video_id) {
+                        state.title = details.title.clone();
+                    }
                     self.tab_details_cache.insert(details.video_id.clone(), Arc::clone(&details));
                     if matches!(self.current_view, ViewMode::Watch(ref v) if v == &details.video_id) {
                         self.description_content = iced::widget::text_editor::Content::with_text(&details.description);
@@ -2650,8 +2775,16 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                             }
                         }
 
+                        crate::cache_manager::save_video_title(&details.video_id, &details.title);
+                        if let Some(state) = self.buffer_downloads.get_mut(&details.video_id) {
+                            state.title = details.title.clone();
+                        }
                         self.watch_details = Some(Arc::clone(&details));
-                        self.tab_details_cache.insert(details.video_id.clone(), Arc::clone(&details));
+                        crate::cache_manager::save_video_title(&details.video_id, &details.title);
+                    if let Some(state) = self.buffer_downloads.get_mut(&details.video_id) {
+                        state.title = details.title.clone();
+                    }
+                    self.tab_details_cache.insert(details.video_id.clone(), Arc::clone(&details));
                         if self.tab_details_cache.len() > self.tabs.len() + 2 {
                             let open_vids: std::collections::HashSet<&str> =
                                 self.tabs.iter().map(|t| t.video_id.as_str()).collect();
@@ -3063,6 +3196,7 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                     ViewMode::Channel(c) => self.update(Message::OpenChannel(c)),
                     ViewMode::VideoFullscreen => self.update(Message::ToggleFullscreen),
                     ViewMode::History => self.update(Message::OpenHistory),
+                    ViewMode::Downloads => self.update(Message::OpenDownloads),
                     ViewMode::Playlists => self.update(Message::OpenPlaylists),
                 }
             }
@@ -5280,6 +5414,7 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                 match self.current_view.clone() {
                     ViewMode::Subscriptions => return self.update(Message::OpenSubscriptions),
                     ViewMode::History => return self.update(Message::OpenHistory),
+                    ViewMode::Downloads => return self.update(Message::OpenDownloads),
                     ViewMode::Playlists => return self.update(Message::OpenPlaylists),
                     ViewMode::Channel(cid) => return self.update(Message::OpenChannel(cid)),
                     ViewMode::Watch(vid) => return self.update(Message::OpenVideo(vid)),
@@ -5464,10 +5599,13 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                         }
                         if let Some(pos) = self.last_cursor_pos {
                             let cur_search_w = self.current_search_bar_width();
-                            let search_start_x = 160.0;
-                            let search_end_x = search_start_x + cur_search_w + 42.0;
+                            let in_suggestions = self.show_suggestions
+                                && pos.y >= 52.0
+                                && pos.y <= 280.0
+                                && pos.x >= 168.0
+                                && pos.x <= 168.0 + cur_search_w.max(260.0);
 
-                            if pos.y <= 56.0 && pos.x >= search_start_x && pos.x <= search_end_x {
+                            if self.search_hovered {
                                 if !self.search_input_focused {
                                     self.search_input_focused = true;
                                     self.search_focus_anim = Some((true, std::time::Instant::now()));
@@ -5475,17 +5613,11 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                                         self.show_suggestions = true;
                                     }
                                 }
-                            } else {
-                                let in_suggestions = self.show_suggestions
-                                    && pos.y >= 52.0
-                                    && pos.y <= 280.0
-                                    && pos.x >= 168.0
-                                    && pos.x <= 168.0 + cur_search_w.max(260.0);
-                                if !in_suggestions && self.search_input_focused {
-                                    self.search_input_focused = false;
-                                    self.search_focus_anim = Some((false, std::time::Instant::now()));
-                                    self.show_suggestions = false;
-                                }
+                            } else if !in_suggestions && self.search_input_focused {
+                                self.search_input_focused = false;
+                                let is_expanded = self.search_hovered || !self.search_query.is_empty();
+                                self.search_focus_anim = Some((is_expanded, std::time::Instant::now()));
+                                self.show_suggestions = false;
                             }
                         }
                     }
@@ -5559,7 +5691,8 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                             } else if self.search_input_focused {
                                 if let Key::Named(Named::Escape) = key {
                                     self.search_input_focused = false;
-                                    self.search_focus_anim = Some((false, std::time::Instant::now()));
+                                    let is_expanded = self.search_hovered || !self.search_query.is_empty();
+                                    self.search_focus_anim = Some((is_expanded, std::time::Instant::now()));
                                     self.show_suggestions = false;
                                     return Task::none();
                                 }
@@ -5574,7 +5707,8 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                                     }
                                     Key::Named(Named::Escape) if self.search_input_focused => {
                                         self.search_input_focused = false;
-                                        self.search_focus_anim = Some((false, std::time::Instant::now()));
+                                        let is_expanded = self.search_hovered || !self.search_query.is_empty();
+                                        self.search_focus_anim = Some((is_expanded, std::time::Instant::now()));
                                         self.show_suggestions = false;
                                         return Task::none();
                                     }
@@ -5834,10 +5968,15 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                         return Task::none();
                     }
                 }
+                let title = self.find_video_title(&video_id);
                 self.buffer_downloads.insert(
                     video_id.clone(),
                     BufferDownloadState {
+                        title: title.clone(),
                         percent: 1,
+                        downloaded_bytes: 0,
+                        total_bytes: 0,
+                        speed_bytes_per_sec: 0,
                         is_complete: false,
                         video_path: None,
                         audio_path: None,
@@ -5856,92 +5995,158 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                     None
                 };
 
-                start_full_buffer_task(self.innertube.clone(), video_id, known_streams)
+                start_full_buffer_task(self.innertube.clone(), video_id, title, known_streams)
             }
 
-            Message::FullBufferProgress(video_id, pct) => {
+            Message::FullBufferTitle(video_id, title) => {
                 if let Some(state) = self.buffer_downloads.get_mut(&video_id) {
-                    state.percent = pct;
-                } else {
-                    self.buffer_downloads.insert(
-                        video_id,
-                        BufferDownloadState {
-                            percent: pct,
-                            is_complete: pct >= 100,
-                            video_path: None,
-                            audio_path: None,
-                        },
-                    );
+                    state.title = title.clone();
                 }
+                crate::cache_manager::save_video_title(&video_id, &title);
+                Task::none()
+            }
+
+            Message::FullBufferProgress(video_id, pct, done, total, speed) => {
+                let title = self.find_video_title(&video_id);
+                let state = self.buffer_downloads.entry(video_id).or_insert_with(|| BufferDownloadState {
+                    title,
+                    percent: pct,
+                    downloaded_bytes: 0,
+                    total_bytes: 0,
+                    speed_bytes_per_sec: 0,
+                    is_complete: false,
+                    video_path: None,
+                    audio_path: None,
+                });
+                state.percent = pct;
+                state.downloaded_bytes = done;
+                state.total_bytes = total;
+                state.speed_bytes_per_sec = speed;
+                state.is_complete = pct >= 100;
                 Task::none()
             }
 
             Message::FullBufferComplete(video_id, v_path, a_path) => {
+                // Download-only: the file is stored for later playback; the stream currently playing is never swapped.
+                let title = self.find_video_title(&video_id);
+                crate::cache_manager::save_video_title(&video_id, &title);
+                let size = std::fs::metadata(&v_path).map(|m| m.len()).unwrap_or(0)
+                    + a_path.as_ref().and_then(|p| std::fs::metadata(p).ok()).map(|m| m.len()).unwrap_or(0);
                 self.buffer_downloads.insert(
                     video_id.clone(),
                     BufferDownloadState {
+                        title,
                         percent: 100,
+                        downloaded_bytes: size,
+                        total_bytes: size,
+                        speed_bytes_per_sec: 0,
                         is_complete: true,
                         video_path: Some(v_path.clone()),
                         audio_path: a_path.clone(),
                     },
                 );
 
-                if self.playing_video_id.as_deref() == Some(&video_id) {
-                    if let Some(player) = &self.player {
-                        let v_uri = format!("file://{}", v_path.to_string_lossy());
-                        let a_uri = a_path.as_ref().map(|p| format!("file://{}", p.to_string_lossy()));
-                        let _ = player.switch_resolution(&v_uri, a_uri.as_deref());
-                    }
-                }
-
                 // Prune cache if exceeding configured limit and refresh size
-                let max_bytes = self.config.max_cache_size_bytes;
-                let active_vid = self.playing_video_id.clone();
-                Task::perform(
-                    async move {
-                        tokio::task::spawn_blocking(move || {
-                            crate::cache_manager::prune_cache_if_needed(max_bytes, active_vid.as_deref());
-                            crate::cache_manager::get_cache_size_bytes()
-                        })
-                        .await
-                        .unwrap_or(0)
-                    },
-                    Message::CacheSizeRefreshed,
-                )
+                self.prune_and_refresh_cache_task()
             }
 
             Message::FullBufferError(video_id, err) => {
                 eprintln!("[Mitub Full Buffer Error for {video_id}]: {err}");
                 if let Some(state) = self.buffer_downloads.get_mut(&video_id) {
                     state.percent = 0;
+                    state.downloaded_bytes = 0;
+                    state.total_bytes = 0;
+                    state.speed_bytes_per_sec = 0;
                     state.is_complete = false;
                 }
+                Task::none()
+            }
+
+            Message::SearchHoverChanged(hovered) => {
+                if self.search_hovered != hovered {
+                    self.search_hovered = hovered;
+                    let is_expanded = self.search_hovered || self.search_input_focused || !self.search_query.is_empty();
+                    self.search_focus_anim = Some((is_expanded, std::time::Instant::now()));
+                }
+                Task::none()
+            }
+
+            Message::DeleteDownloadedVideo(video_id) => {
+                self.buffer_downloads.remove(&video_id);
+                self.cached_videos.retain(|(id, _, _)| id != &video_id);
+                let vid = video_id.clone();
+                Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || {
+                            let freed = crate::cache_manager::delete_cached_video(&vid);
+                            (crate::cache_manager::get_cache_size_bytes(), freed)
+                        })
+                        .await
+                        .unwrap_or((0, 0))
+                    },
+                    |(new_size, freed)| Message::VideoDeleted(new_size, freed),
+                )
+            }
+
+            Message::VideoDeleted(new_size, freed) => {
+                self.current_cache_size_bytes = new_size;
+                if freed > 0 {
+                    self.toast_message = Some((
+                        format!(
+                            "Video eliminado ({} liberados)",
+                            crate::cache_manager::format_size(freed)
+                        ),
+                        std::time::Instant::now(),
+                    ));
+                    crate::power_manager::trim_process_memory();
+                }
+                Task::none()
+            }
+
+            Message::OpenDownloads => {
+                self.snapshot_current_playing_frame();
+                if let Some(details) = &self.watch_details {
+                    if !details.video_streams.is_empty() {
+                        self.tab_details_cache.insert(details.video_id.clone(), details.clone());
+                    }
+                }
+                self.show_auth_modal = false;
+                self.previous_view = self.current_view.clone();
+                self.current_view = ViewMode::Downloads;
+                self.active_tab_idx = None;
+                self.show_suggestions = false;
+                self.sync_player_viewport();
+                Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(crate::cache_manager::list_cached_videos)
+                            .await
+                            .unwrap_or_default()
+                    },
+                    Message::DownloadsScanned,
+                )
+            }
+
+            Message::DownloadsScanned(list) => {
+                self.cached_videos = list;
                 Task::none()
             }
 
             Message::ToggleFullBufferTabs => {
                 self.config.full_buffer_tabs = !self.config.full_buffer_tabs;
                 self.config.save();
+                if self.config.full_buffer_tabs {
+                    // Start preloading every tab that is already open
+                    let ids: Vec<String> = self.tabs.iter().map(|t| t.video_id.clone()).filter(|v| !v.is_empty()).collect();
+                    let tasks: Vec<Task<Message>> = ids.into_iter().map(|id| self.update(Message::TriggerFullBuffer(id))).collect();
+                    return Task::batch(tasks);
+                }
                 Task::none()
             }
 
             Message::SetCacheLimitIndex(idx) => {
                 self.config.max_cache_size_bytes = crate::cache_manager::index_to_limit(idx);
                 self.config.save();
-                let max_bytes = self.config.max_cache_size_bytes;
-                let active_vid = self.playing_video_id.clone();
-                Task::perform(
-                    async move {
-                        tokio::task::spawn_blocking(move || {
-                            crate::cache_manager::prune_cache_if_needed(max_bytes, active_vid.as_deref());
-                            crate::cache_manager::get_cache_size_bytes()
-                        })
-                        .await
-                        .unwrap_or(0)
-                    },
-                    Message::CacheSizeRefreshed,
-                )
+                self.prune_and_refresh_cache_task()
             }
 
             Message::ClearCache => {
@@ -5971,6 +6176,10 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
 
             Message::CacheSizeRefreshed(new_size) => {
                 self.current_cache_size_bytes = new_size;
+                // Drop buffer entries whose files were pruned from disk
+                self.buffer_downloads.retain(|_, st| {
+                    !st.is_complete || st.video_path.as_ref().map(|p| p.exists()).unwrap_or(false)
+                });
                 Task::none()
             }
         }
@@ -6502,7 +6711,7 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
                             .find(|t| t.video_id == details.video_id && !t.thumbnail_url.is_empty())
                             .and_then(|t| self.thumbnail_cache.get(&t.thumbnail_url))
                     });
-                let buffer_status = self.buffer_downloads.get(&details.video_id).map(|s| (s.percent, s.is_complete));
+                let buffer_status = self.buffer_downloads.get(&details.video_id).map(|s| (s.percent, s.is_complete, s.downloaded_bytes, s.total_bytes, s.speed_bytes_per_sec));
                 let video_frame = if is_active_video && !is_this_video_in_pip {
                     self.player.as_ref().and_then(|p| p.get_current_frame())
                 } else {
@@ -6562,6 +6771,7 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
                     Message::DislikeVideo,
                     buffer_status,
                     Message::TriggerFullBuffer(details.video_id.clone()),
+                    Message::DeleteDownloadedVideo(details.video_id.clone()),
                     Message::OpenVideo,
                     Message::OpenVideoInNewTab,
                     Message::OpenChannel,
@@ -6584,6 +6794,7 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
         let is_authed = self.auth_status.starts_with("[OK]");
         let is_subscriptions = matches!(self.current_view, ViewMode::Subscriptions);
         let is_history = matches!(self.current_view, ViewMode::History);
+        let is_downloads = matches!(self.current_view, ViewMode::Downloads);
         let is_home = matches!(self.current_view, ViewMode::Home);
         let newly_opened = self.tab_opened_anim.and_then(|(idx, inst)| {
             let el = inst.elapsed().as_secs_f32();
@@ -6618,6 +6829,7 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
             self.user_avatar_handle.as_ref(),
             is_subscriptions,
             is_history,
+            is_downloads,
             is_home,
             &self.tabs,
             self.active_tab_idx,
@@ -6630,11 +6842,13 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
             self.tabs_max_scroll_x,
             Message::SearchInputChanged,
             Message::SearchSubmitted,
+            Message::SearchHoverChanged,
             Message::SelectSuggestion,
             Message::GoHome,
             Message::GoBack,
             Message::OpenSubscriptions,
             Message::OpenHistory,
+            Message::OpenDownloads,
             Message::ToggleLoginModal,
             Message::ReloadFeed,
             Message::SelectTab,
@@ -6688,6 +6902,51 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
                 Message::OpenChannel,
                 Message::HomeScrolled,
             ),
+            ViewMode::Downloads => {
+                let mut items: Vec<ui::DownloadItem> = Vec::new();
+                for (id, st) in &self.buffer_downloads {
+                    if !st.is_complete && st.percent > 0 {
+                        items.push(ui::DownloadItem {
+                            video_id: id.clone(),
+                            title: if !st.title.is_empty() && st.title != *id { st.title.clone() } else { self.find_video_title(id) },
+                            percent: st.percent,
+                            downloaded_bytes: st.downloaded_bytes,
+                            total_bytes: st.total_bytes,
+                            speed_bytes_per_sec: st.speed_bytes_per_sec,
+                            is_complete: false,
+                        });
+                    }
+                }
+                items.sort_by(|a, b| a.video_id.cmp(&b.video_id));
+                for (id, disk_title, size) in &self.cached_videos {
+                    if items.iter().any(|i| &i.video_id == id) {
+                        continue;
+                    }
+                    items.push(ui::DownloadItem {
+                        video_id: id.clone(),
+                        title: if !disk_title.is_empty() && disk_title != id { disk_title.clone() } else { self.find_video_title(id) },
+                        percent: 100,
+                        downloaded_bytes: *size,
+                        total_bytes: *size,
+                        speed_bytes_per_sec: 0,
+                        is_complete: true,
+                    });
+                }
+                for (id, st) in &self.buffer_downloads {
+                    if st.is_complete && !items.iter().any(|i| &i.video_id == id) {
+                        items.push(ui::DownloadItem {
+                            video_id: id.clone(),
+                            title: if !st.title.is_empty() && st.title != *id { st.title.clone() } else { self.find_video_title(id) },
+                            percent: 100,
+                            downloaded_bytes: st.downloaded_bytes,
+                            total_bytes: st.total_bytes,
+                            speed_bytes_per_sec: 0,
+                            is_complete: true,
+                        });
+                    }
+                }
+                ui::view_downloads(items, Message::OpenVideo, Message::DeleteDownloadedVideo)
+            }
             ViewMode::Playlists => view_home_grid(
                 &self.home_videos,
                 &self.thumbnail_cache,
@@ -6724,7 +6983,7 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
                                 .find(|t| t.video_id == details.video_id && !t.thumbnail_url.is_empty())
                                 .and_then(|t| self.thumbnail_cache.get(&t.thumbnail_url))
                         });
-                    let buffer_status = self.buffer_downloads.get(&details.video_id).map(|s| (s.percent, s.is_complete));
+                    let buffer_status = self.buffer_downloads.get(&details.video_id).map(|s| (s.percent, s.is_complete, s.downloaded_bytes, s.total_bytes, s.speed_bytes_per_sec));
                     let video_frame = if is_active_video && !is_this_video_in_pip {
                         self.player.as_ref().and_then(|p| p.get_current_frame())
                     } else {
@@ -6784,6 +7043,7 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
                         Message::DislikeVideo,
                         buffer_status,
                         Message::TriggerFullBuffer(details.video_id.clone()),
+                        Message::DeleteDownloadedVideo(details.video_id.clone()),
                         Message::OpenVideo,
                         Message::OpenVideoInNewTab,
                         Message::OpenChannel,

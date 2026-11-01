@@ -154,8 +154,16 @@ pub fn video_hitbox_button(_theme: &iced::Theme, _status: button::Status) -> but
 pub fn search_input(_theme: &iced::Theme, status: text_input::Status) -> text_input::Style {
     match status {
         text_input::Status::Focused => text_input::Style {
+            background: Color::from_rgb(0.12, 0.12, 0.15).into(),
+            border: border::rounded(20).width(1.5).color(Color::from_rgb(0.24, 0.65, 1.0)),
+            icon: COLOR_TEXT_PRIMARY,
+            placeholder: COLOR_TEXT_SECONDARY,
+            value: COLOR_TEXT_PRIMARY,
+            selection: Color::from_rgba(0.2, 0.4, 0.8, 0.4),
+        },
+        text_input::Status::Hovered => text_input::Style {
             background: COLOR_INPUT_BG.into(),
-            border: border::rounded(20).width(1.0).color(COLOR_BORDER_FOCUS),
+            border: border::rounded(20).width(1.0).color(Color::from_rgb(0.42, 0.42, 0.42)),
             icon: COLOR_TEXT_SECONDARY,
             placeholder: COLOR_TEXT_SECONDARY,
             value: COLOR_TEXT_PRIMARY,
