@@ -152,11 +152,14 @@ pub enum Message {
     SelectSettingsCategory(ui::SettingsCategory),
     CookieInputChanged(String),
     SaveRawCookie,
+    OpenBrowserLogin,
+    SyncBrowserSession,
     ImportFirefoxCookies,
     FirefoxCookiesImported(Result<AuthSession, String>),
     ImportChromeCookies,
     ChromeCookiesImported(Result<AuthSession, String>),
     Logout,
+    SessionExpired,
     SetPreferredResolution(PreferredResolution),
     SetPreferredCodec(PreferredCodec),
     SetPreferredAudioLanguage(crate::config::PreferredAudioLanguage),
@@ -976,7 +979,7 @@ fn start_full_buffer_task(
             const UA: &str = "Mozilla/5.0 (X11; Linux x86_64; rv:132.0) Gecko/20100101 Firefox/132.0";
             let client = reqwest::Client::builder()
                 .user_agent(UA)
-                .timeout(Duration::from_secs(180))
+                .timeout(Duration::from_secs(45))
                 .tcp_nodelay(true)
                 .build()
                 .unwrap_or_default();
@@ -986,63 +989,202 @@ fn start_full_buffer_task(
             let has_separate_audio = a_url.is_some();
             let v_range = if has_separate_audio { (3u8, 75u8) } else { (3u8, 98u8) };
 
-            let dl_video = async {
-                use iced::futures::StreamExt;
-                use tokio::io::AsyncWriteExt;
+            // Helper function to download an HTTP resource using Range Chunking (8 MB chunks)
+            // This bypasses YouTube CDN's aggressive bandwidth throttling (400 KB/s -> 4-10 MB/s)
+            // and provides resilient resume capabilities if a chunk drops.
+            let download_stream_chunked = |stream_url: String,
+                                           part_path: PathBuf,
+                                           dest_path: PathBuf,
+                                           pct_start: u8,
+                                           pct_end: u8,
+                                           base_downloaded: u64,
+                                           total_file_offset: u64,
+                                           mut out_sender: iced::futures::channel::mpsc::Sender<Message>,
+                                           vid_id: String| {
+                let http_client = client.clone();
+                async move {
+                    use iced::futures::SinkExt;
+                    use tokio::io::AsyncWriteExt;
 
-                let resp = client
-                    .get(&v_url)
-                    .header(reqwest::header::REFERER, "https://www.youtube.com/")
-                    .header(reqwest::header::ORIGIN, "https://www.youtube.com")
-                    .send()
-                    .await
-                    .map_err(|e| e.to_string())?;
-
-                if !resp.status().is_success() {
-                    return Err(format!("HTTP {}", resp.status()));
-                }
-                let total_size = resp.content_length().unwrap_or(0);
-                let mut file = tokio::fs::File::create(&v_part).await.map_err(|e| e.to_string())?;
-                let mut stream = resp.bytes_stream();
-                let mut downloaded: u64 = 0;
-                let mut last_pct = v_range.0;
-                let mut last_speed_time = std::time::Instant::now();
-                let mut last_speed_bytes: u64 = 0;
-                let mut current_speed_bps: u64 = 0;
-                let mut last_emit_time = std::time::Instant::now();
-
-                while let Some(chunk_res) = stream.next().await {
-                    let chunk = chunk_res.map_err(|e| e.to_string())?;
-                    file.write_all(&chunk).await.map_err(|e| e.to_string())?;
-                    downloaded += chunk.len() as u64;
-
-                    let now = std::time::Instant::now();
-                    let elapsed_speed = now.duration_since(last_speed_time).as_secs_f64();
-                    if elapsed_speed >= 0.3 {
-                        let diff = downloaded.saturating_sub(last_speed_bytes);
-                        current_speed_bps = (diff as f64 / elapsed_speed) as u64;
-                        last_speed_bytes = downloaded;
-                        last_speed_time = now;
-                    }
-
-                    if total_size > 0 {
-                        let p = v_range.0 as f32
-                            + (downloaded as f32 / total_size as f32)
-                                * (v_range.1 - v_range.0) as f32;
-                        let p_u8 = p.clamp(v_range.0 as f32, v_range.1 as f32) as u8;
-                        if p_u8 > last_pct || now.duration_since(last_emit_time).as_millis() >= 300 {
-                            last_pct = p_u8;
-                            last_emit_time = now;
-                            let _ = output.send(Message::FullBufferProgress(video_id.clone(), p_u8, downloaded, total_size, current_speed_bps)).await;
+                    // 1. Determine total stream size via HEAD or initial byte probe
+                    let mut total_size: u64 = 0;
+                    if let Ok(head_resp) = http_client
+                        .head(&stream_url)
+                        .header(reqwest::header::REFERER, "https://www.youtube.com/")
+                        .header(reqwest::header::ORIGIN, "https://www.youtube.com")
+                        .send()
+                        .await
+                    {
+                        if head_resp.status().is_success() {
+                            total_size = head_resp.content_length().unwrap_or(0);
                         }
                     }
+
+                    if total_size == 0 {
+                        // Fallback: request byte 0-0 to extract Content-Range total length
+                        if let Ok(probe_resp) = http_client
+                            .get(&stream_url)
+                            .header(reqwest::header::REFERER, "https://www.youtube.com/")
+                            .header(reqwest::header::ORIGIN, "https://www.youtube.com")
+                            .header(reqwest::header::RANGE, "bytes=0-0")
+                            .send()
+                            .await
+                        {
+                            if let Some(range_header) = probe_resp.headers().get(reqwest::header::CONTENT_RANGE) {
+                                if let Ok(s) = range_header.to_str() {
+                                    if let Some((_, total_str)) = s.split_once('/') {
+                                        total_size = total_str.trim().parse::<u64>().unwrap_or(0);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Open file in append/create mode so we can resume chunks cleanly
+                    let mut file = tokio::fs::OpenOptions::new()
+                        .create(true)
+                        .write(true)
+                        .append(true)
+                        .open(&part_path)
+                        .await
+                        .map_err(|e| e.to_string())?;
+
+                    let existing_len = file.metadata().await.map(|m| m.len()).unwrap_or(0);
+                    let mut downloaded = existing_len;
+
+                    let mut last_pct = pct_start;
+                    let mut last_speed_time = std::time::Instant::now();
+                    let mut last_speed_bytes: u64 = downloaded;
+                    let mut current_speed_bps: u64 = 0;
+                    let mut last_emit_time = std::time::Instant::now();
+
+                    const CHUNK_SIZE: u64 = 8 * 1024 * 1024; // 8 MB chunks for peak CDN throughput
+
+                    if total_size > 0 && downloaded < total_size {
+                        while downloaded < total_size {
+                            let chunk_end = (downloaded + CHUNK_SIZE - 1).min(total_size - 1);
+                            let range_header = format!("bytes={downloaded}-{chunk_end}");
+
+                            let mut chunk_success = false;
+                            for retry in 0..3 {
+                                match http_client
+                                    .get(&stream_url)
+                                    .header(reqwest::header::REFERER, "https://www.youtube.com/")
+                                    .header(reqwest::header::ORIGIN, "https://www.youtube.com")
+                                    .header(reqwest::header::RANGE, &range_header)
+                                    .send()
+                                    .await
+                                {
+                                    Ok(resp) if resp.status().is_success() || resp.status() == reqwest::StatusCode::PARTIAL_CONTENT => {
+                                        match resp.bytes().await {
+                                            Ok(bytes) => {
+                                                file.write_all(&bytes).await.map_err(|e| e.to_string())?;
+                                                downloaded += bytes.len() as u64;
+                                                chunk_success = true;
+                                                break;
+                                            }
+                                            Err(e) => {
+                                                eprintln!("[Mitub Download] Retry {retry} read chunk error: {e}");
+                                            }
+                                        }
+                                    }
+                                    Ok(resp) => {
+                                        eprintln!("[Mitub Download] Retry {retry} chunk status error: {}", resp.status());
+                                    }
+                                    Err(e) => {
+                                        eprintln!("[Mitub Download] Retry {retry} network error: {e}");
+                                    }
+                                }
+                                tokio::time::sleep(tokio::time::Duration::from_millis(500 * (retry + 1))).await;
+                            }
+
+                            if !chunk_success {
+                                return Err(format!("Fallo persistente de descarga en bloque {range_header}"));
+                            }
+
+                            let now = std::time::Instant::now();
+                            let elapsed_speed = now.duration_since(last_speed_time).as_secs_f64();
+                            if elapsed_speed >= 0.3 {
+                                let diff = downloaded.saturating_sub(last_speed_bytes);
+                                current_speed_bps = (diff as f64 / elapsed_speed) as u64;
+                                last_speed_bytes = downloaded;
+                                last_speed_time = now;
+                            }
+
+                            let p = pct_start as f32
+                                + (downloaded as f32 / total_size as f32) * (pct_end - pct_start) as f32;
+                            let p_u8 = p.clamp(pct_start as f32, pct_end as f32) as u8;
+                            if p_u8 > last_pct || now.duration_since(last_emit_time).as_millis() >= 300 {
+                                last_pct = p_u8;
+                                last_emit_time = now;
+                                let _ = out_sender.send(Message::FullBufferProgress(
+                                    vid_id.clone(),
+                                    p_u8,
+                                    base_downloaded + downloaded,
+                                    total_file_offset + total_size,
+                                    current_speed_bps,
+                                )).await;
+                            }
+                        }
+                    } else if total_size == 0 {
+                        // Fallback stream when server does not provide content-range / content-length
+                        use iced::futures::StreamExt;
+                        let resp = http_client
+                            .get(&stream_url)
+                            .header(reqwest::header::REFERER, "https://www.youtube.com/")
+                            .header(reqwest::header::ORIGIN, "https://www.youtube.com")
+                            .send()
+                            .await
+                            .map_err(|e| e.to_string())?;
+
+                        if !resp.status().is_success() {
+                            return Err(format!("HTTP {}", resp.status()));
+                        }
+                        let mut stream = resp.bytes_stream();
+                        while let Some(chunk_res) = stream.next().await {
+                            let chunk = chunk_res.map_err(|e| e.to_string())?;
+                            file.write_all(&chunk).await.map_err(|e| e.to_string())?;
+                            downloaded += chunk.len() as u64;
+
+                            let now = std::time::Instant::now();
+                            let elapsed_speed = now.duration_since(last_speed_time).as_secs_f64();
+                            if elapsed_speed >= 0.3 {
+                                let diff = downloaded.saturating_sub(last_speed_bytes);
+                                current_speed_bps = (diff as f64 / elapsed_speed) as u64;
+                                last_speed_bytes = downloaded;
+                                last_speed_time = now;
+                            }
+
+                            if now.duration_since(last_emit_time).as_millis() >= 300 {
+                                last_emit_time = now;
+                                let _ = out_sender.send(Message::FullBufferProgress(
+                                    vid_id.clone(),
+                                    pct_end,
+                                    base_downloaded + downloaded,
+                                    base_downloaded + downloaded,
+                                    current_speed_bps,
+                                )).await;
+                            }
+                        }
+                    }
+
+                    file.flush().await.map_err(|e| e.to_string())?;
+                    tokio::fs::rename(&part_path, &dest_path).await.map_err(|e| e.to_string())?;
+                    Ok::<u64, String>(downloaded)
                 }
-                file.flush().await.map_err(|e| e.to_string())?;
-                tokio::fs::rename(&v_part, &v_dest).await.map_err(|e| e.to_string())?;
-                Ok::<u64, String>(downloaded)
             };
 
-            let v_bytes = match dl_video.await {
+            let v_bytes = match download_stream_chunked(
+                v_url,
+                v_part.clone(),
+                v_dest.clone(),
+                v_range.0,
+                v_range.1,
+                0,
+                0,
+                output.clone(),
+                video_id.clone(),
+            ).await {
                 Ok(b) => b,
                 Err(e) => {
                     eprintln!("[Mitub Full Buffer Download Error for {video_id}]: {e}");
@@ -1055,66 +1197,23 @@ fn start_full_buffer_task(
             let mut a_bytes: u64 = 0;
             let final_a_dest = if let Some(audio_url) = a_url {
                 let _ = output.send(Message::FullBufferProgress(video_id.clone(), 78, v_bytes, v_bytes, 0)).await;
-
                 let a_range = (78u8, 98u8);
-                let dl_audio = async {
-                    use iced::futures::StreamExt;
-                    use tokio::io::AsyncWriteExt;
 
-                    let resp = client
-                        .get(&audio_url)
-                        .header(reqwest::header::REFERER, "https://www.youtube.com/")
-                        .header(reqwest::header::ORIGIN, "https://www.youtube.com")
-                        .send()
-                        .await
-                        .map_err(|e| e.to_string())?;
-
-                    if !resp.status().is_success() {
-                        return Err(format!("HTTP {}", resp.status()));
+                match download_stream_chunked(
+                    audio_url,
+                    a_part.clone(),
+                    a_dest.clone(),
+                    a_range.0,
+                    a_range.1,
+                    v_bytes,
+                    v_bytes,
+                    output.clone(),
+                    video_id.clone(),
+                ).await {
+                    Ok(b) => {
+                        a_bytes = b;
+                        Some(a_dest)
                     }
-                    let total_size = resp.content_length().unwrap_or(0);
-                    let mut file = tokio::fs::File::create(&a_part).await.map_err(|e| e.to_string())?;
-                    let mut stream = resp.bytes_stream();
-                    let mut downloaded: u64 = 0;
-                    let mut last_pct = a_range.0;
-                    let mut last_speed_time = std::time::Instant::now();
-                    let mut last_speed_bytes: u64 = 0;
-                    let mut current_speed_bps: u64 = 0;
-                    let mut last_emit_time = std::time::Instant::now();
-
-                    while let Some(chunk_res) = stream.next().await {
-                        let chunk = chunk_res.map_err(|e| e.to_string())?;
-                        file.write_all(&chunk).await.map_err(|e| e.to_string())?;
-                        downloaded += chunk.len() as u64;
-
-                        let now = std::time::Instant::now();
-                        let elapsed_speed = now.duration_since(last_speed_time).as_secs_f64();
-                        if elapsed_speed >= 0.3 {
-                            let diff = downloaded.saturating_sub(last_speed_bytes);
-                            current_speed_bps = (diff as f64 / elapsed_speed) as u64;
-                            last_speed_bytes = downloaded;
-                            last_speed_time = now;
-                        }
-
-                        if total_size > 0 {
-                            let p = a_range.0 as f32
-                                + (downloaded as f32 / total_size as f32)
-                                    * (a_range.1 - a_range.0) as f32;
-                            let p_u8 = p.clamp(a_range.0 as f32, a_range.1 as f32) as u8;
-                            if p_u8 > last_pct || now.duration_since(last_emit_time).as_millis() >= 300 {
-                                last_pct = p_u8;
-                                last_emit_time = now;
-                                let _ = output.send(Message::FullBufferProgress(video_id.clone(), p_u8, v_bytes + downloaded, v_bytes + total_size, current_speed_bps)).await;
-                            }
-                        }
-                    }
-                    file.flush().await.map_err(|e| e.to_string())?;
-                    tokio::fs::rename(&a_part, &a_dest).await.map_err(|e| e.to_string())?;
-                    Ok::<u64, String>(downloaded)
-                };
-
-                match dl_audio.await {
-                    Ok(b) => a_bytes = b,
                     Err(e) => {
                         eprintln!("[Mitub Full Buffer Audio Download Error for {video_id}]: {e}");
                         let _ = tokio::fs::remove_file(&a_part).await;
@@ -1122,7 +1221,6 @@ fn start_full_buffer_task(
                         return;
                     }
                 }
-                Some(a_dest)
             } else {
                 None
             };
@@ -4128,13 +4226,9 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
 
             Message::SubscriptionsLoaded(res) => {
                 self.trigger_unblur_transition();
-                if let Ok(r) = self.auth_session.try_read() {
-                    if r.is_authenticated() {
-                        self.auth_status = "[OK] Sesion activa de YouTube".to_string();
-                    }
-                }
                 match res {
                     Ok(videos) => {
+                        self.auth_status = "[OK] Sesión activa de YouTube".to_string();
                         if !matches!(self.current_view, ViewMode::Subscriptions) {
                             return Task::none();
                         }
@@ -4160,6 +4254,9 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                         }
                     }
                     Err(err) => {
+                        if err.contains("SESSION_EXPIRED") {
+                            return self.update(Message::SessionExpired);
+                        }
                         eprintln!("[Mitub] Error al cargar suscripciones de YouTube: {err}");
                     }
                 }
@@ -4192,13 +4289,9 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
 
             Message::HistoryLoaded(res) => {
                 self.trigger_unblur_transition();
-                if let Ok(r) = self.auth_session.try_read() {
-                    if r.is_authenticated() {
-                        self.auth_status = "[OK] Sesion activa de YouTube".to_string();
-                    }
-                }
                 match res {
                     Ok(mut videos) => {
+                        self.auth_status = "[OK] Sesión activa de YouTube".to_string();
                         if !matches!(self.current_view, ViewMode::History) {
                             return Task::none();
                         }
@@ -4250,6 +4343,9 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                         }
                     }
                     Err(err) => {
+                        if err.contains("SESSION_EXPIRED") {
+                            return self.update(Message::SessionExpired);
+                        }
                         eprintln!("[Mitub] Error al cargar historial de la cuenta de YouTube (usando respaldo local): {err}");
                         if !self.config.local_history.is_empty() {
                             self.home_videos = self
@@ -4302,13 +4398,9 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
 
             Message::PlaylistsLoaded(res) => {
                 self.trigger_unblur_transition();
-                if let Ok(r) = self.auth_session.try_read() {
-                    if r.is_authenticated() {
-                        self.auth_status = "[OK] Sesion activa de YouTube".to_string();
-                    }
-                }
                 match res {
                     Ok(videos) => {
+                        self.auth_status = "[OK] Sesión activa de YouTube".to_string();
                         if !matches!(self.current_view, ViewMode::Playlists) {
                             return Task::none();
                         }
@@ -4334,6 +4426,9 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                         }
                     }
                     Err(err) => {
+                        if err.contains("SESSION_EXPIRED") {
+                            return self.update(Message::SessionExpired);
+                        }
                         eprintln!("[Mitub] Error al cargar playlists de YouTube: {err}");
                     }
                 }
@@ -4341,6 +4436,13 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
             }
 
             Message::UserProfileLoaded(url_opt, name_opt) => {
+                if url_opt.is_none() && name_opt.is_none() {
+                    let is_authed = self.auth_session.try_read().map(|r| r.is_authenticated()).unwrap_or(false);
+                    if is_authed {
+                        // YouTube did not recognize the session as active
+                        return self.update(Message::SessionExpired);
+                    }
+                }
                 if let Some(name) = name_opt {
                     self.user_display_name = Some(name.clone());
                     self.config.cached_user_name = Some(name);
@@ -5325,6 +5427,57 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                 } else {
                     self.auth_status = "[Error] No se detecto SAPISID o cookies validas".to_string();
                 }
+                Task::none()
+            }
+
+            Message::OpenBrowserLogin => {
+                let _ = std::process::Command::new("xdg-open")
+                    .arg("https://accounts.google.com/ServiceLogin?service=youtube&continue=https%3A%2F%2Fwww.youtube.com%2Fsignin%3Faction_handle_signin%3Dtrue")
+                    .spawn();
+                self.auth_status = "Navegador abierto. Inicia sesión en YouTube y luego pulsa 'Sincronizar sesión de Navegador'.".to_string();
+                Task::none()
+            }
+
+            Message::SyncBrowserSession => {
+                self.auth_status = "Detectando y sincronizando sesión desde tu navegador...".to_string();
+                Task::perform(
+                    async move {
+                        // Priority 1: Check Firefox
+                        if let Ok(ff) = tokio::task::spawn_blocking(AuthSession::from_firefox).await.unwrap_or(Err("".into())) {
+                            if ff.verify_active_session().await {
+                                return Ok(ff);
+                            }
+                        }
+                        // Priority 2: Check Chrome
+                        if let Ok(cr) = tokio::task::spawn_blocking(AuthSession::from_chrome).await.unwrap_or(Err("".into())) {
+                            if cr.verify_active_session().await {
+                                return Ok(cr);
+                            }
+                        }
+                        // Priority 3: Fallback without strict verify if cookies extracted
+                        if let Ok(ff) = tokio::task::spawn_blocking(AuthSession::from_firefox).await.unwrap_or(Err("".into())) {
+                            if ff.is_authenticated() {
+                                return Ok(ff);
+                            }
+                        }
+                        Err("No se detectó ninguna sesión activa de YouTube en tus navegadores. Inicia sesión primero con el botón de arriba.".to_string())
+                    },
+                    Message::FirefoxCookiesImported,
+                )
+            }
+
+            Message::SessionExpired => {
+                let _ = AuthSession::clear_from_disk();
+                let guest_session = AuthSession::default();
+                self.innertube.set_session(guest_session);
+                self.auth_status = "Sesión no iniciada (Modo invitado)".to_string();
+                self.user_display_name = None;
+                self.user_avatar_handle = None;
+                self.user_avatar_url = None;
+                self.config.cached_user_name = None;
+                self.config.cached_avatar_url = None;
+                self.config.save_async();
+                self.toast_message = Some(("Tu sesión de Google expiró. Has pasado a Modo Invitado.".to_string(), std::time::Instant::now()));
                 Task::none()
             }
 
@@ -7379,6 +7532,8 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
                 self.current_cache_size_bytes,
                 Message::CookieInputChanged,
                 Message::SaveRawCookie,
+                Message::OpenBrowserLogin,
+                Message::SyncBrowserSession,
                 Message::ImportFirefoxCookies,
                 Message::ImportChromeCookies,
                 Message::Logout,

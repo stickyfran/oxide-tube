@@ -196,6 +196,26 @@ pub fn json_has_subscribed_true(val: &Value) -> bool {
 }
 
 impl InnerTubeClient {
+    /// Inspects an InnerTube JSON response to determine if YouTube recognizes the user as logged in
+    pub fn is_response_logged_in(json_val: &Value) -> bool {
+        if let Some(params) = json_val
+            .get("responseContext")
+            .and_then(|rc| rc.get("serviceTrackingParams"))
+            .and_then(|st| st.as_array())
+        {
+            for stp in params {
+                if let Some(p_arr) = stp.get("params").and_then(|p| p.as_array()) {
+                    for item in p_arr {
+                        if item.get("key").and_then(|k| k.as_str()) == Some("logged_in") {
+                            return item.get("value").and_then(|v| v.as_str()) == Some("1");
+                        }
+                    }
+                }
+            }
+        }
+        false
+    }
+
     pub fn new(session: Arc<RwLock<AuthSession>>) -> Self {
         let client = reqwest::Client::builder()
             .gzip(true)
@@ -922,18 +942,24 @@ impl InnerTubeClient {
 
         let mut videos = Vec::new();
         let mut next_token: Option<String> = None;
+        let mut was_logged_in = false;
         for attempt in 0..2 {
             let headers = self.build_headers().await;
             let resp = self.client.post(&url).headers(headers).json(&body).send().await?;
             self.capture_set_cookies(resp.headers()).await;
             let json_val: Value = Self::resp_simd_json(resp).await?;
             self.capture_visitor_data(&json_val).await;
+            was_logged_in = Self::is_response_logged_in(&json_val);
             Self::collect_video_cards(&json_val, &mut videos);
             next_token = Self::extract_feed_continuation_token(&json_val);
 
             if !videos.is_empty() || attempt == 1 || !self.try_refresh_firefox_session().await {
                 break;
             }
+        }
+
+        if !was_logged_in && self.session.read().await.is_authenticated() {
+            return Err("SESSION_EXPIRED: YouTube requiere iniciar sesión".into());
         }
 
         *self.feed_continuation.write().await = next_token.map(|t| ("browse".to_string(), t));
@@ -1000,18 +1026,24 @@ impl InnerTubeClient {
 
         let mut videos = Vec::new();
         let mut next_token: Option<String> = None;
+        let mut was_logged_in = false;
         for attempt in 0..2 {
             let headers = self.build_headers().await;
             let resp = self.client.post(&url).headers(headers).json(&body).send().await?;
             self.capture_set_cookies(resp.headers()).await;
             let json_val: Value = Self::resp_simd_json(resp).await?;
             self.capture_visitor_data(&json_val).await;
+            was_logged_in = Self::is_response_logged_in(&json_val);
             Self::collect_video_cards(&json_val, &mut videos);
             next_token = Self::extract_feed_continuation_token(&json_val);
 
             if !videos.is_empty() || attempt == 1 || !self.try_refresh_firefox_session().await {
                 break;
             }
+        }
+
+        if !was_logged_in && self.session.read().await.is_authenticated() {
+            return Err("SESSION_EXPIRED: YouTube requiere iniciar sesión".into());
         }
 
         *self.feed_continuation.write().await = next_token.map(|t| ("browse".to_string(), t));
@@ -1163,6 +1195,10 @@ impl InnerTubeClient {
         if let Ok(resp) = self.client.post(&url).headers(headers).json(&body).send().await {
             if resp.status().is_success() {
                 if let Ok(val) = Self::resp_simd_json(resp).await {
+                    // Check if response indicates active login
+                    if !Self::is_response_logged_in(&val) {
+                        return (None, None);
+                    }
                     let (a, n) = Self::extract_user_profile(&val);
                     if a.is_some() || n.is_some() {
                         return (a, n);

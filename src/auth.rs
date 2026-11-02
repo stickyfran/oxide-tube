@@ -218,32 +218,38 @@ impl AuthSession {
             None => return Err("No se encontró el archivo cookies.sqlite de Firefox".into()),
         };
 
-        // Copy cookies.sqlite + cookies.sqlite-wal + cookies.sqlite-shm to a temporary directory.
-        // Opening with `?immutable=1` ignores the WAL file where running Firefox stores rotated
-        // `__Secure-1PSIDTS` and `__Secure-3PSIDTS` tokens, which caused expired session reads!
-        let pid = std::process::id();
-        let tmp_dir = std::env::temp_dir().join(format!("mitub_ff_cookies_{pid}"));
-        let _ = fs::create_dir_all(&tmp_dir);
-        let tmp_db = tmp_dir.join("cookies.sqlite");
+        // Open cookies.sqlite using SQLite URI with immutable=1, or fallback to temporary directory copy with WAL journal
+        let conn_res = Connection::open_with_flags(
+            format!("file:{}?immutable=1", cookie_file.to_string_lossy()),
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+        );
 
-        fs::copy(&cookie_file, &tmp_db)?;
-        if let Some(parent) = cookie_file.parent() {
-            let wal_src = parent.join("cookies.sqlite-wal");
-            if wal_src.exists() {
-                let _ = fs::copy(&wal_src, tmp_dir.join("cookies.sqlite-wal"));
-            }
-            let shm_src = parent.join("cookies.sqlite-shm");
-            if shm_src.exists() {
-                let _ = fs::copy(&shm_src, tmp_dir.join("cookies.sqlite-shm"));
-            }
-        }
+        let (conn, _tmp_cleanup) = match conn_res {
+            Ok(c) => (c, None),
+            Err(_) => {
+                let pid = std::process::id();
+                let tmp_dir = std::env::temp_dir().join(format!("mitub_ff_cookies_{pid}"));
+                let _ = fs::create_dir_all(&tmp_dir);
+                let tmp_db = tmp_dir.join("cookies.sqlite");
 
-        let conn_res = Connection::open_with_flags(&tmp_db, OpenFlags::SQLITE_OPEN_READ_ONLY);
-        let conn = match conn_res {
-            Ok(c) => c,
-            Err(e) => {
-                let _ = fs::remove_dir_all(&tmp_dir);
-                return Err(e.into());
+                fs::copy(&cookie_file, &tmp_db)?;
+                if let Some(parent) = cookie_file.parent() {
+                    let wal_src = parent.join("cookies.sqlite-wal");
+                    if wal_src.exists() {
+                        let _ = fs::copy(&wal_src, tmp_dir.join("cookies.sqlite-wal"));
+                    }
+                    let shm_src = parent.join("cookies.sqlite-shm");
+                    if shm_src.exists() {
+                        let _ = fs::copy(&shm_src, tmp_dir.join("cookies.sqlite-shm"));
+                    }
+                }
+
+                let fallback_conn = Connection::open_with_flags(&tmp_db, OpenFlags::SQLITE_OPEN_READ_ONLY)
+                    .map_err(|e| {
+                        let _ = fs::remove_dir_all(&tmp_dir);
+                        e
+                    })?;
+                (fallback_conn, Some(tmp_dir))
             }
         };
 
@@ -251,7 +257,7 @@ impl AuthSession {
         // and ensure `.youtube.com` cookies always override `.google.com` cookies!
         let mut stmt = conn.prepare(
             "SELECT name, value FROM moz_cookies \
-             WHERE (host = '.youtube.com' OR host = 'www.youtube.com' OR host = 'youtube.com' OR host = '.google.com') \
+             WHERE (host LIKE '%youtube.com' OR host LIKE '%google.com' OR host LIKE '%google.com%') \
                AND (originAttributes = '' OR originAttributes LIKE '%youtube.com%') \
              ORDER BY CASE WHEN host LIKE '%youtube.com' THEN 1 ELSE 0 END ASC, lastAccessed ASC",
         )?;
@@ -269,7 +275,9 @@ impl AuthSession {
 
         drop(stmt);
         drop(conn);
-        let _ = fs::remove_dir_all(&tmp_dir);
+        if let Some(tmp_dir) = _tmp_cleanup {
+            let _ = fs::remove_dir_all(&tmp_dir);
+        }
 
         if session.cookies.is_empty() || !session.is_authenticated() {
             return Err("No se encontraron cookies activas de YouTube en Firefox".into());
@@ -535,5 +543,73 @@ impl AuthSession {
         }
 
         Some(parts.join(" "))
+    }
+
+    /// Verifies if the stored credentials represent an active authenticated YouTube session
+    /// by calling YouTube's account menu endpoint with SAPISID authorization.
+    pub async fn verify_active_session(&self) -> bool {
+        if !self.is_authenticated() {
+            return false;
+        }
+
+        let sapisid = match self.cookies.get("SAPISID")
+            .or_else(|| self.cookies.get("__Secure-3PAPISID"))
+            .or_else(|| self.cookies.get("__Secure-1PAPISID")) {
+            Some(s) if !s.is_empty() => s,
+            _ => return false,
+        };
+
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let mut hasher = Sha1::new();
+        hasher.update(format!("{ts} {sapisid} https://www.youtube.com").as_bytes());
+        let hash = hex::encode(hasher.finalize());
+        let auth_val = format!("SAPISIDHASH {ts}_{hash}");
+
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(6))
+            .build()
+            .unwrap_or_default();
+
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(reqwest::header::USER_AGENT, reqwest::header::HeaderValue::from_static("Mozilla/5.0 (X11; Linux x86_64; rv:132.0) Gecko/20100101 Firefox/132.0"));
+        headers.insert(reqwest::header::ORIGIN, reqwest::header::HeaderValue::from_static("https://www.youtube.com"));
+        headers.insert("X-Origin", reqwest::header::HeaderValue::from_static("https://www.youtube.com"));
+        headers.insert("X-Youtube-Client-Name", reqwest::header::HeaderValue::from_static("1"));
+        headers.insert("X-Youtube-Client-Version", reqwest::header::HeaderValue::from_static("2.20241028.01.00"));
+        if let Ok(v) = reqwest::header::HeaderValue::from_str(&auth_val) {
+            headers.insert(reqwest::header::AUTHORIZATION, v);
+        }
+        let cookie_str = self.cookie_header();
+        if let Ok(c) = reqwest::header::HeaderValue::from_str(&cookie_str) {
+            headers.insert(reqwest::header::COOKIE, c);
+        }
+
+        let body = serde_json::json!({
+            "context": {
+                "client": {
+                    "clientName": "WEB",
+                    "clientVersion": "2.20241028.01.00"
+                }
+            }
+        });
+
+        if let Ok(resp) = client.post("https://www.youtube.com/youtubei/v1/account/account_menu?prettyPrint=false")
+            .headers(headers)
+            .json(&body)
+            .send()
+            .await
+        {
+            if resp.status().is_success() {
+                if let Ok(val) = resp.json::<serde_json::Value>().await {
+                    return crate::innertube::InnerTubeClient::is_response_logged_in(&val);
+                }
+            }
+        }
+
+        false
     }
 }

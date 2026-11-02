@@ -721,6 +721,8 @@ pub fn view_auth_modal<'a, Message: Clone + 'static>(
     current_cache_size_bytes: u64,
     on_cookie_input: impl Fn(String) -> Message + 'static,
     on_save_raw_cookie: Message,
+    on_open_browser_login: Message,
+    on_sync_browser_session: Message,
     on_import_firefox: Message,
     on_import_chrome: Message,
     on_logout: Message,
@@ -1187,38 +1189,76 @@ pub fn view_auth_modal<'a, Message: Clone + 'static>(
                 .padding([6, 14])
                 .on_press(on_logout);
 
+                let sync_btn = button(
+                    row![
+                        icon_user(13.0),
+                        text("Re-sincronizar").size(12).color(COLOR_TEXT_PRIMARY),
+                    ]
+                    .spacing(6)
+                    .align_y(Alignment::Center),
+                )
+                .style(ghost_button)
+                .padding([6, 12])
+                .on_press(on_sync_browser_session.clone());
+
                 row![
                     text("Sesión sincronizada activamente.")
                         .size(12)
                         .color(COLOR_TEXT_SECONDARY),
                     Space::with_width(Length::Fill),
+                    sync_btn,
                     logout_btn,
                 ]
+                .spacing(8)
                 .align_y(Alignment::Center)
                 .into()
             } else {
-                let firefox_btn = button(
+                let browser_login_btn = button(
                     row![
-                        icon_user(13.0),
-                        text("Importar desde Firefox").size(12).color(COLOR_TEXT_PRIMARY),
+                        icon_user(14.0),
+                        text("1. Abrir inicio de sesión en Navegador").size(12).color(iced::Color::WHITE),
+                    ]
+                    .spacing(6)
+                    .align_y(Alignment::Center),
+                )
+                .style(primary_button)
+                .padding([8, 14])
+                .on_press(on_open_browser_login);
+
+                let sync_browser_btn = button(
+                    row![
+                        icon_play(12.0),
+                        text("2. Sincronizar sesión activa").size(12).color(COLOR_TEXT_PRIMARY),
                     ]
                     .spacing(6)
                     .align_y(Alignment::Center),
                 )
                 .style(secondary_button)
-                .padding([6, 12])
+                .padding([8, 14])
+                .on_press(on_sync_browser_session);
+
+                let firefox_btn = button(
+                    row![
+                        icon_user(12.0),
+                        text("Firefox directo").size(11).color(COLOR_TEXT_SECONDARY),
+                    ]
+                    .spacing(4)
+                    .align_y(Alignment::Center),
+                )
+                .style(ghost_button)
+                .padding([4, 8])
                 .on_press(on_import_firefox);
 
                 let chrome_btn = button(
                     row![
-                        icon_user(13.0),
-                        text("Importar desde Chrome").size(12).color(COLOR_TEXT_PRIMARY),
+                        icon_user(12.0),
+                        text("Chrome directo").size(11).color(COLOR_TEXT_SECONDARY),
                     ]
-                    .spacing(6)
+                    .spacing(4)
                     .align_y(Alignment::Center),
                 )
-                .style(secondary_button)
-                .padding([6, 12])
+                .style(ghost_button)
+                .padding([4, 8])
                 .on_press(on_import_chrome);
 
                 let input = text_input("O pega aquí tu Cookie: SAPISID=...; HSID=...", raw_cookie_input)
@@ -1237,7 +1277,12 @@ pub fn view_auth_modal<'a, Message: Clone + 'static>(
                     )
                     .size(11)
                     .color(COLOR_TEXT_SECONDARY),
-                    row![firefox_btn, chrome_btn].spacing(8).align_y(Alignment::Center),
+                    row![browser_login_btn, sync_browser_btn].spacing(8).align_y(Alignment::Center),
+                    row![
+                        text("Opciones avanzadas:").size(11).color(COLOR_TEXT_SECONDARY),
+                        firefox_btn,
+                        chrome_btn
+                    ].spacing(6).align_y(Alignment::Center),
                     input,
                     row![save_btn].align_y(Alignment::Center),
                 ]
