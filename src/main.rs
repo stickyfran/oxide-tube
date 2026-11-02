@@ -300,7 +300,6 @@ pub struct MitubApp {
     tab_opened_anim: Option<(usize, std::time::Instant)>,
     tab_shake_anim: Option<(usize, std::time::Instant)>,
     hovered_tab: Option<(usize, std::time::Instant)>,
-    search_focus_anim: Option<(bool, std::time::Instant)>,
     current_cache_size_bytes: u64,
     closed_tabs_history: std::collections::VecDeque<ui::VideoTab>,
     tabs_scroll_x: f32,
@@ -312,6 +311,9 @@ pub struct MitubApp {
     is_window_hidden: bool,
     cursor_hidden_fullscreen: bool,
     suppress_autoplay_on_launch: bool,
+    playing_from_local: bool,
+    search_anim: Option<(f32, f32, std::time::Instant, f32)>,
+    search_hover_exit_at: Option<std::time::Instant>,
 }
 
 fn get_ipc_port() -> u16 {
@@ -1414,7 +1416,6 @@ impl MitubApp {
             tab_opened_anim: None,
             tab_shake_anim: None,
             hovered_tab: None,
-            search_focus_anim: None,
             search_request_id: 0,
             current_cache_size_bytes: 0,
             closed_tabs_history: std::collections::VecDeque::with_capacity(5),
@@ -1427,6 +1428,9 @@ impl MitubApp {
             is_window_hidden: false,
             cursor_hidden_fullscreen: false,
             suppress_autoplay_on_launch: false,
+            playing_from_local: false,
+            search_anim: None,
+            search_hover_exit_at: None,
         };
 
         // Initial tasks: fetch home feed & bind Wayland window pointers
@@ -1975,17 +1979,27 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
     fn current_search_bar_width(&self) -> f32 {
         let is_expanded = self.search_hovered || self.search_input_focused || !self.search_query.is_empty();
         let target_w = if is_expanded { 300.0 } else { 145.0 };
-        if let Some((expanded, inst)) = self.search_focus_anim {
+        if let Some((from_w, to_w, inst, dur)) = self.search_anim {
             let elapsed = inst.elapsed().as_secs_f32();
-            let dur = 0.16; // 160ms cubic ease-out
-            if elapsed < dur {
+            if elapsed < dur && dur > 0.001 {
                 let t = (elapsed / dur).clamp(0.0, 1.0);
                 let ease = 1.0 - (1.0 - t).powi(3);
-                let (from_w, to_w) = if expanded { (145.0, 300.0) } else { (300.0, 145.0) };
                 return from_w + (to_w - from_w) * ease;
             }
         }
         target_w
+    }
+
+    fn trigger_search_anim(&mut self, target_w: f32) {
+        let cur_w = self.current_search_bar_width();
+        if (cur_w - target_w).abs() < 1.0 {
+            self.search_anim = None;
+            return;
+        }
+        // Proportional duration: velocity is constant regardless of remaining distance
+        let dist = (target_w - cur_w).abs();
+        let dur = (0.16 * (dist / 155.0)).clamp(0.04, 0.20);
+        self.search_anim = Some((cur_w, target_w, std::time::Instant::now(), dur));
     }
 
     fn find_video_title(&self, video_id: &str) -> String {
@@ -2808,6 +2822,43 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                 self.sync_player_viewport();
                 power_manager::trim_process_memory();
 
+                // Check if video is already downloaded locally (both video and audio files exist and no orphan .part)
+                let cache_dir = crate::cache_manager::video_cache_dir();
+                let v_file = cache_dir.join(format!("{video_id}_video.mp4"));
+                let a_file = cache_dir.join(format!("{video_id}_audio.mp4"));
+                let v_part = cache_dir.join(format!("{video_id}_video.part"));
+                let a_part = cache_dir.join(format!("{video_id}_audio.part"));
+
+                let is_cached = v_file.is_file()
+                    && std::fs::metadata(&v_file).map(|m| m.len() > 1024).unwrap_or(false)
+                    && (!a_file.exists() || std::fs::metadata(&a_file).map(|m| m.len() > 1024).unwrap_or(false))
+                    && !v_part.exists()
+                    && !a_part.exists();
+
+                if is_cached {
+                    let total_sz = std::fs::metadata(&v_file).map(|m| m.len()).unwrap_or(0)
+                        + a_file.metadata().map(|m| m.len()).unwrap_or(0);
+                    let title = matched_card.as_ref().map(|c| c.title.clone()).unwrap_or_else(|| self.find_video_title(&video_id));
+                    self.buffer_downloads.insert(
+                        video_id.clone(),
+                        BufferDownloadState {
+                            title,
+                            percent: 100,
+                            downloaded_bytes: total_sz,
+                            total_bytes: total_sz,
+                            speed_bytes_per_sec: 0,
+                            is_complete: true,
+                            video_path: Some(v_file.clone()),
+                            audio_path: if a_file.is_file() { Some(a_file.clone()) } else { None },
+                        },
+                    );
+                    self.osd_state.is_fully_buffered = true;
+                    self.playing_from_local = true;
+                } else {
+                    self.osd_state.is_fully_buffered = false;
+                    self.playing_from_local = false;
+                }
+
                 self.current_request_id = self.current_request_id.wrapping_add(1);
                 let req_id = self.current_request_id;
 
@@ -3302,7 +3353,8 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
             Message::SearchInputChanged(query) => {
                 if !self.search_input_focused {
                     self.search_input_focused = true;
-                    self.search_focus_anim = Some((true, std::time::Instant::now()));
+                    self.search_hover_exit_at = None;
+                    self.trigger_search_anim(300.0);
                 }
                 self.search_query = query.clone();
                 self.search_request_id = self.search_request_id.wrapping_add(1);
@@ -3335,7 +3387,7 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
             Message::SelectSuggestion(query) => {
                 if self.search_input_focused {
                     self.search_input_focused = false;
-                    self.search_focus_anim = Some((false, std::time::Instant::now()));
+                    self.trigger_search_anim(if self.search_hovered { 300.0 } else { 145.0 });
                 }
                 self.search_query = query;
                 self.show_suggestions = false;
@@ -3345,7 +3397,7 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
             Message::SearchSubmitted => {
                 if self.search_input_focused {
                     self.search_input_focused = false;
-                    self.search_focus_anim = Some((false, std::time::Instant::now()));
+                    self.trigger_search_anim(if self.search_hovered { 300.0 } else { 145.0 });
                 }
                 let query = self.search_query.trim().to_string();
                 if query.is_empty() {
@@ -3792,6 +3844,29 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                 crate::diagnostics::session_seek_start(self.osd_state.current_pos_secs * 1000, target_secs * 1000);
                 self.osd_state.close_all_menus();
                 if let Some(player) = &self.player {
+                    // Deferred hot-swap: if video finished downloading while playing from web, switch to local seamlessly on seek
+                    if self.osd_state.is_fully_buffered && !self.playing_from_local {
+                        if let Some(vid) = &self.playing_video_id {
+                            if let Some(buf_st) = self.buffer_downloads.get(vid) {
+                                if buf_st.is_complete && buf_st.video_path.is_some() {
+                                    let v_p = buf_st.video_path.as_ref().unwrap();
+                                    let v_str = format!("file://{}", v_p.to_string_lossy());
+                                    let a_str = buf_st.audio_path.as_ref().map(|p| format!("file://{}", p.to_string_lossy()));
+                                    let is_playing = self.osd_state.is_playing;
+                                    self.playing_from_local = true;
+                                    if is_playing {
+                                        let _ = player.play_stream_with_seek(&v_str, a_str.as_deref(), Some(target_secs * 1000));
+                                    } else {
+                                        let _ = player.play_stream_with_seek_paused(&v_str, a_str.as_deref(), Some(target_secs * 1000));
+                                    }
+                                    self.osd_state.current_pos_secs = target_secs;
+                                    self.seek_suppress_until = Some(std::time::Instant::now() + Duration::from_millis(800));
+                                    return Task::none();
+                                }
+                            }
+                        }
+                    }
+
                     player.seek_ms(target_secs * 1000);
                     self.osd_state.current_pos_secs = target_secs;
                     self.seek_suppress_until = Some(std::time::Instant::now() + Duration::from_millis(800));
@@ -5289,7 +5364,8 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                 self.current_view = ViewMode::Home;
                 self.search_query.clear();
                 self.search_input_focused = true;
-                self.search_focus_anim = Some((true, std::time::Instant::now()));
+                self.search_hover_exit_at = None;
+                self.trigger_search_anim(300.0);
                 self.show_suggestions = false;
                 self.sync_player_viewport();
 
@@ -5761,7 +5837,8 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                             if self.search_hovered {
                                 if !self.search_input_focused {
                                     self.search_input_focused = true;
-                                    self.search_focus_anim = Some((true, std::time::Instant::now()));
+                                    self.search_hover_exit_at = None;
+                                    self.trigger_search_anim(300.0);
                                     if self.search_query.trim().len() >= 2 && !self.suggestions.is_empty() {
                                         self.show_suggestions = true;
                                     }
@@ -5769,7 +5846,7 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                             } else if !in_suggestions && self.search_input_focused {
                                 self.search_input_focused = false;
                                 let is_expanded = self.search_hovered || !self.search_query.is_empty();
-                                self.search_focus_anim = Some((is_expanded, std::time::Instant::now()));
+                                self.trigger_search_anim(if is_expanded { 300.0 } else { 145.0 });
                                 self.show_suggestions = false;
                             }
                         }
@@ -5845,7 +5922,7 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                                 if let Key::Named(Named::Escape) = key {
                                     self.search_input_focused = false;
                                     let is_expanded = self.search_hovered || !self.search_query.is_empty();
-                                    self.search_focus_anim = Some((is_expanded, std::time::Instant::now()));
+                                    self.trigger_search_anim(if is_expanded { 300.0 } else { 145.0 });
                                     self.show_suggestions = false;
                                     return Task::none();
                                 }
@@ -5861,7 +5938,7 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                                     Key::Named(Named::Escape) if self.search_input_focused => {
                                         self.search_input_focused = false;
                                         let is_expanded = self.search_hovered || !self.search_query.is_empty();
-                                        self.search_focus_anim = Some((is_expanded, std::time::Instant::now()));
+                                        self.trigger_search_anim(if is_expanded { 300.0 } else { 145.0 });
                                         self.show_suggestions = false;
                                         return Task::none();
                                     }
@@ -6180,7 +6257,6 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
             }
 
             Message::FullBufferComplete(video_id, v_path, a_path) => {
-                // Download-only: the file is stored for later playback; the stream currently playing is never swapped.
                 let title = self.find_video_title(&video_id);
                 crate::cache_manager::save_video_title(&video_id, &title);
                 let size = std::fs::metadata(&v_path).map(|m| m.len()).unwrap_or(0)
@@ -6199,6 +6275,10 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                     },
                 );
 
+                if self.playing_video_id.as_deref() == Some(&video_id) {
+                    self.osd_state.is_fully_buffered = true;
+                }
+
                 // Prune cache if exceeding configured limit and refresh size
                 self.prune_and_refresh_cache_task()
             }
@@ -6216,10 +6296,17 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
             }
 
             Message::SearchHoverChanged(hovered) => {
-                if self.search_hovered != hovered {
-                    self.search_hovered = hovered;
-                    let is_expanded = self.search_hovered || self.search_input_focused || !self.search_query.is_empty();
-                    self.search_focus_anim = Some((is_expanded, std::time::Instant::now()));
+                if hovered {
+                    self.search_hover_exit_at = None;
+                    if !self.search_hovered {
+                        self.search_hovered = true;
+                        self.trigger_search_anim(300.0);
+                    }
+                } else if self.search_hovered {
+                    // Grace period: cancel hover only if not immediately re-entered
+                    self.search_hovered = false;
+                    let is_expanded = self.search_input_focused || !self.search_query.is_empty();
+                    self.trigger_search_anim(if is_expanded { 300.0 } else { 145.0 });
                 }
                 Task::none()
             }
@@ -6470,7 +6557,9 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
             0.0
         };
 
-        let buffered_ratio = if effective_dur > 0 {
+        let buffered_ratio = if self.osd_state.is_fully_buffered {
+            1.0
+        } else if effective_dur > 0 {
             (self.osd_state.buffered_pos_secs as f32 / effective_dur as f32).clamp(progress_ratio, 1.0)
         } else {
             0.0
@@ -7672,8 +7761,8 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
         let is_tab_hover_animating = self.hovered_tab
             .map(|(_, t)| t.elapsed().as_millis() < 360)
             .unwrap_or(false);
-        let is_search_animating = self.search_focus_anim
-            .map(|(_, t)| t.elapsed().as_secs_f32() < 0.18)
+        let is_search_animating = self.search_anim
+            .map(|(_, _, t, dur)| t.elapsed().as_secs_f32() < dur)
             .unwrap_or(false);
 
         let has_active_animation = is_transitioning

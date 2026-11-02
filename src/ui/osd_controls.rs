@@ -606,6 +606,7 @@ pub struct OsdState {
     pub preferred_resolution: PreferredResolution,
     pub set_as_default_quality: bool,
     pub has_playback_error: bool,
+    pub is_fully_buffered: bool,
 }
 
 impl Default for OsdState {
@@ -641,6 +642,7 @@ impl Default for OsdState {
             preferred_resolution: PreferredResolution::Res1080p,
             set_as_default_quality: true,
             has_playback_error: false,
+            is_fully_buffered: false,
         }
     }
 }
@@ -1210,7 +1212,9 @@ pub fn view_control_bar<'a, Message: Clone + 'static>(
         0.0
     };
 
-    let buffered_ratio = if effective_dur > 0 {
+    let buffered_ratio = if state.is_fully_buffered {
+        1.0
+    } else if effective_dur > 0 {
         (state.buffered_pos_secs as f32 / effective_dur as f32).clamp(progress_ratio, 1.0)
     } else {
         0.0
@@ -1326,19 +1330,21 @@ pub fn view_control_bar<'a, Message: Clone + 'static>(
     .spacing(6)
     .align_y(Alignment::Center);
 
-    if state.is_buffering {
-        time_items = time_items.push(
-            text(format!("(Cargando buffer {}%)", state.buffering_percent))
-                .size(11)
-                .color(COLOR_ACCENT_RED),
-        );
-    } else if state.buffered_pos_secs > state.current_pos_secs {
-        let ahead = state.buffered_pos_secs.saturating_sub(state.current_pos_secs);
-        time_items = time_items.push(
-            text(format!("(+{ahead}s buffer)"))
-                .size(11)
-                .color(COLOR_TEXT_SECONDARY),
-        );
+    if !state.is_fully_buffered {
+        if state.is_buffering {
+            time_items = time_items.push(
+                text(format!("(Cargando buffer {}%)", state.buffering_percent))
+                    .size(11)
+                    .color(COLOR_ACCENT_RED),
+            );
+        } else if state.buffered_pos_secs > state.current_pos_secs {
+            let ahead = state.buffered_pos_secs.saturating_sub(state.current_pos_secs);
+            time_items = time_items.push(
+                text(format!("(+{ahead}s buffer)"))
+                    .size(11)
+                    .color(COLOR_TEXT_SECONDARY),
+            );
+        }
     }
 
     if !chapters.is_empty() {

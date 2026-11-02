@@ -203,7 +203,7 @@ pub fn view_header_bar<'a, Message: Clone + 'static>(
         .padding([6, 8])
         .on_press(on_open_downloads);
 
-    let search_placeholder = if is_search_focused || !search_query.is_empty() {
+    let search_placeholder = if is_search_focused || search_bar_width > 180.0 || !search_query.is_empty() {
         "Buscar o pegar enlace..."
     } else {
         "Buscar..."
@@ -217,16 +217,20 @@ pub fn view_header_bar<'a, Message: Clone + 'static>(
         .padding([6, 12])
         .width(Length::Fixed(search_bar_width));
 
-    let search_bar = mouse_area(search_input_widget)
-        .on_enter(on_search_hover(true))
-        .on_exit(on_search_hover(false));
-
     let search_btn = button(icon_search(14.0))
         .style(secondary_button)
         .padding([6, 10])
         .on_press(on_search_submit);
 
-    let search_container = row![subs_btn, history_btn, downloads_btn, search_bar, search_btn]
+    let search_bar_compound = mouse_area(
+        row![search_input_widget, search_btn]
+            .spacing(4)
+            .align_y(Alignment::Center)
+    )
+    .on_enter(on_search_hover(true))
+    .on_exit(on_search_hover(false));
+
+    let search_container = row![subs_btn, history_btn, downloads_btn, search_bar_compound]
         .spacing(4)
         .align_y(Alignment::Center);
 
