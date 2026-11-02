@@ -1,6 +1,6 @@
 ; Inno Setup Script for Tube-oxide
 #ifndef AppVersion
-  #define AppVersion "0.99.12"
+  #define AppVersion "0.99.13"
 #endif
 
 [Setup]

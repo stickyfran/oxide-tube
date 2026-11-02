@@ -49,7 +49,6 @@ jobs:
           mkdir -p pkg
           cp target/x86_64-pc-windows-gnu/release/tube-oxide.exe pkg/
           cp mpvdev/out/*.dll pkg/ || true
-          cp assets/icon.png pkg/ 2>/dev/null || true
           cp assets/icon.ico pkg/ 2>/dev/null || true
           7z a tube-oxide-windows-x86_64-${{ github.ref_name }}.zip ./pkg/*
 

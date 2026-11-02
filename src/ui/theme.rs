@@ -1,5 +1,56 @@
 use iced::widget::{button, container, text_editor, text_input};
 use iced::{border, Color};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+static IS_AMOLED: AtomicBool = AtomicBool::new(false);
+
+pub fn set_amoled_mode(amoled: bool) {
+    IS_AMOLED.store(amoled, Ordering::Relaxed);
+}
+
+pub fn is_amoled_mode() -> bool {
+    IS_AMOLED.load(Ordering::Relaxed)
+}
+
+pub fn color_bg() -> Color {
+    if is_amoled_mode() {
+        Color::BLACK
+    } else {
+        COLOR_BG
+    }
+}
+
+pub fn color_surface() -> Color {
+    if is_amoled_mode() {
+        Color::from_rgb(0.04, 0.04, 0.04)
+    } else {
+        COLOR_SURFACE
+    }
+}
+
+pub fn color_surface_hover() -> Color {
+    if is_amoled_mode() {
+        Color::from_rgb(0.10, 0.10, 0.10)
+    } else {
+        COLOR_SURFACE_HOVER
+    }
+}
+
+pub fn color_input_bg() -> Color {
+    if is_amoled_mode() {
+        Color::from_rgb(0.03, 0.03, 0.03)
+    } else {
+        COLOR_INPUT_BG
+    }
+}
+
+pub fn color_border() -> Color {
+    if is_amoled_mode() {
+        Color::from_rgb(0.12, 0.12, 0.12)
+    } else {
+        COLOR_BORDER
+    }
+}
 
 pub fn selectable_text_editor(_theme: &iced::Theme, _status: text_editor::Status) -> text_editor::Style {
     text_editor::Style {
@@ -27,7 +78,7 @@ pub const COLOR_OSD_BG: Color = Color::from_rgba(0.03, 0.03, 0.03, 0.75); // rgb
 
 pub fn main_container(_theme: &iced::Theme) -> container::Style {
     container::Style {
-        background: Some(COLOR_BG.into()),
+        background: Some(color_bg().into()),
         text_color: Some(COLOR_TEXT_PRIMARY),
         ..container::Style::default()
     }
@@ -42,7 +93,7 @@ pub fn transparent_player_container(_theme: &iced::Theme) -> container::Style {
 
 pub fn card_container(_theme: &iced::Theme) -> container::Style {
     container::Style {
-        background: Some(COLOR_SURFACE.into()),
+        background: Some(color_surface().into()),
         border: border::rounded(12),
         text_color: Some(COLOR_TEXT_PRIMARY),
         ..container::Style::default()
@@ -77,7 +128,7 @@ pub fn primary_button(_theme: &iced::Theme, status: button::Status) -> button::S
         },
         _ => button::Style {
             background: Some(COLOR_TEXT_PRIMARY.into()),
-            text_color: COLOR_BG,
+            text_color: color_bg(),
             border: border::rounded(18),
             ..button::Style::default()
         },
@@ -87,13 +138,13 @@ pub fn primary_button(_theme: &iced::Theme, status: button::Status) -> button::S
 pub fn secondary_button(_theme: &iced::Theme, status: button::Status) -> button::Style {
     match status {
         button::Status::Hovered => button::Style {
-            background: Some(COLOR_SURFACE_HOVER.into()),
+            background: Some(color_surface_hover().into()),
             text_color: COLOR_TEXT_PRIMARY,
             border: border::rounded(18),
             ..button::Style::default()
         },
         _ => button::Style {
-            background: Some(COLOR_SURFACE.into()),
+            background: Some(color_surface().into()),
             text_color: COLOR_TEXT_PRIMARY,
             border: border::rounded(18),
             ..button::Style::default()
@@ -151,18 +202,29 @@ pub fn video_hitbox_button(_theme: &iced::Theme, _status: button::Status) -> but
     }
 }
 
-pub fn search_input(_theme: &iced::Theme, status: text_input::Status) -> text_input::Style {
-    match status {
-        text_input::Status::Focused => text_input::Style {
-            background: Color::from_rgb(0.12, 0.12, 0.15).into(),
-            border: border::rounded(20).width(1.5).color(Color::from_rgb(0.24, 0.65, 1.0)),
-            icon: COLOR_TEXT_PRIMARY,
-            placeholder: COLOR_TEXT_SECONDARY,
-            value: COLOR_TEXT_PRIMARY,
-            selection: Color::from_rgba(0.2, 0.4, 0.8, 0.4),
-        },
-        text_input::Status::Hovered => text_input::Style {
-            background: COLOR_INPUT_BG.into(),
+pub fn animated_search_input(glow: f32) -> impl Fn(&iced::Theme, text_input::Status) -> text_input::Style {
+    let glow = glow.clamp(0.0, 1.0);
+    let base_border = color_border();
+    let glow_border = Color::from_rgb(0.24, 0.65, 1.0);
+    let current_border = Color {
+        r: base_border.r + (glow_border.r - base_border.r) * glow,
+        g: base_border.g + (glow_border.g - base_border.g) * glow,
+        b: base_border.b + (glow_border.b - base_border.b) * glow,
+        a: 1.0,
+    };
+    let base_bg = color_input_bg();
+    let glow_bg = Color::from_rgb(0.12, 0.12, 0.15);
+    let current_bg = Color {
+        r: base_bg.r + (glow_bg.r - base_bg.r) * glow,
+        g: base_bg.g + (glow_bg.g - base_bg.g) * glow,
+        b: base_bg.b + (glow_bg.b - base_bg.b) * glow,
+        a: 1.0,
+    };
+    let border_w = 1.0 + 0.5 * glow;
+
+    move |_theme, status| match status {
+        text_input::Status::Hovered if glow < 0.05 => text_input::Style {
+            background: base_bg.into(),
             border: border::rounded(20).width(1.0).color(Color::from_rgb(0.42, 0.42, 0.42)),
             icon: COLOR_TEXT_SECONDARY,
             placeholder: COLOR_TEXT_SECONDARY,
@@ -170,14 +232,18 @@ pub fn search_input(_theme: &iced::Theme, status: text_input::Status) -> text_in
             selection: Color::from_rgba(0.2, 0.4, 0.8, 0.4),
         },
         _ => text_input::Style {
-            background: COLOR_INPUT_BG.into(),
-            border: border::rounded(20).width(1.0).color(COLOR_BORDER),
-            icon: COLOR_TEXT_SECONDARY,
+            background: current_bg.into(),
+            border: border::rounded(20).width(border_w).color(current_border),
+            icon: if glow > 0.4 { COLOR_TEXT_PRIMARY } else { COLOR_TEXT_SECONDARY },
             placeholder: COLOR_TEXT_SECONDARY,
             value: COLOR_TEXT_PRIMARY,
             selection: Color::from_rgba(0.2, 0.4, 0.8, 0.4),
         },
     }
+}
+
+pub fn search_input(theme: &iced::Theme, status: text_input::Status) -> text_input::Style {
+    animated_search_input(0.0)(theme, status)
 }
 
 #[allow(dead_code)]

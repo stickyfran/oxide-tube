@@ -126,6 +126,7 @@ pub fn view_header_bar<'a, Message: Clone + 'static>(
     search_query: &'a str,
     search_bar_width: f32,
     is_search_focused: bool,
+    search_focus_glow: f32,
     _suggestions: &'a [String],
     _show_suggestions: bool,
     _power_profile: PowerProfile,
@@ -190,7 +191,7 @@ pub fn view_header_bar<'a, Message: Clone + 'static>(
         .id(iced::widget::text_input::Id::new("main_search_input"))
         .on_input(on_search_input)
         .on_submit(on_search_submit.clone())
-        .style(search_input)
+        .style(animated_search_input(search_focus_glow))
         .padding([6, 12])
         .width(Length::Fixed(search_bar_width));
 
@@ -695,6 +696,7 @@ pub fn view_auth_modal<'a, Message: Clone + 'static>(
     current_audio_lang: PreferredAudioLanguage,
     current_card_style: crate::config::CardStyle,
     current_columns: crate::config::GridColumnsConfig,
+    current_theme: crate::config::AppTheme,
     auto_pip_on_unfocus: bool,
     full_buffer_tabs: bool,
     close_to_tray: bool,
@@ -715,11 +717,13 @@ pub fn view_auth_modal<'a, Message: Clone + 'static>(
     on_select_audio_lang: impl Fn(PreferredAudioLanguage) -> Message + Copy + 'static,
     on_select_card_style: impl Fn(crate::config::CardStyle) -> Message + Copy + 'static,
     on_select_home_columns: impl Fn(crate::config::GridColumnsConfig) -> Message + Copy + 'static,
+    on_select_theme: impl Fn(crate::config::AppTheme) -> Message + Copy + 'static,
     on_toggle_auto_pip: Message,
     on_toggle_full_buffer_tabs: Message,
     on_toggle_close_to_tray: Message,
     on_change_cache_limit: impl Fn(usize) -> Message + Copy + 'static,
     on_clear_cache: Message,
+    on_modal_click_trap: Message,
     on_close_modal: Message,
 ) -> Element<'a, Message> {
     // 1. Profile Header Banner
@@ -906,6 +910,18 @@ pub fn view_auth_modal<'a, Message: Clone + 'static>(
         }
 
         SettingsCategory::Appearance => {
+            let theme_row = row![
+                button(text("Oscuro (YouTube)").size(12))
+                    .style(segmented_button(current_theme == crate::config::AppTheme::Dark))
+                    .padding([5, 12])
+                    .on_press(on_select_theme(crate::config::AppTheme::Dark)),
+                button(text("Dark AMOLED (Negro Puro)").size(12))
+                    .style(segmented_button(current_theme == crate::config::AppTheme::Amoled))
+                    .padding([5, 12])
+                    .on_press(on_select_theme(crate::config::AppTheme::Amoled)),
+            ]
+            .spacing(6);
+
             let style_row = row![
                 button(text("Squircle (YouTube)").size(12))
                     .style(segmented_button(current_card_style == crate::config::CardStyle::Squircle))
@@ -943,9 +959,13 @@ pub fn view_auth_modal<'a, Message: Clone + 'static>(
             .spacing(6);
 
             column![
-                text("Diseño y Cuadrícula").size(15).color(COLOR_TEXT_PRIMARY),
+                text("Apariencia y Diseño").size(15).color(COLOR_TEXT_PRIMARY),
                 section_card(
                     column![
+                        column![
+                            text("Tema de la Interfaz").size(12).color(COLOR_TEXT_SECONDARY),
+                            theme_row,
+                        ].spacing(6),
                         column![
                             text("Bordes de Miniaturas").size(12).color(COLOR_TEXT_SECONDARY),
                             style_row,
@@ -954,7 +974,7 @@ pub fn view_auth_modal<'a, Message: Clone + 'static>(
                             text("Columnas de la Cuadrícula del Home").size(12).color(COLOR_TEXT_SECONDARY),
                             cols_row,
                         ].spacing(6),
-                        text("YouTube Desktop usa 4 columnas por defecto con esquinas Squircle (12px). Puedes personalizar a rectangulares o cambiar columnas sin saltos de layout.")
+                        text("El modo AMOLED apaga totalmente los píxeles negros (#000000) para máxima eficiencia y contraste.")
                             .size(11)
                             .color(COLOR_TEXT_SECONDARY),
                     ]
@@ -1331,7 +1351,7 @@ pub fn view_auth_modal<'a, Message: Clone + 'static>(
         .width(Length::Fixed(760.0))
         .height(Length::Fixed(520.0));
 
-    let clickable_modal = mouse_area(modal_box);
+    let clickable_modal = mouse_area(modal_box).on_press(on_modal_click_trap);
 
     let backdrop = mouse_area(
         container(clickable_modal)

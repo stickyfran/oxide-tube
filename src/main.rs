@@ -10,7 +10,7 @@ mod diagnostics;
 mod tray;
 
 use auth::AuthSession;
-use config::{AppConfig, PreferredCodec, PreferredResolution};
+use config::{AppConfig, AppTheme, PreferredCodec, PreferredResolution};
 use innertube::{ChannelDetails, InnerTubeClient, VideoCard, WatchDetails};
 use live_chat::{ChatMessage, LiveChatManager};
 use player::WaylandZeroCopyPlayer;
@@ -197,6 +197,8 @@ pub enum Message {
     ToggleCloseToTray,
     RestoreFromTray,
     QuitApp,
+    NoOp,
+    SetAppTheme(AppTheme),
 }
 
 #[derive(Debug, Clone)]
@@ -330,6 +332,7 @@ pub struct MitubApp {
     playing_from_local: bool,
     search_anim: Option<(f32, f32, std::time::Instant, f32)>,
     search_hover_exit_at: Option<std::time::Instant>,
+    search_focus_glow: f32,
 }
 
 fn get_ipc_port() -> u16 {
@@ -1290,6 +1293,10 @@ impl MitubApp {
 
         let ((saved_w, saved_h), saved_maximized) = load_window_state();
         let config = AppConfig::load();
+        ui::theme::set_amoled_mode(config.theme == AppTheme::Amoled);
+        if config.close_to_tray {
+            crate::tray::set_tray_visible(true);
+        }
         let saved_tabs = config.saved_tabs.clone();
         let saved_active_idx = config.active_tab_idx;
         let saved_pip_size = config.pip_size;
@@ -1297,7 +1304,7 @@ impl MitubApp {
         let window_settings = Settings {
             size: Size::new(saved_w, saved_h),
             min_size: Some(Size::new(800.0, 600.0)),
-            transparent: true,
+            transparent: false,
             decorations: true,
             icon: load_app_icon(),
             exit_on_close_request: false,
@@ -1447,6 +1454,7 @@ impl MitubApp {
             playing_from_local: false,
             search_anim: None,
             search_hover_exit_at: None,
+            search_focus_glow: 0.0,
         };
 
         // Initial tasks: fetch home feed & bind Wayland window pointers
@@ -1663,7 +1671,7 @@ impl MitubApp {
         let window_settings = Settings {
             size: Size::new(saved_w, saved_h),
             min_size: Some(Size::new(800.0, 600.0)),
-            transparent: true,
+            transparent: false,
             decorations: true,
             icon: load_app_icon(),
             exit_on_close_request: false,
@@ -1999,8 +2007,8 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
             let elapsed = inst.elapsed().as_secs_f32();
             if elapsed < dur && dur > 0.001 {
                 let t = (elapsed / dur).clamp(0.0, 1.0);
-                // Ease-in-out smoothstep (3t^2 - 2t^3) for seamless gradual start and elegant soft stop
-                let ease = t * t * (3.0 - 2.0 * t);
+                // Quintic smoothstep (6t^5 - 15t^4 + 10t^3) for ultra-soft, organic start and finish
+                let ease = t * t * t * (t * (t * 6.0 - 15.0) + 10.0);
                 return from_w + (to_w - from_w) * ease;
             }
         }
@@ -2022,9 +2030,9 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
         }
         let dist = (target_w - cur_w).abs();
         let is_expanding = target_w > cur_w;
-        // Luxurious ease-in-out pacing: 420ms for full expansion, 280ms for collapse
-        let base_dur = if is_expanding { 0.42 } else { 0.28 };
-        let dur = (base_dur * (dist / 155.0)).clamp(0.10, base_dur);
+        // Luxurious ease-in-out pacing: 480ms for full expansion, 320ms for collapse
+        let base_dur = if is_expanding { 0.48 } else { 0.32 };
+        let dur = (base_dur * (dist / 155.0)).clamp(0.12, base_dur);
         self.search_anim = Some((cur_w, target_w, std::time::Instant::now(), dur));
     }
 
@@ -2327,6 +2335,16 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                 if let Some((_, _, inst, dur)) = self.search_anim {
                     if inst.elapsed().as_secs_f32() >= dur {
                         self.search_anim = None;
+                    }
+                }
+
+                // Smooth illumination glow animation on click/focus
+                let target_glow = if self.search_input_focused { 1.0 } else { 0.0 };
+                if (self.search_focus_glow - target_glow).abs() > 0.005 {
+                    let speed = 0.16;
+                    self.search_focus_glow += (target_glow - self.search_focus_glow) * speed;
+                    if (self.search_focus_glow - target_glow).abs() <= 0.005 {
+                        self.search_focus_glow = target_glow;
                     }
                 }
 
@@ -4267,6 +4285,9 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                     },
                     size: Size::new(final_pip_w, final_pip_h),
                     min_size: Some(Size::new(135.0, 135.0)),
+                    #[cfg(target_os = "windows")]
+                    transparent: false,
+                    #[cfg(not(target_os = "windows"))]
                     transparent: true,
                     resizable: true,
                     decorations: false,
@@ -4702,19 +4723,15 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
             Message::ToggleCloseToTray => {
                 self.config.close_to_tray = !self.config.close_to_tray;
                 self.config.save_async();
-                // Show/hide the tray icon based on the new setting.
-                // Only show it when the window is already hidden to tray;
-                // if enabling the setting while the window is open, the icon
-                // will appear the next time the user closes to tray.
-                if !self.config.close_to_tray {
-                    crate::tray::set_tray_visible(false);
-                }
+                crate::tray::set_tray_visible(self.config.close_to_tray);
                 Task::none()
             }
 
             Message::RestoreFromTray => {
-                // Hide the tray icon — it should only be visible while minimized to tray
-                crate::tray::set_tray_visible(false);
+                // Keep tray icon visible if close_to_tray is enabled in settings
+                if !self.config.close_to_tray {
+                    crate::tray::set_tray_visible(false);
+                }
                 if let Some(main_id) = self.main_window_id {
                     self.is_window_hidden = false;
                     self.focused_window = Some(main_id);
@@ -4748,6 +4765,15 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                     player.shutdown_sync();
                 }
                 std::process::exit(0);
+            }
+
+            Message::NoOp => Task::none(),
+
+            Message::SetAppTheme(theme) => {
+                self.config.theme = theme;
+                ui::theme::set_amoled_mode(theme == AppTheme::Amoled);
+                self.config.save_async();
+                Task::none()
             }
 
             Message::ScalePip(scale) => {
@@ -7176,6 +7202,7 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
             &self.search_query,
             search_bar_w,
             self.search_input_focused,
+            self.search_focus_glow,
             &self.suggestions,
             self.show_suggestions,
             self.power_profile,
@@ -7735,6 +7762,7 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
                 self.config.preferred_audio_lang,
                 self.config.card_style,
                 self.config.home_columns,
+                self.config.theme,
                 self.config.auto_pip_on_unfocus,
                 self.config.full_buffer_tabs,
                 self.config.close_to_tray,
@@ -7755,11 +7783,13 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
                 Message::SetPreferredAudioLanguage,
                 Message::SetCardStyle,
                 Message::SetHomeColumns,
+                Message::SetAppTheme,
                 Message::ToggleAutoPipOnUnfocus,
                 Message::ToggleFullBufferTabs,
                 Message::ToggleCloseToTray,
                 Message::SetCacheLimitIndex,
                 Message::ClearCache,
+                Message::NoOp,
                 Message::ToggleLoginModal,
             ));
         }
@@ -7885,6 +7915,8 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
         let is_search_animating = self.search_anim
             .map(|(_, _, t, dur)| t.elapsed().as_secs_f32() < dur)
             .unwrap_or(false);
+        let target_glow = if self.search_input_focused { 1.0 } else { 0.0 };
+        let is_search_glow_animating = (self.search_focus_glow - target_glow).abs() > 0.005;
 
         let has_active_animation = is_transitioning
             || has_ripple
@@ -7895,7 +7927,8 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
             || has_tab_shake
             || has_tab_open
             || is_tab_hover_animating
-            || is_search_animating;
+            || is_search_animating
+            || is_search_glow_animating;
 
         let has_playing_tab_glow = self.osd_state.is_playing
             && self.playing_video_id.is_some()
@@ -7931,7 +7964,7 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
 
     pub fn style(&self, _theme: &iced::Theme) -> iced::daemon::Appearance {
         iced::daemon::Appearance {
-            background_color: iced::Color::TRANSPARENT,
+            background_color: ui::theme::color_bg(),
             text_color: COLOR_TEXT_PRIMARY,
         }
     }

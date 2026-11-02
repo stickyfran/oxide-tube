@@ -99,6 +99,22 @@ pub enum CardStyle {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum AppTheme {
+    #[default]
+    Dark,
+    Amoled,
+}
+
+impl AppTheme {
+    pub fn label(&self) -> &'static str {
+        match self {
+            AppTheme::Dark => "Oscuro (YouTube)",
+            AppTheme::Amoled => "Dark AMOLED (Negro Puro)",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum GridColumnsConfig {
     #[default]
     Cols4,
@@ -154,6 +170,8 @@ pub struct AppConfig {
     pub card_style: CardStyle,
     #[serde(default)]
     pub home_columns: GridColumnsConfig,
+    #[serde(default)]
+    pub theme: AppTheme,
 }
 
 fn default_true() -> bool {
@@ -186,6 +204,7 @@ impl Default for AppConfig {
             close_to_tray: true,
             card_style: CardStyle::Squircle,
             home_columns: GridColumnsConfig::Cols4,
+            theme: AppTheme::Dark,
         }
     }
 }
