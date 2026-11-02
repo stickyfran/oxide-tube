@@ -167,6 +167,7 @@ pub struct InnerTubeClient {
     session: Arc<RwLock<AuthSession>>,
     visitor_data: Arc<RwLock<String>>,
     bot_detected: Arc<AtomicBool>,
+    incognito: Arc<AtomicBool>,
     watch_cache: Arc<RwLock<HashMap<String, (Instant, Arc<WatchDetails>)>>>,
     feed_continuation: Arc<RwLock<Option<(String, String)>>>,
 }
@@ -238,6 +239,7 @@ impl InnerTubeClient {
             session,
             visitor_data: Arc::new(RwLock::new(initial_vd)),
             bot_detected: Arc::new(AtomicBool::new(false)),
+            incognito: Arc::new(AtomicBool::new(false)),
             watch_cache: Arc::new(RwLock::new(HashMap::new())),
             feed_continuation: Arc::new(RwLock::new(None)),
         }
@@ -319,6 +321,10 @@ impl InnerTubeClient {
         });
     }
 
+    pub fn set_incognito(&self, incognito: bool) {
+        self.incognito.store(incognito, Ordering::Relaxed);
+    }
+
     async fn try_refresh_firefox_session(&self) -> bool {
         let fresh_res = tokio::task::spawn_blocking(AuthSession::from_firefox).await;
         if let Ok(Ok(fresh)) = fresh_res {
@@ -332,6 +338,10 @@ impl InnerTubeClient {
     }
 
     async fn build_headers(&self) -> HeaderMap {
+        if self.incognito.load(Ordering::Relaxed) {
+            return Self::build_public_headers();
+        }
+
         let mut headers = HeaderMap::new();
         headers.insert(USER_AGENT, HeaderValue::from_static(USER_AGENT_STR));
         headers.insert(ORIGIN, HeaderValue::from_static(YOUTUBE_ORIGIN));
@@ -967,53 +977,139 @@ impl InnerTubeClient {
         Ok(videos)
     }
 
-    /// Reports a watched video back to the user's YouTube Account History (`FEhistory`)
-    /// using YouTube's official `playbackTracking.videostatsPlaybackUrl` endpoint.
-    /// If `videostats_url` is already known from `WatchDetails`, avoids redundant `/player` fetch.
-    pub async fn record_watch_history(&self, video_id: &str, videostats_url: Option<&str>) {
-        if !self.session.read().await.is_authenticated() || video_id.is_empty() {
-            return;
+    /// Generates an authentic 16-character alphanumeric CPN (Client Playback Nonce)
+    /// compliant with YouTube player telemetry specifications [a-zA-Z0-9-_].
+    pub fn generate_cpn() -> String {
+        const CPN_ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_";
+        use std::time::SystemTime;
+        let nanos = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(123456789);
+        let mut seed = nanos as u64;
+        let mut cpn_bytes = [0u8; 16];
+        for b in &mut cpn_bytes {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let idx = ((seed >> 32) as usize) & 63;
+            *b = CPN_ALPHABET[idx];
         }
+        String::from_utf8_lossy(&cpn_bytes).to_string()
+    }
+
+    /// Fetches authenticated playback tracking URLs (playback and watchtime) from the WEB player endpoint.
+    /// This avoids the VISIONOS anonymous endpoint issue and ensures URLs are tied to the authenticated user account.
+    pub async fn fetch_auth_playback_tracking(&self, video_id: &str) -> (Option<String>, Option<String>) {
+        if self.incognito.load(Ordering::Relaxed) || !self.session.read().await.is_authenticated() || video_id.is_empty() {
+            return (None, None);
+        }
+
+        let player_url = format!("{YOUTUBE_ORIGIN}/youtubei/v1/player?prettyPrint=false");
         let headers = self.build_headers().await;
+        let body = serde_json::json!({
+            "context": Self::innertube_context(),
+            "videoId": video_id
+        });
 
-        let base_url_opt = if let Some(u) = videostats_url {
-            Some(u.to_string())
-        } else {
-            let player_url = format!("{YOUTUBE_ORIGIN}/youtubei/v1/player?prettyPrint=false");
-            let body = serde_json::json!({
-                "context": Self::innertube_context(),
-                "videoId": video_id
-            });
-
-            if let Ok(resp) = self.client.post(&player_url).headers(headers.clone()).json(&body).send().await {
-                self.capture_set_cookies(resp.headers()).await;
-                if let Ok(json_val) = Self::resp_simd_json(resp).await {
-                    json_val
-                        .get("playbackTracking")
-                        .and_then(|pt| pt.get("videostatsPlaybackUrl"))
+        if let Ok(resp) = self.client.post(&player_url).headers(headers).json(&body).send().await {
+            self.capture_set_cookies(resp.headers()).await;
+            if let Ok(json_val) = Self::resp_simd_json(resp).await {
+                if let Some(pt) = json_val.get("playbackTracking") {
+                    let pb = pt.get("videostatsPlaybackUrl")
                         .and_then(|vp| vp.get("baseUrl"))
                         .and_then(|u| u.as_str())
-                        .map(|s| s.to_string())
-                } else {
-                    None
+                        .map(|s| s.replace("https://s.youtube.com", YOUTUBE_ORIGIN));
+                    let wt = pt.get("videostatsWatchtimeUrl")
+                        .and_then(|vp| vp.get("baseUrl"))
+                        .and_then(|u| u.as_str())
+                        .map(|s| s.replace("https://s.youtube.com", YOUTUBE_ORIGIN));
+                    return (pb, wt);
                 }
-            } else {
-                None
-            }
-        };
-
-        if let Some(base_url) = base_url_opt {
-            let stats_url = base_url.replace("https://s.youtube.com", YOUTUBE_ORIGIN);
-            let ts = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis())
-                .unwrap_or(0);
-            let cpn = format!("mitub{:011x}", ts & 0xfff_ffff_ffff);
-            let full_url = format!("{stats_url}&ver=2&c=WEB&cpn={cpn}&cmt=0");
-            if let Ok(stats_resp) = self.client.get(&full_url).headers(headers).send().await {
-                self.capture_set_cookies(stats_resp.headers()).await;
             }
         }
+        (None, None)
+    }
+
+    /// Starts a playback session in YouTube's accounting system and reports the first second of watchtime.
+    /// Returns (cpn, watchtime_url) so the caller can send periodic progress heartbeats.
+    pub async fn start_watch_session(&self, video_id: &str, duration_secs: f64) -> Option<(String, String)> {
+        if self.incognito.load(Ordering::Relaxed) || !self.session.read().await.is_authenticated() || video_id.is_empty() {
+            return None;
+        }
+
+        let (pb_url_opt, wt_url_opt) = self.fetch_auth_playback_tracking(video_id).await;
+        let wt_url = wt_url_opt?;
+        let cpn = Self::generate_cpn();
+        let headers = self.build_headers().await;
+
+        // 1. Initial playback start ping
+        if let Some(pb_url) = pb_url_opt {
+            let pb_ping = if pb_url.contains('?') {
+                format!("{pb_url}&ver=2&c=WEB&cpn={cpn}&cmt=0")
+            } else {
+                format!("{pb_url}?ver=2&c=WEB&cpn={cpn}&cmt=0")
+            };
+            if let Ok(resp) = self.client.get(&pb_ping).headers(headers.clone()).send().await {
+                self.capture_set_cookies(resp.headers()).await;
+            }
+        }
+
+        // 2. Initial watchtime ping to mark video in YouTube account history (FEhistory) immediately
+        let len_param = if duration_secs > 0.0 { format!("&len={:.1}", duration_secs) } else { String::new() };
+        let wt_init = if wt_url.contains('?') {
+            format!("{wt_url}&ver=2&c=WEB&cpn={cpn}&docid={video_id}&cmt=1.0&st=0.0&et=1.0&state=playing{len_param}")
+        } else {
+            format!("{wt_url}?ver=2&c=WEB&cpn={cpn}&docid={video_id}&cmt=1.0&st=0.0&et=1.0&state=playing{len_param}")
+        };
+        if let Ok(resp) = self.client.get(&wt_init).headers(headers).send().await {
+            self.capture_set_cookies(resp.headers()).await;
+        }
+
+        Some((cpn, wt_url))
+    }
+
+    /// Reports updated watchtime position to YouTube (updates the red progress bar and resumes where left off).
+    pub async fn report_watchtime_heartbeat(
+        &self,
+        video_id: &str,
+        cpn: &str,
+        watchtime_url: &str,
+        start_secs: f64,
+        current_secs: f64,
+        duration_secs: f64,
+        is_final: bool,
+    ) {
+        if self.incognito.load(Ordering::Relaxed) || !self.session.read().await.is_authenticated() || watchtime_url.is_empty() {
+            return;
+        }
+
+        let headers = self.build_headers().await;
+        let len_param = if duration_secs > 0.0 { format!("&len={:.1}", duration_secs) } else { String::new() };
+        let final_param = if is_final { "&final=1" } else { "" };
+        let state = if is_final { "paused" } else { "playing" };
+        let ping_url = if watchtime_url.contains('?') {
+            format!(
+                "{watchtime_url}&ver=2&c=WEB&cpn={cpn}&docid={video_id}&cmt={:.1}&st={:.1}&et={:.1}&state={state}{len_param}{final_param}",
+                current_secs.max(0.0),
+                start_secs.max(0.0),
+                current_secs.max(start_secs),
+            )
+        } else {
+            format!(
+                "{watchtime_url}?ver=2&c=WEB&cpn={cpn}&docid={video_id}&cmt={:.1}&st={:.1}&et={:.1}&state={state}{len_param}{final_param}",
+                current_secs.max(0.0),
+                start_secs.max(0.0),
+                current_secs.max(start_secs),
+            )
+        };
+
+        if let Ok(resp) = self.client.get(&ping_url).headers(headers).send().await {
+            self.capture_set_cookies(resp.headers()).await;
+        }
+    }
+
+    /// Legacy record_watch_history wrapper for backwards compatibility
+    pub async fn record_watch_history(&self, video_id: &str, _videostats_url: Option<&str>) {
+        let _ = self.start_watch_session(video_id, 0.0).await;
     }
 
     /// Loads Subscriptions feed (FEsubscriptions) for the authenticated user

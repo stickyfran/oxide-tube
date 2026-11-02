@@ -323,6 +323,12 @@ pub fn icon_logout<'a, Message: 'static>(size: f32) -> Element<'a, Message> {
     render_cached_svg(&HANDLE, SVG, size)
 }
 
+pub fn icon_incognito<'a, Message: 'static>(size: f32) -> Element<'a, Message> {
+    static HANDLE: OnceLock<svg::Handle> = OnceLock::new();
+    const SVG: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#f1f1f1" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 10s3.5-4 10-4 10 4 10 4"/><path d="M4 10l1-5h14l1 5"/><circle cx="6.5" cy="15.5" r="2.5"/><circle cx="17.5" cy="15.5" r="2.5"/><path d="M9 15.5h6"/></svg>"##;
+    render_cached_svg(&HANDLE, SVG, size)
+}
+
 
 
 

@@ -199,6 +199,8 @@ pub enum Message {
     QuitApp,
     NoOp,
     SetAppTheme(AppTheme),
+    ToggleIncognito,
+    WatchSessionStarted(Option<(String, String, String)>),
 }
 
 #[derive(Debug, Clone)]
@@ -229,9 +231,20 @@ pub struct ToastState {
     pub created_at: std::time::Instant,
 }
 
+#[derive(Debug, Clone)]
+pub struct ActiveWatchSession {
+    pub video_id: String,
+    pub cpn: String,
+    pub watchtime_url: String,
+    pub duration_secs: f64,
+    pub last_reported_secs: f64,
+    pub last_heartbeat_instant: std::time::Instant,
+}
+
 #[allow(dead_code)]
 pub struct MitubApp {
     config: AppConfig,
+    active_watch_session: Option<ActiveWatchSession>,
     auth_session: Arc<RwLock<AuthSession>>,
     innertube: Arc<InnerTubeClient>,
     buffer_downloads: HashMap<String, BufferDownloadState>,
@@ -1293,6 +1306,7 @@ impl MitubApp {
 
         let ((saved_w, saved_h), saved_maximized) = load_window_state();
         let config = AppConfig::load();
+        innertube.set_incognito(config.incognito_mode);
         ui::theme::set_amoled_mode(config.theme == AppTheme::Amoled);
         if config.close_to_tray {
             crate::tray::set_tray_visible(true);
@@ -1350,6 +1364,7 @@ impl MitubApp {
 
         let mut app = Self {
             config,
+            active_watch_session: None,
             auth_session,
             innertube: innertube.clone(),
             power_manager,
@@ -1783,7 +1798,27 @@ impl MitubApp {
         }
     }
 
+    fn finish_active_watch_session(&mut self) {
+        if let Some(session) = self.active_watch_session.take() {
+            if !self.config.incognito_mode {
+                let it = self.innertube.clone();
+                let vid = session.video_id;
+                let cpn = session.cpn;
+                let wt_url = session.watchtime_url;
+                let st = session.last_reported_secs;
+                let et = self.osd_state.current_pos_secs as f64;
+                let dur = session.duration_secs;
+                tokio::spawn(async move {
+                    it.report_watchtime_heartbeat(&vid, &cpn, &wt_url, st, et, dur, true).await;
+                });
+            }
+        }
+    }
+
     fn save_session(&mut self) {
+        if self.config.incognito_mode {
+            return;
+        }
         if let (Some(cur_idx), Some(player)) = (self.active_tab_idx, &self.player) {
             if cur_idx < self.tabs.len()
                 && player.is_first_frame_rendered()
@@ -2530,6 +2565,30 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                         }
                     }
 
+                    // Periodic watchtime heartbeat to YouTube account history (~40-45s)
+                    if is_playing && !self.config.incognito_mode {
+                        if let Some(session) = &mut self.active_watch_session {
+                            if self.playing_video_id.as_deref() == Some(&session.video_id) {
+                                let elapsed_since_last = session.last_heartbeat_instant.elapsed();
+                                let cur_secs = (pos_ms as f64) / 1000.0;
+                                if elapsed_since_last >= Duration::from_secs(40) && cur_secs > session.last_reported_secs {
+                                    let it = self.innertube.clone();
+                                    let vid = session.video_id.clone();
+                                    let cpn = session.cpn.clone();
+                                    let wt_url = session.watchtime_url.clone();
+                                    let st = session.last_reported_secs;
+                                    let et = cur_secs;
+                                    let dur = session.duration_secs;
+                                    session.last_reported_secs = cur_secs;
+                                    session.last_heartbeat_instant = std::time::Instant::now();
+                                    tokio::spawn(async move {
+                                        it.report_watchtime_heartbeat(&vid, &cpn, &wt_url, st, et, dur, false).await;
+                                    });
+                                }
+                            }
+                        }
+                    }
+
                     let now_secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
                     let prev = self.last_session_save_secs;
                     if now_secs.saturating_sub(prev) >= 10 {
@@ -2585,6 +2644,7 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                     {
                         player.reset_eos();
                         self.osd_state.first_frame_rendered = false;
+                        self.finish_active_watch_session();
 
                         // Reset saved position of the completed video so reopening it starts from 00:00
                         if let Some(finished_vid) = self.playing_video_id.clone() {
@@ -2679,6 +2739,7 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                         if self.pip_window_id.is_some() && self.playing_video_id.as_deref() == Some(&details.video_id) {
                             self.pip_watch_details = Some(Arc::clone(&details));
                         }
+
                         self.watch_details = Some(details);
                         if !rec_tasks.is_empty() {
                             return Task::batch(rec_tasks);
@@ -2950,13 +3011,8 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                     Ok(mut details) => {
                         crate::diagnostics::session_details_loaded();
 
-                        // Record watched video in user history reusing videostats_playback_url (zero redundant network requests)
-                        let it_hist = self.innertube.clone();
-                        let vid_hist = details.video_id.clone();
-                        let stats_url = details.videostats_playback_url.clone();
-                        tokio::spawn(async move {
-                            it_hist.record_watch_history(&vid_hist, stats_url.as_deref()).await;
-                        });
+                        // Reset any active watch session before starting a new one
+                        self.finish_active_watch_session();
 
                         // Preserve pre-populated title/channel_name if API fallback was generic
                         if let Some(prev) = &self.watch_details {
@@ -3194,6 +3250,22 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                                     tasks.push(t);
                                 }
                             }
+                        }
+
+                        if !self.config.incognito_mode {
+                            let it_sess = self.innertube.clone();
+                            let v_sess = details.video_id.clone();
+                            let dur_s = if approx_dur_ms > 0 {
+                                (approx_dur_ms / 1000) as f64
+                            } else {
+                                self.osd_state.duration_secs as f64
+                            };
+                            tasks.push(Task::perform(
+                                async move {
+                                    it_sess.start_watch_session(&v_sess, dur_s).await.map(|(cpn, wt_url)| (v_sess, cpn, wt_url))
+                                },
+                                Message::WatchSessionStarted,
+                            ));
                         }
 
                         self.watch_details = Some(details);
@@ -3847,6 +3919,24 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                                     .map(|t| t.saved_pos_ms)
                                     .filter(|&p| p > 0);
 
+                                self.finish_active_watch_session();
+                                let mut start_tasks = vec![close_pip_task];
+                                if !self.config.incognito_mode {
+                                    let it_sess = self.innertube.clone();
+                                    let v_sess = details.video_id.clone();
+                                    let dur_s = if stream.approx_duration_ms > 0 {
+                                        (stream.approx_duration_ms / 1000) as f64
+                                    } else {
+                                        self.osd_state.duration_secs as f64
+                                    };
+                                    start_tasks.push(Task::perform(
+                                        async move {
+                                            it_sess.start_watch_session(&v_sess, dur_s).await.map(|(cpn, wt_url)| (v_sess, cpn, wt_url))
+                                        },
+                                        Message::WatchSessionStarted,
+                                    ));
+                                }
+
                                 self.watch_details = Some(details);
                                 self.playing_video_id = Some(vid.clone());
                                 self.video_started_at = Some(std::time::Instant::now());
@@ -3862,7 +3952,7 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
 
                                 let _ = player.play_stream_with_seek(&v_uri, a_uri.as_deref(), seek_target);
                                 self.sync_player_viewport();
-                                return close_pip_task;
+                                return Task::batch(start_tasks);
                             }
                         }
 
@@ -3875,11 +3965,28 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                     self.osd_state.is_playing = is_play;
                     self.osd_state.play_pause_anim = Some((std::time::Instant::now(), is_play));
                     self.power_manager.set_screensaver_inhibit(is_play);
+                    if !is_play && !self.config.incognito_mode {
+                        if let Some(session) = &mut self.active_watch_session {
+                            let it = self.innertube.clone();
+                            let vid = session.video_id.clone();
+                            let cpn = session.cpn.clone();
+                            let wt_url = session.watchtime_url.clone();
+                            let st = session.last_reported_secs;
+                            let et = self.osd_state.current_pos_secs as f64;
+                            let dur = session.duration_secs;
+                            session.last_reported_secs = et;
+                            session.last_heartbeat_instant = std::time::Instant::now();
+                            tokio::spawn(async move {
+                                it.report_watchtime_heartbeat(&vid, &cpn, &wt_url, st, et, dur, false).await;
+                            });
+                        }
+                    }
                 }
                 Task::none()
             }
 
             Message::StopPlayback => {
+                self.finish_active_watch_session();
                 if let Some(player) = &self.player {
                     player.stop();
                 }
@@ -4753,6 +4860,7 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
             }
 
             Message::QuitApp => {
+                self.finish_active_watch_session();
                 if self.pip_window_id.is_some() {
                     trigger_save_kwin_pip_position();
                 }
@@ -4773,6 +4881,43 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                 self.config.theme = theme;
                 ui::theme::set_amoled_mode(theme == AppTheme::Amoled);
                 self.config.save_async();
+                Task::none()
+            }
+
+            Message::ToggleIncognito => {
+                self.config.incognito_mode = !self.config.incognito_mode;
+                self.innertube.set_incognito(self.config.incognito_mode);
+                if self.config.incognito_mode {
+                    self.finish_active_watch_session();
+                    self.active_watch_session = None;
+                } else if let Some(vid) = &self.playing_video_id {
+                    let it = self.innertube.clone();
+                    let v = vid.clone();
+                    let dur_s = self.osd_state.duration_secs as f64;
+                    return Task::perform(
+                        async move {
+                            it.start_watch_session(&v, dur_s).await.map(|(cpn, wt_url)| (v, cpn, wt_url))
+                        },
+                        Message::WatchSessionStarted,
+                    );
+                }
+                self.config.save_async();
+                Task::none()
+            }
+
+            Message::WatchSessionStarted(res) => {
+                if let Some((vid, cpn, wt_url)) = res {
+                    if self.playing_video_id.as_deref() == Some(&vid) && !self.config.incognito_mode {
+                        self.active_watch_session = Some(ActiveWatchSession {
+                            video_id: vid,
+                            cpn,
+                            watchtime_url: wt_url,
+                            duration_secs: self.osd_state.duration_secs as f64,
+                            last_reported_secs: 1.0,
+                            last_heartbeat_instant: std::time::Instant::now(),
+                        });
+                    }
+                }
                 Task::none()
             }
 
@@ -5457,6 +5602,7 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                 if idx < self.tabs.len() {
                     let removed = self.tabs.remove(idx);
                     if self.playing_video_id.as_deref() == Some(removed.video_id.as_str()) {
+                        self.finish_active_watch_session();
                         if let Some(player) = &self.player {
                             player.stop();
                         }
@@ -7203,6 +7349,7 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
             search_bar_w,
             self.search_input_focused,
             self.search_focus_glow,
+            self.config.incognito_mode,
             &self.suggestions,
             self.show_suggestions,
             self.power_profile,
@@ -7763,6 +7910,7 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
                 self.config.card_style,
                 self.config.home_columns,
                 self.config.theme,
+                self.config.incognito_mode,
                 self.config.auto_pip_on_unfocus,
                 self.config.full_buffer_tabs,
                 self.config.close_to_tray,
@@ -7784,6 +7932,7 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
                 Message::SetCardStyle,
                 Message::SetHomeColumns,
                 Message::SetAppTheme,
+                Message::ToggleIncognito,
                 Message::ToggleAutoPipOnUnfocus,
                 Message::ToggleFullBufferTabs,
                 Message::ToggleCloseToTray,

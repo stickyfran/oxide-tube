@@ -172,6 +172,8 @@ pub struct AppConfig {
     pub home_columns: GridColumnsConfig,
     #[serde(default)]
     pub theme: AppTheme,
+    #[serde(default)]
+    pub incognito_mode: bool,
 }
 
 fn default_true() -> bool {
@@ -205,6 +207,7 @@ impl Default for AppConfig {
             card_style: CardStyle::Squircle,
             home_columns: GridColumnsConfig::Cols4,
             theme: AppTheme::Dark,
+            incognito_mode: false,
         }
     }
 }
@@ -280,7 +283,7 @@ impl AppConfig {
         duration_str: &str,
         pos_ms: u64,
     ) {
-        if video_id.is_empty() {
+        if video_id.is_empty() || self.incognito_mode {
             return;
         }
         let parsed_dur_ms = crate::innertube::InnerTubeClient::parse_timestamp_secs(duration_str)

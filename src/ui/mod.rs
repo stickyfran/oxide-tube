@@ -12,7 +12,7 @@ use crate::power_manager::PowerProfile;
 use crate::ui::icons::*;
 use crate::ui::theme::*;
 use iced::widget::{button, canvas, column, container, image, mouse_area, row, scrollable, slider, stack, text, text_input, Column, Space};
-use iced::{Alignment, Element, Length, Point, Rectangle, Renderer, Theme};
+use iced::{Alignment, Color, Element, Length, Point, Rectangle, Renderer, Theme};
 
 pub use crate::config::VideoTab;
 
@@ -127,6 +127,7 @@ pub fn view_header_bar<'a, Message: Clone + 'static>(
     search_bar_width: f32,
     is_search_focused: bool,
     search_focus_glow: f32,
+    is_incognito: bool,
     _suggestions: &'a [String],
     _show_suggestions: bool,
     _power_profile: PowerProfile,
@@ -538,16 +539,42 @@ pub fn view_header_bar<'a, Message: Clone + 'static>(
         } else {
             [6, 12]
         })
-        .on_press(on_toggle_login_modal);
+        .on_press(on_toggle_login_modal.clone());
+
+    let incognito_badge: Option<Element<'a, Message>> = if is_incognito {
+        Some(
+            button(
+                row![
+                    icon_incognito(14.0),
+                    text("Incógnito").size(11).color(Color::from_rgb(0.85, 0.85, 0.85)),
+                ]
+                .spacing(5)
+                .align_y(Alignment::Center),
+            )
+            .style(|_t, _s| button::Style {
+                background: Some(Color::from_rgba(0.25, 0.25, 0.30, 0.85).into()),
+                border: iced::border::rounded(14).color(Color::from_rgb(0.45, 0.50, 0.60)).width(1.0),
+                ..button::Style::default()
+            })
+            .padding([4, 8])
+            .on_press(on_toggle_login_modal)
+            .into(),
+        )
+    } else {
+        None
+    };
 
     let reload_btn = button(icon_reload(16.0))
         .style(ghost_button)
         .padding([6, 8])
         .on_press(on_reload);
 
-    let right_section = row![auth_btn, reload_btn]
-        .spacing(8)
-        .align_y(Alignment::Center);
+    let mut right_row = row![].spacing(8).align_y(Alignment::Center);
+    if let Some(badge) = incognito_badge {
+        right_row = right_row.push(badge);
+    }
+    right_row = right_row.push(auth_btn).push(reload_btn);
+    let right_section = right_row;
 
     container(
         row![
@@ -697,6 +724,7 @@ pub fn view_auth_modal<'a, Message: Clone + 'static>(
     current_card_style: crate::config::CardStyle,
     current_columns: crate::config::GridColumnsConfig,
     current_theme: crate::config::AppTheme,
+    incognito_mode: bool,
     auto_pip_on_unfocus: bool,
     full_buffer_tabs: bool,
     close_to_tray: bool,
@@ -718,6 +746,7 @@ pub fn view_auth_modal<'a, Message: Clone + 'static>(
     on_select_card_style: impl Fn(crate::config::CardStyle) -> Message + Copy + 'static,
     on_select_home_columns: impl Fn(crate::config::GridColumnsConfig) -> Message + Copy + 'static,
     on_select_theme: impl Fn(crate::config::AppTheme) -> Message + Copy + 'static,
+    on_toggle_incognito: Message,
     on_toggle_auto_pip: Message,
     on_toggle_full_buffer_tabs: Message,
     on_toggle_close_to_tray: Message,
@@ -986,6 +1015,20 @@ pub fn view_auth_modal<'a, Message: Clone + 'static>(
         }
 
         SettingsCategory::System => {
+            let row_incognito = row![
+                column![
+                    text("Modo Incógnito (No dejar rastro)").size(13).color(COLOR_TEXT_PRIMARY),
+                    text("No marca videos como vistos ni reporta tiempo a YouTube, y desactiva el historial local.")
+                        .size(11)
+                        .color(COLOR_TEXT_SECONDARY),
+                ]
+                .spacing(2)
+                .width(Length::Fill),
+                render_toggle_switch(incognito_mode, on_toggle_incognito),
+            ]
+            .spacing(12)
+            .align_y(Alignment::Center);
+
             let row_auto_pip = row![
                 column![
                     text("PiP Automático al cambiar de ventana (Alt+Tab)").size(13).color(COLOR_TEXT_PRIMARY),
@@ -1032,6 +1075,13 @@ pub fn view_auth_modal<'a, Message: Clone + 'static>(
                 text("Multitarea y Sistema").size(15).color(COLOR_TEXT_PRIMARY),
                 section_card(
                     column![
+                        row_incognito,
+                        container(Space::with_height(Length::Fixed(1.0)))
+                            .width(Length::Fill)
+                            .style(|_t| container::Style {
+                                background: Some(iced::Color::from_rgba(1.0, 1.0, 1.0, 0.05).into()),
+                                ..container::Style::default()
+                            }),
                         row_auto_pip,
                         container(Space::with_height(Length::Fixed(1.0)))
                             .width(Length::Fill)
