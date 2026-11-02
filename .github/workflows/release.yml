@@ -94,7 +94,9 @@ jobs:
             libmpv-dev \
             libwayland-dev \
             libxkbcommon-dev \
-            libgl1-mesa-dev
+            libgl1-mesa-dev \
+            clang \
+            mold
 
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
