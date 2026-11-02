@@ -340,6 +340,7 @@ pub struct WaylandZeroCopyPlayer {
     is_buffering: Arc<AtomicBool>,
     buffering_percent: Arc<AtomicU8>,
     first_frame_rendered: Arc<AtomicBool>,
+    awaiting_playback_restart: Arc<AtomicBool>,
     eos_detected: Arc<AtomicBool>,
     has_error: Arc<AtomicBool>,
     last_error: Arc<Mutex<Option<String>>>,
@@ -404,6 +405,7 @@ impl WaylandZeroCopyPlayer {
             is_buffering: Arc::new(AtomicBool::new(false)),
             buffering_percent: Arc::new(AtomicU8::new(100)),
             first_frame_rendered: Arc::new(AtomicBool::new(false)),
+            awaiting_playback_restart: Arc::new(AtomicBool::new(false)),
             eos_detected: Arc::new(AtomicBool::new(false)),
             has_error: Arc::new(AtomicBool::new(false)),
             last_error: Arc::new(Mutex::new(None)),
@@ -520,6 +522,7 @@ impl WaylandZeroCopyPlayer {
         let is_buffering = self.is_buffering.clone();
         let buffering_percent = self.buffering_percent.clone();
         let first_frame_rendered = self.first_frame_rendered.clone();
+        let awaiting_playback_restart = self.awaiting_playback_restart.clone();
         let eos_detected = self.eos_detected.clone();
         let has_error = self.has_error.clone();
         let last_error = self.last_error.clone();
@@ -777,6 +780,7 @@ impl WaylandZeroCopyPlayer {
 
                         match ev.event_id {
                             MPV_EVENT_PLAYBACK_RESTART => {
+                                awaiting_playback_restart.store(false, Ordering::SeqCst);
                                 first_frame_rendered.store(true, Ordering::SeqCst);
                                 has_error.store(false, Ordering::SeqCst);
                                 *last_error.safe_lock() = None;
@@ -1044,6 +1048,11 @@ impl WaylandZeroCopyPlayer {
                             true
                         };
 
+                        if awaiting_playback_restart.load(Ordering::SeqCst) {
+                            // Discard any residual render callback frame from previous video stream
+                            continue;
+                        }
+
                         if render_ok {
                             frame_seq += 1;
                             let owner = RecycledBuf {
@@ -1205,7 +1214,9 @@ impl WaylandZeroCopyPlayer {
         *self.current_video_url.safe_lock() = video_url.to_string();
         *self.current_audio_url.safe_lock() = audio_url.map(|s| s.to_string());
 
+        self.awaiting_playback_restart.store(true, Ordering::SeqCst);
         self.first_frame_rendered.store(false, Ordering::SeqCst);
+        *self.current_frame.safe_lock() = None;
         self.eos_detected.store(false, Ordering::SeqCst);
         self.has_error.store(false, Ordering::SeqCst);
         *self.last_error.safe_lock() = None;

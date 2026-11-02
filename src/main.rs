@@ -211,6 +211,22 @@ pub struct BufferDownloadState {
     pub audio_path: Option<PathBuf>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToastIcon {
+    VolumeHigh,
+    VolumeLow,
+    VolumeMute,
+    Check,
+    None,
+}
+
+#[derive(Debug, Clone)]
+pub struct ToastState {
+    pub icon: ToastIcon,
+    pub text: String,
+    pub created_at: std::time::Instant,
+}
+
 #[allow(dead_code)]
 pub struct MitubApp {
     config: AppConfig,
@@ -296,7 +312,7 @@ pub struct MitubApp {
     last_snapshot_frame_ids: HashMap<String, u64>,
     last_progress_pos_sec: u64,
     last_session_save_secs: u64,
-    toast_message: Option<(String, std::time::Instant)>,
+    toast_state: Option<ToastState>,
     tab_opened_anim: Option<(usize, std::time::Instant)>,
     tab_shake_anim: Option<(usize, std::time::Instant)>,
     hovered_tab: Option<(usize, std::time::Instant)>,
@@ -1412,7 +1428,7 @@ impl MitubApp {
             last_snapshot_frame_ids: HashMap::new(),
             last_progress_pos_sec: 0,
             last_session_save_secs: 0,
-            toast_message: None,
+            toast_state: None,
             tab_opened_anim: None,
             tab_shake_anim: None,
             hovered_tab: None,
@@ -1983,8 +1999,8 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
             let elapsed = inst.elapsed().as_secs_f32();
             if elapsed < dur && dur > 0.001 {
                 let t = (elapsed / dur).clamp(0.0, 1.0);
-                // Smooth ease-out cubic for a gentle, luxurious transition
-                let ease = 1.0 - (1.0 - t).powi(3);
+                // Ease-in-out smoothstep (3t^2 - 2t^3) for seamless gradual start and elegant soft stop
+                let ease = t * t * (3.0 - 2.0 * t);
                 return from_w + (to_w - from_w) * ease;
             }
         }
@@ -1992,6 +2008,13 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
     }
 
     fn trigger_search_anim(&mut self, target_w: f32) {
+        // Idempotence check: if already transitioning towards the same target, don't reset the timer!
+        if let Some((_, current_target, _, _)) = self.search_anim {
+            if (current_target - target_w).abs() < 1.0 {
+                return;
+            }
+        }
+
         let cur_w = self.current_search_bar_width();
         if (cur_w - target_w).abs() < 1.0 {
             self.search_anim = None;
@@ -1999,10 +2022,9 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
         }
         let dist = (target_w - cur_w).abs();
         let is_expanding = target_w > cur_w;
-        // Expansion is leisurely and graceful (360ms for full expansion),
-        // contraction is slightly brisker (260ms) but still silky smooth.
-        let base_dur = if is_expanding { 0.36 } else { 0.26 };
-        let dur = (base_dur * (dist / 155.0)).clamp(0.08, base_dur);
+        // Luxurious ease-in-out pacing: 420ms for full expansion, 280ms for collapse
+        let base_dur = if is_expanding { 0.42 } else { 0.28 };
+        let dur = (base_dur * (dist / 155.0)).clamp(0.10, base_dur);
         self.search_anim = Some((cur_w, target_w, std::time::Instant::now(), dur));
     }
 
@@ -2302,9 +2324,16 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                     }
                 }
 
-                if let Some((_, instant)) = &self.toast_message {
-                    if instant.elapsed().as_secs_f32() >= 3.0 {
-                        self.toast_message = None;
+                if let Some((_, _, inst, dur)) = self.search_anim {
+                    if inst.elapsed().as_secs_f32() >= dur {
+                        self.search_anim = None;
+                    }
+                }
+
+                if let Some(st) = &self.toast_state {
+                    let max_d = if matches!(st.icon, ToastIcon::VolumeHigh | ToastIcon::VolumeLow | ToastIcon::VolumeMute) { 1.4 } else { 2.5 };
+                    if st.created_at.elapsed().as_secs_f32() >= max_d {
+                        self.toast_state = None;
                     }
                 }
 
@@ -3364,7 +3393,7 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                 self.search_request_id = self.search_request_id.wrapping_add(1);
                 let req_id = self.search_request_id;
 
-                if query.trim().len() >= 2 {
+                if query.trim().len() >= 2 && self.current_search_bar_width() >= 250.0 {
                     self.show_suggestions = true;
                     let it = self.innertube.clone();
                     return Task::perform(
@@ -3898,21 +3927,18 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                     player.set_volume(clamped_vol as f64);
                 }
                 let pct = (clamped_vol * 100.0).round() as u32;
-                let vol_icon = if clamped_vol <= 0.001 {
-                    "🔇 Silenciado"
+                let (icon, text) = if clamped_vol <= 0.001 {
+                    (ToastIcon::VolumeMute, "Silenciado".to_string())
                 } else if clamped_vol < 0.35 {
-                    "🔉"
+                    (ToastIcon::VolumeLow, format!("{pct}%"))
                 } else {
-                    "🔊"
+                    (ToastIcon::VolumeHigh, format!("{pct}%"))
                 };
-                self.toast_message = Some((
-                    if clamped_vol <= 0.001 {
-                        "🔇 Silenciado".to_string()
-                    } else {
-                        format!("{vol_icon}  {pct}%")
-                    },
-                    std::time::Instant::now(),
-                ));
+                self.toast_state = Some(ToastState {
+                    icon,
+                    text,
+                    created_at: std::time::Instant::now(),
+                });
                 Task::none()
             }
 
@@ -4811,7 +4837,11 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                 } else {
                     "Copiado al portapapeles".to_string()
                 };
-                self.toast_message = Some((toast_text, std::time::Instant::now()));
+                self.toast_state = Some(ToastState {
+                    icon: ToastIcon::Check,
+                    text: toast_text,
+                    created_at: std::time::Instant::now(),
+                });
                 iced::clipboard::write(text)
             }
 
@@ -5557,7 +5587,11 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                 self.config.cached_user_name = None;
                 self.config.cached_avatar_url = None;
                 self.config.save_async();
-                self.toast_message = Some(("Tu sesión de Google expiró. Has pasado a Modo Invitado.".to_string(), std::time::Instant::now()));
+                self.toast_state = Some(ToastState {
+                    icon: ToastIcon::None,
+                    text: "Tu sesión de Google expiró. Has pasado a Modo Invitado.".to_string(),
+                    created_at: std::time::Instant::now(),
+                });
                 Task::none()
             }
 
@@ -5638,7 +5672,11 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                 self.config.cached_user_name = None;
                 self.config.cached_avatar_url = None;
                 self.config.save_async();
-                self.toast_message = Some(("Sesión cerrada exitosamente".to_string(), std::time::Instant::now()));
+                self.toast_state = Some(ToastState {
+                    icon: ToastIcon::Check,
+                    text: "Sesión cerrada exitosamente".to_string(),
+                    created_at: std::time::Instant::now(),
+                });
                 return self.update(Message::ReloadFeed);
             }
 
@@ -5843,7 +5881,7 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                                     self.search_input_focused = true;
                                     self.search_hover_exit_at = None;
                                     self.trigger_search_anim(300.0);
-                                    if self.search_query.trim().len() >= 2 && !self.suggestions.is_empty() {
+                                    if cur_search_w >= 250.0 && self.search_query.trim().len() >= 2 && !self.suggestions.is_empty() {
                                         self.show_suggestions = true;
                                     }
                                 }
@@ -6335,13 +6373,14 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
             Message::VideoDeleted(new_size, freed) => {
                 self.current_cache_size_bytes = new_size;
                 if freed > 0 {
-                    self.toast_message = Some((
-                        format!(
+                    self.toast_state = Some(ToastState {
+                        icon: ToastIcon::Check,
+                        text: format!(
                             "Video eliminado ({} liberados)",
                             crate::cache_manager::format_size(freed)
                         ),
-                        std::time::Instant::now(),
-                    ));
+                        created_at: std::time::Instant::now(),
+                    });
                     crate::power_manager::trim_process_memory();
                 }
                 Task::none()
@@ -6407,13 +6446,14 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
 
             Message::CacheCleared(freed_bytes) => {
                 self.current_cache_size_bytes = 0;
-                self.toast_message = Some((
-                    format!(
+                self.toast_state = Some(ToastState {
+                    icon: ToastIcon::Check,
+                    text: format!(
                         "Caché de video vaciada ({} liberados)",
                         crate::cache_manager::format_size(freed_bytes)
                     ),
-                    std::time::Instant::now(),
-                ));
+                    created_at: std::time::Instant::now(),
+                });
                 crate::power_manager::trim_process_memory();
                 Task::none()
             }
@@ -6835,13 +6875,63 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
         .align_y(iced::alignment::Vertical::Top)
         .into();
 
-        let video_frame = self.player.as_ref().and_then(|p| p.get_current_frame());
+        let is_first_frame_ready = self.player.as_ref().map(|p| p.is_first_frame_rendered()).unwrap_or(false);
+        let video_frame = if is_first_frame_ready {
+            self.player.as_ref().and_then(|p| p.get_current_frame())
+        } else {
+            None
+        };
         let mut layers: Vec<Element<'_, Message>> = Vec::new();
 
         if let Some(frame) = video_frame {
             layers.push(
                 crate::ui::video_widget::video_shader_pip(frame),
             );
+        } else {
+            // Video is paused or buffering its first frame: render solid black base and thumbnail poster
+            // to avoid transparent window on initial pause or before first frame
+            let pip_vid_opt = self.pip_watch_details.as_ref().map(|d| d.video_id.clone())
+                .or_else(|| self.playing_video_id.clone());
+            let poster_img = pip_vid_opt.as_ref().and_then(|vid| {
+                self.tab_cached_frames.get(vid)
+                    .or_else(|| {
+                        self.tabs.iter().find(|t| &t.video_id == vid && !t.thumbnail_url.is_empty())
+                            .and_then(|t| self.thumbnail_cache.get(&t.thumbnail_url))
+                    })
+                    .or_else(|| {
+                        let thumb_url = format!("https://i.ytimg.com/vi/{vid}/hqdefault.jpg");
+                        self.thumbnail_cache.get(&thumb_url)
+                    })
+            });
+
+            if let Some(h) = poster_img {
+                layers.push(
+                    container(
+                        iced::widget::image(h.clone())
+                            .width(Length::Fill)
+                            .height(Length::Fill)
+                            .content_fit(iced::ContentFit::Cover)
+                    )
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .style(|_t| container::Style {
+                        background: Some(iced::Color::BLACK.into()),
+                        ..container::Style::default()
+                    })
+                    .into()
+                );
+            } else {
+                layers.push(
+                    container(iced::widget::Space::new(Length::Fill, Length::Fill))
+                        .width(Length::Fill)
+                        .height(Length::Fill)
+                        .style(|_t| container::Style {
+                            background: Some(iced::Color::BLACK.into()),
+                            ..container::Style::default()
+                        })
+                        .into()
+                );
+            }
         }
 
         // Layer 1: drag_area directly over video
@@ -6878,20 +6968,36 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
         }
 
         // Layer 3.5: Volume/toast HUD
-        if let Some((ref msg, instant)) = &self.toast_message {
-            let elapsed = instant.elapsed().as_secs_f32();
-            if elapsed < 1.4 {
-                let alpha = if elapsed > 1.1 {
-                    ((1.4 - elapsed) / 0.3).clamp(0.0, 1.0)
+        if let Some(st) = &self.toast_state {
+            let elapsed = st.created_at.elapsed().as_secs_f32();
+            let max_d = if matches!(st.icon, ToastIcon::VolumeHigh | ToastIcon::VolumeLow | ToastIcon::VolumeMute) { 1.4 } else { 2.2 };
+            if elapsed < max_d {
+                let alpha = if elapsed > max_d - 0.3 {
+                    ((max_d - elapsed) / 0.3).clamp(0.0, 1.0)
                 } else if elapsed < 0.15 {
                     (elapsed / 0.15).clamp(0.0, 1.0)
                 } else {
                     1.0
                 };
+
+                let icon_el: Element<'_, Message> = match st.icon {
+                    ToastIcon::VolumeHigh => ui::icons::icon_volume(15.0),
+                    ToastIcon::VolumeLow => ui::icons::icon_volume_low(15.0),
+                    ToastIcon::VolumeMute => ui::icons::icon_volume_mute(15.0),
+                    ToastIcon::Check => ui::icons::icon_check_circle(15.0),
+                    ToastIcon::None => iced::widget::Space::with_width(Length::Fixed(0.0)).into(),
+                };
+
+                let has_icon = st.icon != ToastIcon::None;
                 let toast_badge = container(
-                    text(msg.clone())
-                        .size(13)
-                        .color(COLOR_TEXT_PRIMARY),
+                    iced::widget::row![
+                        icon_el,
+                        text(st.text.clone())
+                            .size(13)
+                            .color(COLOR_TEXT_PRIMARY),
+                    ]
+                    .spacing(if has_icon { 8 } else { 0 })
+                    .align_y(iced::Alignment::Center)
                 )
                 .padding([6, 14])
                 .style(move |_t| container::Style {
@@ -6958,7 +7064,10 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
                             .and_then(|t| self.thumbnail_cache.get(&t.thumbnail_url))
                     });
                 let buffer_status = self.buffer_downloads.get(&details.video_id).map(|s| (s.percent, s.is_complete, s.downloaded_bytes, s.total_bytes, s.speed_bytes_per_sec));
-                let video_frame = if is_active_video && !is_this_video_in_pip {
+                let video_frame = if is_active_video
+                    && !is_this_video_in_pip
+                    && self.player.as_ref().map(|p| p.is_first_frame_rendered()).unwrap_or(false)
+                {
                     self.player.as_ref().and_then(|p| p.get_current_frame())
                 } else {
                     None
@@ -7230,7 +7339,10 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
                                 .and_then(|t| self.thumbnail_cache.get(&t.thumbnail_url))
                         });
                     let buffer_status = self.buffer_downloads.get(&details.video_id).map(|s| (s.percent, s.is_complete, s.downloaded_bytes, s.total_bytes, s.speed_bytes_per_sec));
-                    let video_frame = if is_active_video && !is_this_video_in_pip {
+                    let video_frame = if is_active_video
+                        && !is_this_video_in_pip
+                        && self.player.as_ref().map(|p| p.is_first_frame_rendered()).unwrap_or(false)
+                    {
                         self.player.as_ref().and_then(|p| p.get_current_frame())
                     } else {
                         None
@@ -7443,9 +7555,9 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
 
         let mut layers: Vec<Element<'_, Message>> = vec![base_view];
 
-        if let Some((ref msg, instant)) = &self.toast_message {
-            let elapsed = instant.elapsed().as_secs_f32();
-            let is_vol = msg.starts_with('🔊') || msg.starts_with('🔉') || msg.starts_with('🔇');
+        if let Some(st) = &self.toast_state {
+            let elapsed = st.created_at.elapsed().as_secs_f32();
+            let is_vol = matches!(st.icon, ToastIcon::VolumeHigh | ToastIcon::VolumeLow | ToastIcon::VolumeMute);
             let max_duration = if is_vol { 1.4 } else { 2.5 };
             if elapsed < max_duration {
                 let fade_out = 0.3;
@@ -7457,18 +7569,23 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
                     1.0
                 };
 
+                let icon_el: Element<'_, Message> = match st.icon {
+                    ToastIcon::VolumeHigh => ui::icons::icon_volume(16.0),
+                    ToastIcon::VolumeLow => ui::icons::icon_volume_low(16.0),
+                    ToastIcon::VolumeMute => ui::icons::icon_volume_mute(16.0),
+                    ToastIcon::Check => ui::icons::icon_check_circle(16.0),
+                    ToastIcon::None => Space::with_width(Length::Fixed(0.0)).into(),
+                };
+
+                let has_icon = st.icon != ToastIcon::None;
                 let toast_widget = container(
                     row![
-                        if !is_vol {
-                            Element::from(icon_check_circle(16.0))
-                        } else {
-                            Element::from(Space::with_width(Length::Fixed(0.0)))
-                        },
-                        text(msg.clone())
+                        icon_el,
+                        text(st.text.clone())
                             .size(13)
                             .color(COLOR_TEXT_PRIMARY),
                     ]
-                    .spacing(if !is_vol { 8 } else { 0 })
+                    .spacing(if has_icon { 8 } else { 0 })
                     .align_y(Alignment::Center),
                 )
                 .padding([10, 18])
@@ -7739,11 +7856,11 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
         let is_loading_buffer = is_watching
             && (!self.osd_state.first_frame_rendered || self.osd_state.is_buffering)
             && !self.osd_state.has_playback_error;
-        let has_toast = self.toast_message
+        let has_toast = self.toast_state
             .as_ref()
-            .map(|(msg, t)| {
-                let max_d = if msg.starts_with('🔊') || msg.starts_with('🔉') || msg.starts_with('🔇') { 1.4 } else { 2.5 };
-                t.elapsed().as_secs_f32() < max_d
+            .map(|st| {
+                let max_d = if matches!(st.icon, ToastIcon::VolumeHigh | ToastIcon::VolumeLow | ToastIcon::VolumeMute) { 1.4 } else { 2.5 };
+                st.created_at.elapsed().as_secs_f32() < max_d
             })
             .unwrap_or(false);
         let has_tab_shake = self.tab_shake_anim

@@ -813,7 +813,7 @@ pub fn view_watch_page<'a, Message: Clone + 'static>(
 
     let (buf_label, buf_color, buf_icon) = if is_buffered {
         (
-            format!("Descargado ✓ · {}", crate::cache_manager::format_size(buf_done)),
+            format!("Descargado · {}", crate::cache_manager::format_size(buf_done)),
             iced::Color::from_rgb8(0x2b, 0xa6, 0x40),
             icon_check_circle(14.0),
         )

@@ -101,6 +101,27 @@ impl<Message> canvas::Program<Message> for PlayingTabGlowBorder {
     }
 }
 
+fn nav_tab_button<'a, Message: Clone + 'static>(
+    icon: Element<'a, Message>,
+    is_active: bool,
+    on_press: Message,
+) -> iced::widget::Button<'a, Message> {
+    button(icon)
+        .style(move |_t, status| {
+            if is_active {
+                button::Style {
+                    background: Some(iced::Color::from_rgb8(0xcc, 0x00, 0x00).into()),
+                    border: iced::border::rounded(6).color(iced::Color::from_rgb8(0xff, 0x33, 0x33)).width(1.0),
+                    ..button::Style::default()
+                }
+            } else {
+                ghost_button(_t, status)
+            }
+        })
+        .padding([6, 8])
+        .on_press(on_press)
+}
+
 pub fn view_header_bar<'a, Message: Clone + 'static>(
     search_query: &'a str,
     search_bar_width: f32,
@@ -142,68 +163,24 @@ pub fn view_header_bar<'a, Message: Clone + 'static>(
     on_scroll_tabs_left: Message,
     on_scroll_tabs_right: Message,
 ) -> Element<'a, Message> {
-    // 1. Left section: Back, Logo (white when away, red when home)
+    // 1. Left section: Back, Home button (with uniform active styling)
     let back_btn = button(icon_back(18.0))
         .style(ghost_button)
         .padding([6, 10])
         .on_press(on_go_back);
 
-    let logo = button(icon_youtube_logo(20.0, is_home))
-        .style(ghost_button)
-        .padding([4, 6])
-        .on_press(on_go_home);
+    let home_btn = nav_tab_button(icon_home(16.0), is_home, on_go_home);
 
-    let left_section = row![back_btn, logo]
+    let left_section = row![back_btn, home_btn]
         .spacing(6)
         .align_y(Alignment::Center);
 
-    // 2. Suscripciones (icon-only) + Historial + Search Bar - alineado a la izquierda junto al logo
-    let subs_btn = button(icon_subscriptions(16.0))
-        .style(move |_t, status| {
-            if is_subscriptions {
-                button::Style {
-                    background: Some(iced::Color::from_rgb8(0xcc, 0x00, 0x00).into()),
-                    border: iced::border::rounded(6).color(iced::Color::from_rgb8(0xff, 0x33, 0x33)).width(1.0),
-                    ..button::Style::default()
-                }
-            } else {
-                ghost_button(_t, status)
-            }
-        })
-        .padding([6, 8])
-        .on_press(on_open_subscriptions);
+    // 2. Suscripciones (icon-only) + Historial + Descargas + Search Bar
+    let subs_btn = nav_tab_button(icon_subscriptions(16.0), is_subscriptions, on_open_subscriptions);
+    let history_btn = nav_tab_button(icon_history(16.0), is_history, on_open_history);
+    let downloads_btn = nav_tab_button(icon_buffer(16.0), is_downloads, on_open_downloads);
 
-    let history_btn = button(icon_history(16.0))
-        .style(move |_t, status| {
-            if is_history {
-                button::Style {
-                    background: Some(iced::Color::from_rgb8(0xcc, 0x00, 0x00).into()),
-                    border: iced::border::rounded(6).color(iced::Color::from_rgb8(0xff, 0x33, 0x33)).width(1.0),
-                    ..button::Style::default()
-                }
-            } else {
-                ghost_button(_t, status)
-            }
-        })
-        .padding([6, 8])
-        .on_press(on_open_history);
-
-    let downloads_btn = button(icon_buffer(16.0))
-        .style(move |_t, status| {
-            if is_downloads {
-                button::Style {
-                    background: Some(iced::Color::from_rgb8(0xcc, 0x00, 0x00).into()),
-                    border: iced::border::rounded(6).color(iced::Color::from_rgb8(0xff, 0x33, 0x33)).width(1.0),
-                    ..button::Style::default()
-                }
-            } else {
-                ghost_button(_t, status)
-            }
-        })
-        .padding([6, 8])
-        .on_press(on_open_downloads);
-
-    let search_placeholder = if is_search_focused || search_bar_width > 180.0 || !search_query.is_empty() {
+    let search_placeholder = if is_search_focused || search_bar_width > 240.0 || !search_query.is_empty() {
         "Buscar o pegar enlace..."
     } else {
         "Buscar..."
@@ -1403,29 +1380,40 @@ pub fn view_downloads<'a, Message: Clone + 'static>(
 
     for item in items {
         let speed_str = crate::cache_manager::format_speed(item.speed_bytes_per_sec);
-        let status_text = if item.is_complete {
-            format!("Descargado ✓ · {}", format_size(item.downloaded_bytes))
-        } else if item.total_bytes > 0 {
-            if !speed_str.is_empty() {
-                format!(
-                    "Descargando {}% · {} / {} · {}",
-                    item.percent,
-                    format_size(item.downloaded_bytes),
-                    format_size(item.total_bytes),
-                    speed_str
-                )
-            } else {
-                format!(
-                    "Descargando {}% · {} / {}",
-                    item.percent,
-                    format_size(item.downloaded_bytes),
-                    format_size(item.total_bytes)
-                )
-            }
-        } else if !speed_str.is_empty() {
-            format!("Descargando {}% · {}", item.percent, speed_str)
+        let status_row: Element<'a, Message> = if item.is_complete {
+            row![
+                icon_check_circle(12.0),
+                text(format!("Descargado · {}", format_size(item.downloaded_bytes)))
+                    .size(12)
+                    .color(iced::Color::from_rgb8(0x2b, 0xa6, 0x40)),
+            ]
+            .spacing(5)
+            .align_y(Alignment::Center)
+            .into()
         } else {
-            format!("Descargando {}%", item.percent)
+            let status_text = if item.total_bytes > 0 {
+                if !speed_str.is_empty() {
+                    format!(
+                        "Descargando {}% · {} / {} · {}",
+                        item.percent,
+                        format_size(item.downloaded_bytes),
+                        format_size(item.total_bytes),
+                        speed_str
+                    )
+                } else {
+                    format!(
+                        "Descargando {}% · {} / {}",
+                        item.percent,
+                        format_size(item.downloaded_bytes),
+                        format_size(item.total_bytes)
+                    )
+                }
+            } else if !speed_str.is_empty() {
+                format!("Descargando {}% · {}", item.percent, speed_str)
+            } else {
+                format!("Descargando {}%", item.percent)
+            };
+            text(status_text).size(12).color(COLOR_TEXT_SECONDARY).into()
         };
         let bar_color = if item.is_complete {
             iced::Color::from_rgb8(0x2b, 0xa6, 0x40)
@@ -1441,7 +1429,7 @@ pub fn view_downloads<'a, Message: Clone + 'static>(
                     bar: bar_color.into(),
                     border: iced::border::rounded(3),
                 }),
-            text(status_text).size(12).color(COLOR_TEXT_SECONDARY),
+            status_row,
         ]
         .spacing(6);
 

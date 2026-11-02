@@ -37,6 +37,12 @@ pub fn icon_app_logo<'a, Message: 'static>(size: f32) -> Element<'a, Message> {
         .into()
 }
 
+pub fn icon_home<'a, Message: 'static>(size: f32) -> Element<'a, Message> {
+    static HANDLE: OnceLock<svg::Handle> = OnceLock::new();
+    const SVG: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#f1f1f1" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></svg>"##;
+    render_cached_svg(&HANDLE, SVG, size)
+}
+
 pub fn icon_youtube_logo<'a, Message: 'static>(size: f32, is_active: bool) -> Element<'a, Message> {
     static RED_HANDLE: OnceLock<svg::Handle> = OnceLock::new();
     static WHITE_HANDLE: OnceLock<svg::Handle> = OnceLock::new();
