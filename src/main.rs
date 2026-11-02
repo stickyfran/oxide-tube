@@ -1983,6 +1983,7 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
             let elapsed = inst.elapsed().as_secs_f32();
             if elapsed < dur && dur > 0.001 {
                 let t = (elapsed / dur).clamp(0.0, 1.0);
+                // Smooth ease-out cubic for a gentle, luxurious transition
                 let ease = 1.0 - (1.0 - t).powi(3);
                 return from_w + (to_w - from_w) * ease;
             }
@@ -1996,9 +1997,12 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
             self.search_anim = None;
             return;
         }
-        // Proportional duration: velocity is constant regardless of remaining distance
         let dist = (target_w - cur_w).abs();
-        let dur = (0.16 * (dist / 155.0)).clamp(0.04, 0.20);
+        let is_expanding = target_w > cur_w;
+        // Expansion is leisurely and graceful (360ms for full expansion),
+        // contraction is slightly brisker (260ms) but still silky smooth.
+        let base_dur = if is_expanding { 0.36 } else { 0.26 };
+        let dur = (base_dur * (dist / 155.0)).clamp(0.08, base_dur);
         self.search_anim = Some((cur_w, target_w, std::time::Instant::now(), dur));
     }
 
