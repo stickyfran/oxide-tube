@@ -17,7 +17,7 @@ OutputDir=dist
 Compression=lzma2/ultra64
 SolidCompression=yes
 WizardStyle=modern
-SetupIconFile=assets\icon.ico
+SetupIconFile=..\..\assets\icon.ico
 UninstallDisplayIcon={app}\tube-oxide.exe
 CloseApplications=yes
 CloseApplicationsFilter=tube-oxide.exe
@@ -36,8 +36,8 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 Name: "taskbaricon"; Description: "Crear acceso directo en la barra de tareas"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 
 [Files]
-Source: "pkg\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
-Source: "assets\icon.ico"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\..\pkg\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "..\..\assets\icon.ico"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{autoprograms}\Tube-oxide"; Filename: "{app}\tube-oxide.exe"; IconFilename: "{app}\icon.ico"
