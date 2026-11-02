@@ -1,6 +1,6 @@
 ; Inno Setup Script for Tube-oxide
 #ifndef AppVersion
-  #define AppVersion "0.99.7"
+  #define AppVersion "0.99.12"
 #endif
 
 [Setup]
@@ -26,24 +26,46 @@ ArchitecturesInstallIn64BitMode=x64compatible
 ArchitecturesAllowed=x64compatible
 PrivilegesRequired=lowest
 PrivilegesRequiredOverridesAllowed=dialog
+ChangesAssociations=yes
 
 [Languages]
 Name: "spanish"; MessagesFile: "compiler:Languages\Spanish.isl"
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
-Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: checkedonce
-Name: "taskbaricon"; Description: "Crear acceso directo en la barra de tareas"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
+Name: "startmenuicon"; Description: "Crear acceso directo en el Menú Inicio"; GroupDescription: "{cm:AdditionalIcons}"
+Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"
+Name: "assocyoutube"; Description: "Asociar enlaces y protocolos de YouTube (vnd.youtube://, youtube://)"; GroupDescription: "Asociaciones de sistema:"
 
 [Files]
 Source: "..\..\pkg\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "..\..\assets\icon.ico"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
-Name: "{autoprograms}\Tube-oxide"; Filename: "{app}\tube-oxide.exe"; IconFilename: "{app}\icon.ico"
-Name: "{autoprograms}\Desinstalar Tube-oxide"; Filename: "{uninstallexe}"
+Name: "{autoprograms}\Tube-oxide"; Filename: "{app}\tube-oxide.exe"; IconFilename: "{app}\icon.ico"; Tasks: startmenuicon
+Name: "{autoprograms}\Desinstalar Tube-oxide"; Filename: "{uninstallexe}"; Tasks: startmenuicon
 Name: "{autodesktop}\Tube-oxide"; Filename: "{app}\tube-oxide.exe"; IconFilename: "{app}\icon.ico"; Tasks: desktopicon
-Name: "{userappdata}\Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar\Tube-oxide"; Filename: "{app}\tube-oxide.exe"; IconFilename: "{app}\icon.ico"; Tasks: taskbaricon
+
+[Registry]
+; Asociar protocolo de YouTube vnd.youtube (abierto por navegadores y extensiones)
+Root: HKA; Subkey: "Software\Classes\vnd.youtube"; ValueType: string; ValueName: ""; ValueData: "URL:YouTube Protocol"; Flags: uninsdeletekey; Tasks: assocyoutube
+Root: HKA; Subkey: "Software\Classes\vnd.youtube"; ValueType: string; ValueName: "URL Protocol"; ValueData: ""; Flags: uninsdeletekey; Tasks: assocyoutube
+Root: HKA; Subkey: "Software\Classes\vnd.youtube\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: "{app}\tube-oxide.exe,0"; Flags: uninsdeletekey; Tasks: assocyoutube
+Root: HKA; Subkey: "Software\Classes\vnd.youtube\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\tube-oxide.exe"" ""%1"""; Flags: uninsdeletekey; Tasks: assocyoutube
+
+; Asociar protocolo youtube://
+Root: HKA; Subkey: "Software\Classes\youtube"; ValueType: string; ValueName: ""; ValueData: "URL:YouTube Protocol"; Flags: uninsdeletekey; Tasks: assocyoutube
+Root: HKA; Subkey: "Software\Classes\youtube"; ValueType: string; ValueName: "URL Protocol"; ValueData: ""; Flags: uninsdeletekey; Tasks: assocyoutube
+Root: HKA; Subkey: "Software\Classes\youtube\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: "{app}\tube-oxide.exe,0"; Flags: uninsdeletekey; Tasks: assocyoutube
+Root: HKA; Subkey: "Software\Classes\youtube\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\tube-oxide.exe"" ""%1"""; Flags: uninsdeletekey; Tasks: assocyoutube
+
+; Registrar Capabilities para que Windows lo reconozca como reproductor / navegador de YouTube
+Root: HKA; Subkey: "Software\Tube-oxide\Capabilities"; ValueType: string; ValueName: "ApplicationDescription"; ValueData: "Cliente nativo y ligero de YouTube en Rust"; Flags: uninsdeletekey; Tasks: assocyoutube
+Root: HKA; Subkey: "Software\Tube-oxide\Capabilities"; ValueType: string; ValueName: "ApplicationIcon"; ValueData: "{app}\tube-oxide.exe,0"; Flags: uninsdeletekey; Tasks: assocyoutube
+Root: HKA; Subkey: "Software\Tube-oxide\Capabilities"; ValueType: string; ValueName: "ApplicationName"; ValueData: "Tube-oxide"; Flags: uninsdeletekey; Tasks: assocyoutube
+Root: HKA; Subkey: "Software\Tube-oxide\Capabilities\UrlAssociations"; ValueType: string; ValueName: "vnd.youtube"; ValueData: "vnd.youtube"; Flags: uninsdeletekey; Tasks: assocyoutube
+Root: HKA; Subkey: "Software\Tube-oxide\Capabilities\UrlAssociations"; ValueType: string; ValueName: "youtube"; ValueData: "youtube"; Flags: uninsdeletekey; Tasks: assocyoutube
+Root: HKA; Subkey: "Software\RegisteredApplications"; ValueType: string; ValueName: "Tube-oxide"; ValueData: "Software\Tube-oxide\Capabilities"; Flags: uninsdeletevalue; Tasks: assocyoutube
 
 [Run]
 Filename: "{app}\tube-oxide.exe"; Description: "{cm:LaunchProgram,Tube-oxide}"; Flags: nowait postinstall skipifsilent
