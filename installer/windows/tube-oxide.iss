@@ -33,8 +33,8 @@ Name: "spanish"; MessagesFile: "compiler:Languages\Spanish.isl"
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
-Name: "startmenuicon"; Description: "Crear acceso directo en el Menú Inicio"; GroupDescription: "{cm:AdditionalIcons}"
-Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"
+Name: "startmenuicon"; Description: "Crear acceso directo en el Menú Inicio"; GroupDescription: "{cm:AdditionalIcons}"; Check: not IsUpgrade
+Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Check: not IsUpgrade
 Name: "assocyoutube"; Description: "Asociar enlaces y protocolos de YouTube (vnd.youtube://, youtube://)"; GroupDescription: "Asociaciones de sistema:"
 
 [Files]
@@ -45,6 +45,15 @@ Source: "..\..\assets\icon.ico"; DestDir: "{app}"; Flags: ignoreversion
 Name: "{autoprograms}\Tube-oxide"; Filename: "{app}\tube-oxide.exe"; IconFilename: "{app}\icon.ico"; Tasks: startmenuicon
 Name: "{autoprograms}\Desinstalar Tube-oxide"; Filename: "{uninstallexe}"; Tasks: startmenuicon
 Name: "{autodesktop}\Tube-oxide"; Filename: "{app}\tube-oxide.exe"; IconFilename: "{app}\icon.ico"; Tasks: desktopicon
+
+[Code]
+function IsUpgrade(): Boolean;
+var
+  InstalledKey: String;
+begin
+  InstalledKey := 'Software\Microsoft\Windows\CurrentVersion\Uninstall\{{D37B47C5-81E2-4467-9FA0-A6E55A94C777}}_is1';
+  Result := RegKeyExists(HKEY_CURRENT_USER, InstalledKey) or RegKeyExists(HKEY_LOCAL_MACHINE, InstalledKey);
+end;
 
 [Registry]
 ; Asociar protocolo de YouTube vnd.youtube (abierto por navegadores y extensiones)

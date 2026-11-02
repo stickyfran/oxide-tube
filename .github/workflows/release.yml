@@ -65,7 +65,7 @@ jobs:
             $iscc = (Get-Command iscc.exe -ErrorAction SilentlyContinue).Source
           }
           & $iscc "/DAppVersion=${{ github.ref_name }}" installer\windows\tube-oxide.iss
-          Copy-Item dist/*.exe .
+          Copy-Item installer\windows\dist\*.exe .
           Get-ChildItem -Filter *.exe
 
       - name: Upload artifact
