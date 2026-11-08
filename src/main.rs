@@ -40,6 +40,9 @@ use tokio::sync::RwLock;
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+/// How long a loaded Subscriptions/History feed stays fresh before a silent refresh.
+const FEED_CACHE_TTL: Duration = Duration::from_secs(90);
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ViewMode {
     Home,
@@ -86,10 +89,12 @@ pub enum Message {
     OpenDownloads,
     DownloadsScanned(Vec<(String, String, u64)>),
     SearchHoverChanged(bool),
+    ProfileHoverChanged(bool),
     HistoryLoaded(Result<Vec<VideoCard>, String>),
     OpenPlaylists,
     PlaylistsLoaded(Result<Vec<VideoCard>, String>),
     UserProfileLoaded(Option<String>, Option<String>),
+    AuthValidated(bool),
     UserAvatarDownloaded(image::Handle),
     AddToQueue(VideoCard),
     RemoveFromQueue(usize),
@@ -142,6 +147,7 @@ pub enum Message {
     LikeStatusResult(Result<String, String>),
     OpenVideoInNewTab(String),
     SelectTab(usize),
+    TabPressed(usize),
     CloseTab(usize),
     TabHoverChanged(usize, bool),
     RestoreClosedTab,
@@ -196,11 +202,19 @@ pub enum Message {
     WindowMaximized(bool),
     ToggleCloseToTray,
     RestoreFromTray,
+    ToggleTrayWindow,
     QuitApp,
     NoOp,
     SetAppTheme(AppTheme),
     ToggleIncognito,
     WatchSessionStarted(Option<(String, String, String)>),
+    HeaderDragPressed,
+    HeaderRightClicked,
+    MinimizeMainWindow,
+    ToggleMaximizeMainWindow,
+    CloseMainWindow,
+    StartMainWindowResize(PipResizeEdge),
+    ToggleCustomTitlebar,
 }
 
 #[derive(Debug, Clone)]
@@ -229,6 +243,14 @@ pub struct ToastState {
     pub icon: ToastIcon,
     pub text: String,
     pub created_at: std::time::Instant,
+}
+
+#[derive(Debug, Clone)]
+pub struct TabDragState {
+    pub tab_idx: usize,
+    pub start_x: f32,
+    pub current_x: f32,
+    pub has_moved: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -269,6 +291,12 @@ pub struct MitubApp {
     autoplay_next: bool,
     home_videos: Vec<VideoCard>,
     cached_home_feed: Vec<VideoCard>,
+    cached_subscriptions: Vec<VideoCard>,
+    cached_history: Vec<VideoCard>,
+    subscriptions_loaded_at: Option<std::time::Instant>,
+    history_loaded_at: Option<std::time::Instant>,
+    subscriptions_refreshing: bool,
+    history_refreshing: bool,
     watch_details: Option<Arc<WatchDetails>>,
     channel_details: Option<ChannelDetails>,
     selected_channel_tab: usize,
@@ -317,6 +345,8 @@ pub struct MitubApp {
     current_request_id: u64,
     view_transition_start: Option<std::time::Instant>,
     view_transition_alpha: f32,
+    view_fade_start: Option<std::time::Instant>,
+    view_fade_alpha: f32,
     fullscreen_anim: Option<(std::time::Instant, bool, (f32, f32, f32, f32))>,
     is_page_loading: bool,
     live_chat_poll_tick: u32,
@@ -346,6 +376,11 @@ pub struct MitubApp {
     search_anim: Option<(f32, f32, std::time::Instant, f32)>,
     search_hover_exit_at: Option<std::time::Instant>,
     search_focus_glow: f32,
+    profile_hovered: bool,
+    profile_anim: Option<(f32, f32, std::time::Instant, f32)>,
+    last_header_click: Option<std::time::Instant>,
+    header_drag_pending: Option<(std::time::Instant, iced::Point)>,
+    tab_drag: Option<TabDragState>,
 }
 
 fn get_ipc_port() -> u16 {
@@ -409,6 +444,9 @@ fn tray_action_stream() -> impl iced::futures::Stream<Item = Message> {
             match rx.recv().await {
                 Ok(action) => {
                     match action {
+                        crate::tray::TrayAction::Toggle => {
+                            let _ = output.send(Message::ToggleTrayWindow).await;
+                        }
                         crate::tray::TrayAction::Restore => {
                             let _ = output.send(Message::RestoreFromTray).await;
                         }
@@ -988,6 +1026,10 @@ fn start_full_buffer_task(
             } else {
                 match innertube.get_watch_details(&video_id).await {
                     Ok(details) => {
+                        if details.is_live {
+                            let _ = output.send(Message::FullBufferError(video_id, "Los videos en directo no se descargan en caché".to_string())).await;
+                            return;
+                        }
                         let title = details.title.clone();
                         if !title.is_empty() {
                             crate::cache_manager::save_video_title(&video_id, &title);
@@ -1319,7 +1361,7 @@ impl MitubApp {
             size: Size::new(saved_w, saved_h),
             min_size: Some(Size::new(800.0, 600.0)),
             transparent: false,
-            decorations: true,
+            decorations: !config.custom_titlebar,
             icon: load_app_icon(),
             exit_on_close_request: false,
             #[cfg(target_os = "linux")]
@@ -1388,6 +1430,12 @@ impl MitubApp {
             autoplay_next: app_autoplay,
             home_videos: Vec::new(),
             cached_home_feed: Vec::new(),
+            cached_subscriptions: Vec::new(),
+            cached_history: Vec::new(),
+            subscriptions_loaded_at: None,
+            history_loaded_at: None,
+            subscriptions_refreshing: false,
+            history_refreshing: false,
             watch_details: None,
             channel_details: None,
             selected_channel_tab: 0,
@@ -1440,6 +1488,8 @@ impl MitubApp {
             current_request_id: 0,
             view_transition_start: Some(std::time::Instant::now()),
             view_transition_alpha: 1.0,
+            view_fade_start: None,
+            view_fade_alpha: 0.0,
             fullscreen_anim: None,
             is_page_loading: true,
             live_chat_poll_tick: 0,
@@ -1470,6 +1520,11 @@ impl MitubApp {
             search_anim: None,
             search_hover_exit_at: None,
             search_focus_glow: 0.0,
+            profile_hovered: false,
+            profile_anim: None,
+            last_header_click: None,
+            header_drag_pending: None,
+            tab_drag: None,
         };
 
         // Initial tasks: fetch home feed & bind Wayland window pointers
@@ -1519,13 +1574,19 @@ impl MitubApp {
             |(url, name)| Message::UserProfileLoaded(url, name),
         );
 
-        // Asynchronously sync live Firefox cookies if available (in background, never blocking startup)
+        // Asynchronously sync live browser cookies if available (in background, never blocking startup)
         let auth_task = Task::perform(
             async move {
                 tokio::task::spawn_blocking(|| {
                     if let Ok(ff) = AuthSession::from_firefox() {
                         if ff.is_authenticated() {
                             return Some(ff);
+                        }
+                    }
+                    // Chrome/Chromium users should also get a live session refresh.
+                    if let Ok(cr) = AuthSession::from_chrome() {
+                        if cr.is_authenticated() {
+                            return Some(cr);
                         }
                     }
                     None
@@ -1537,12 +1598,16 @@ impl MitubApp {
             Message::BackgroundAuthRefreshed,
         );
 
-        // Asynchronously calculate cache size
+        // Asynchronously prune excess cache (and orphan .part files) and calculate cache size
+        let cache_limit = app.config.max_cache_size_bytes;
         let cache_task = Task::perform(
             async move {
-                tokio::task::spawn_blocking(crate::cache_manager::get_cache_size_bytes)
-                    .await
-                    .unwrap_or(0)
+                tokio::task::spawn_blocking(move || {
+                    crate::cache_manager::prune_cache_if_needed(cache_limit, &[]);
+                    crate::cache_manager::get_cache_size_bytes()
+                })
+                .await
+                .unwrap_or(0)
             },
             Message::CacheSizeRefreshed,
         );
@@ -1687,7 +1752,7 @@ impl MitubApp {
             size: Size::new(saved_w, saved_h),
             min_size: Some(Size::new(800.0, 600.0)),
             transparent: false,
-            decorations: true,
+            decorations: !self.config.custom_titlebar,
             icon: load_app_icon(),
             exit_on_close_request: false,
             #[cfg(target_os = "linux")]
@@ -1771,6 +1836,19 @@ impl MitubApp {
         self.is_page_loading = false;
         self.view_transition_start = Some(std::time::Instant::now());
         self.view_transition_alpha = 1.0;
+        self.trigger_view_fade();
+    }
+
+    /// Soft, one-shot fade-in for card grids when their content is ready.
+    /// Only a single background-colored overlay is animated; no image work.
+    fn trigger_view_fade(&mut self) {
+        if matches!(
+            self.current_view,
+            ViewMode::Home | ViewMode::Subscriptions | ViewMode::History | ViewMode::Downloads
+        ) {
+            self.view_fade_start = Some(std::time::Instant::now());
+            self.view_fade_alpha = 0.58;
+        }
     }
 
     /// Captures a lightweight 480x270 snapshot of the currently playing video frame
@@ -2069,6 +2147,31 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
         let base_dur = if is_expanding { 0.48 } else { 0.32 };
         let dur = (base_dur * (dist / 155.0)).clamp(0.12, base_dur);
         self.search_anim = Some((cur_w, target_w, std::time::Instant::now(), dur));
+    }
+
+    fn current_profile_expand(&self) -> f32 {
+        let target = if self.profile_hovered { 1.0 } else { 0.0 };
+        if let Some((from, to, inst, dur)) = self.profile_anim {
+            let elapsed = inst.elapsed().as_secs_f32();
+            if elapsed < dur && dur > 0.001 {
+                let t = (elapsed / dur).clamp(0.0, 1.0);
+                // Quintic smoothstep: soft acceleration and settle.
+                let ease = t * t * t * (t * (t * 6.0 - 15.0) + 10.0);
+                return from + (to - from) * ease;
+            }
+        }
+        target
+    }
+
+    fn trigger_profile_anim(&mut self, target: f32) {
+        let current = self.current_profile_expand();
+        if (current - target).abs() < 0.001 {
+            self.profile_anim = None;
+            return;
+        }
+        // Slightly slower when opening, quicker when collapsing.
+        let duration = if target > current { 0.34 } else { 0.24 };
+        self.profile_anim = Some((current, target, std::time::Instant::now(), duration));
     }
 
     fn find_video_title(&self, video_id: &str) -> String {
@@ -2373,6 +2476,12 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                     }
                 }
 
+                if let Some((_, _, inst, dur)) = self.profile_anim {
+                    if inst.elapsed().as_secs_f32() >= dur {
+                        self.profile_anim = None;
+                    }
+                }
+
                 // Smooth illumination glow animation on click/focus
                 let target_glow = if self.search_input_focused { 1.0 } else { 0.0 };
                 if (self.search_focus_glow - target_glow).abs() > 0.005 {
@@ -2417,6 +2526,20 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                             let t = (elapsed / duration).clamp(0.0, 1.0);
                             self.view_transition_alpha = (1.0 - t).powi(3);
                         }
+                    }
+                }
+
+                // Lightweight fade-in veil for Home / Subscriptions / History / Downloads.
+                if let Some(start) = self.view_fade_start {
+                    let duration = 0.18_f32;
+                    let elapsed = start.elapsed().as_secs_f32();
+                    if elapsed >= duration {
+                        self.view_fade_alpha = 0.0;
+                        self.view_fade_start = None;
+                    } else {
+                        let t = (elapsed / duration).clamp(0.0, 1.0);
+                        let ease = t * t * (3.0 - 2.0 * t);
+                        self.view_fade_alpha = (1.0 - ease) * 0.58;
                     }
                 }
 
@@ -3096,6 +3219,11 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                             initial_seek_ms.unwrap_or(0),
                         );
 
+                        self.osd_state.is_live = details.is_live;
+                        if details.is_live {
+                            self.osd_state.duration_secs = 0;
+                        }
+
                         if details.is_live || details.live_chat_continuation.is_some() {
                             let chat = self.live_chat.clone();
                             let cont = details.live_chat_continuation.clone();
@@ -3223,6 +3351,7 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                             }
                         }
                         if self.config.full_buffer_tabs
+                            && !details.is_live
                             && !self.buffer_downloads.get(&details.video_id).map(|s| s.is_complete).unwrap_or(false)
                         {
                             tasks.push(self.update(Message::TriggerFullBuffer(details.video_id.clone())));
@@ -3910,8 +4039,22 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
 
                             if let Some(stream) = select_best_stream(&details.video_streams, &self.config) {
                                 let stream_height = stream.height;
-                                let v_uri = stream.playback_uri("v");
-                                let a_uri = select_best_audio_stream(&details.audio_streams, self.config.preferred_audio_lang).map(|s| s.playback_uri("a"));
+                                let (v_uri, a_uri) = if let Some(buf_state) = self.buffer_downloads.get(&vid) {
+                                    if buf_state.is_complete && buf_state.video_path.is_some() {
+                                        let v_p = buf_state.video_path.as_ref().unwrap();
+                                        let v_str = format!("file://{}", v_p.to_string_lossy());
+                                        let a_str = buf_state.audio_path.as_ref().map(|p| format!("file://{}", p.to_string_lossy()));
+                                        (v_str, a_str)
+                                    } else {
+                                        let v = stream.playback_uri("v");
+                                        let a = select_best_audio_stream(&details.audio_streams, self.config.preferred_audio_lang).map(|s| s.playback_uri("a"));
+                                        (v, a)
+                                    }
+                                } else {
+                                    let v = stream.playback_uri("v");
+                                    let a = select_best_audio_stream(&details.audio_streams, self.config.preferred_audio_lang).map(|s| s.playback_uri("a"));
+                                    (v, a)
+                                };
                                 let seek_target = self
                                     .tabs
                                     .iter()
@@ -4444,11 +4587,32 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                 self.previous_view = self.current_view.clone();
                 self.current_view = ViewMode::Subscriptions;
                 self.active_tab_idx = None;
-                self.trigger_blur_loading();
                 self.show_suggestions = false;
+
+                // Show the last loaded feed instantly, then refresh silently if stale.
+                let has_cache = !self.cached_subscriptions.is_empty();
+                if has_cache {
+                    self.home_videos = self.cached_subscriptions.clone();
+                    self.is_page_loading = false;
+                    self.view_transition_start = None;
+                    self.view_transition_alpha = 0.0;
+                    self.trigger_view_fade();
+                } else {
+                    self.home_videos.clear();
+                    self.trigger_blur_loading();
+                }
                 self.sync_player_viewport();
 
                 let scroll_top = self.reset_home_scroll_task();
+                let is_fresh = self
+                    .subscriptions_loaded_at
+                    .map(|t| t.elapsed() < FEED_CACHE_TTL)
+                    .unwrap_or(false);
+                if self.subscriptions_refreshing || (has_cache && is_fresh) {
+                    return scroll_top;
+                }
+
+                self.subscriptions_refreshing = true;
                 let it = self.innertube.clone();
                 let sub_task = Task::perform(
                     async move { it.get_subscriptions_feed().await.map_err(|e| e.to_string()) },
@@ -4458,14 +4622,20 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
             }
 
             Message::SubscriptionsLoaded(res) => {
-                self.trigger_unblur_transition();
+                self.subscriptions_refreshing = false;
+                let is_current = matches!(self.current_view, ViewMode::Subscriptions);
+                let was_loading = self.is_page_loading;
+                if was_loading && is_current {
+                    self.trigger_unblur_transition();
+                }
                 match res {
                     Ok(videos) => {
                         self.auth_status = "[OK] Sesión activa de YouTube".to_string();
-                        if !matches!(self.current_view, ViewMode::Subscriptions) {
+                        self.subscriptions_loaded_at = Some(std::time::Instant::now());
+                        self.cached_subscriptions = videos.clone();
+                        if !is_current {
                             return Task::none();
                         }
-                        self.trigger_unblur_transition();
                         let urls: Vec<(String, String)> = videos
                             .iter()
                             .map(|v| (v.thumbnail_url.clone(), v.channel_avatar.clone()))
@@ -4507,11 +4677,32 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                 self.previous_view = self.current_view.clone();
                 self.current_view = ViewMode::History;
                 self.active_tab_idx = None;
-                self.trigger_blur_loading();
                 self.show_suggestions = false;
+
+                // Instant cached history; refresh in the background when stale.
+                let has_cache = !self.cached_history.is_empty();
+                if has_cache {
+                    self.home_videos = self.cached_history.clone();
+                    self.is_page_loading = false;
+                    self.view_transition_start = None;
+                    self.view_transition_alpha = 0.0;
+                    self.trigger_view_fade();
+                } else {
+                    self.home_videos.clear();
+                    self.trigger_blur_loading();
+                }
                 self.sync_player_viewport();
 
                 let scroll_top = self.reset_home_scroll_task();
+                let is_fresh = self
+                    .history_loaded_at
+                    .map(|t| t.elapsed() < FEED_CACHE_TTL)
+                    .unwrap_or(false);
+                if self.history_refreshing || (has_cache && is_fresh) {
+                    return scroll_top;
+                }
+
+                self.history_refreshing = true;
                 let it = self.innertube.clone();
                 let hist_task = Task::perform(
                     async move { it.get_history().await.map_err(|e| e.to_string()) },
@@ -4521,14 +4712,15 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
             }
 
             Message::HistoryLoaded(res) => {
-                self.trigger_unblur_transition();
+                self.history_refreshing = false;
+                let is_current = matches!(self.current_view, ViewMode::History);
+                let was_loading = self.is_page_loading;
+                if was_loading && is_current {
+                    self.trigger_unblur_transition();
+                }
                 match res {
                     Ok(mut videos) => {
                         self.auth_status = "[OK] Sesión activa de YouTube".to_string();
-                        if !matches!(self.current_view, ViewMode::History) {
-                            return Task::none();
-                        }
-                        self.trigger_unblur_transition();
                         // Merge recent local history items at the top if not yet indexed by YouTube FEhistory
                         let mut prepended = Vec::new();
                         for h in self.config.local_history.iter().take(15) {
@@ -4553,26 +4745,30 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                             videos = prepended;
                         }
 
-                        if !videos.is_empty() {
-                            let urls: Vec<(String, String)> = videos
-                                .iter()
-                                .map(|v| (v.thumbnail_url.clone(), v.channel_avatar.clone()))
-                                .collect();
-                            self.home_videos = videos;
-                            let mut tasks = Vec::new();
-                            for (t_url, a_url) in urls {
-                                if let Some(t) = self.queue_thumbnail_download(&t_url) {
+                        self.history_loaded_at = Some(std::time::Instant::now());
+                        self.cached_history = videos.clone();
+                        if !is_current {
+                            return Task::none();
+                        }
+
+                        let urls: Vec<(String, String)> = videos
+                            .iter()
+                            .map(|v| (v.thumbnail_url.clone(), v.channel_avatar.clone()))
+                            .collect();
+                        self.home_videos = videos;
+                        let mut tasks = Vec::new();
+                        for (t_url, a_url) in urls {
+                            if let Some(t) = self.queue_thumbnail_download(&t_url) {
+                                tasks.push(t);
+                            }
+                            if !a_url.is_empty() {
+                                if let Some(t) = self.queue_thumbnail_download(&a_url) {
                                     tasks.push(t);
                                 }
-                                if !a_url.is_empty() {
-                                    if let Some(t) = self.queue_thumbnail_download(&a_url) {
-                                        tasks.push(t);
-                                    }
-                                }
                             }
-                            if !tasks.is_empty() {
-                                return Task::batch(tasks);
-                            }
+                        }
+                        if !tasks.is_empty() {
+                            return Task::batch(tasks);
                         }
                     }
                     Err(err) => {
@@ -4580,8 +4776,8 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                             return self.update(Message::SessionExpired);
                         }
                         eprintln!("[Mitub] Error al cargar historial de la cuenta de YouTube (usando respaldo local): {err}");
-                        if !self.config.local_history.is_empty() {
-                            self.home_videos = self
+                        if self.cached_history.is_empty() && !self.config.local_history.is_empty() {
+                            let fallback: Vec<VideoCard> = self
                                 .config
                                 .local_history
                                 .iter()
@@ -4599,6 +4795,10 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                                     meta_suffix: String::new(),
                                 })
                                 .collect();
+                            self.cached_history = fallback.clone();
+                            if is_current {
+                                self.home_videos = fallback;
+                            }
                         }
                     }
                 }
@@ -4670,11 +4870,19 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
 
             Message::UserProfileLoaded(url_opt, name_opt) => {
                 if url_opt.is_none() && name_opt.is_none() {
-                    let is_authed = self.auth_session.try_read().map(|r| r.is_authenticated()).unwrap_or(false);
-                    if is_authed {
-                        // YouTube did not recognize the session as active
-                        return self.update(Message::SessionExpired);
+                    let session = self.auth_session.try_read().ok().map(|r| r.clone());
+                    if let Some(session) = session {
+                        if session.is_authenticated() {
+                            // A failed profile request can be a transient network
+                            // error. Confirm against the account endpoint before
+                            // wiping the saved session from disk.
+                            return Task::perform(
+                                async move { session.verify_active_session().await },
+                                Message::AuthValidated,
+                            );
+                        }
                     }
+                    return Task::none();
                 }
                 if let Some(name) = name_opt {
                     self.user_display_name = Some(name.clone());
@@ -4834,8 +5042,35 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                 Task::none()
             }
 
-            Message::RestoreFromTray => {
-                // Keep tray icon visible if close_to_tray is enabled in settings
+            Message::ToggleTrayWindow => {
+                let window_visible = self.main_window_id.is_some()
+                    && !self.is_window_hidden
+                    && !self.is_window_minimized;
+
+                // Left click on the tray: visible+focused -> hide; otherwise
+                // restore and bring the window to the foreground.
+                if window_visible && self.is_window_focused {
+                    if let Some(main_id) = self.main_window_id {
+                        self.is_window_hidden = true;
+                        self.main_window_id = None;
+                        self.save_session();
+                        self.config.save();
+                        if !self.is_fullscreen && self.pip_window_id.is_none() {
+                            save_window_state(self.window_size.0, self.window_size.1, self.is_maximized);
+                        }
+                        if let Some(player) = &self.player {
+                            player.set_rendering_active(false);
+                        }
+                        crate::tray::set_tray_visible(true);
+                        return window::close(main_id);
+                    }
+                    Task::none()
+                } else {
+                    self.update(Message::RestoreFromTray)
+                }
+            }
+
+            Message::RestoreFromTray => {                // Keep tray icon visible if close_to_tray is enabled in settings
                 if !self.config.close_to_tray {
                     crate::tray::set_tray_visible(false);
                 }
@@ -4881,6 +5116,121 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                 self.config.theme = theme;
                 ui::theme::set_amoled_mode(theme == AppTheme::Amoled);
                 self.config.save_async();
+                Task::none()
+            }
+
+            Message::HeaderDragPressed => {
+                if !self.config.custom_titlebar {
+                    return Task::none();
+                }
+                let now = std::time::Instant::now();
+                if let Some(prev) = self.last_header_click {
+                    if now.duration_since(prev) < Duration::from_millis(320) {
+                        self.last_header_click = None;
+                        self.header_drag_pending = None;
+                        return self.update(Message::ToggleMaximizeMainWindow);
+                    }
+                }
+                self.last_header_click = Some(now);
+                if let Some(main_id) = self.main_window_id {
+                    if self.is_maximized {
+                        if let Some(pos) = self.last_cursor_pos {
+                            self.header_drag_pending = Some((now, pos));
+                        }
+                    } else {
+                        return window::drag(main_id);
+                    }
+                }
+                Task::none()
+            }
+
+            Message::TabPressed(idx) => {
+                if idx < self.tabs.len() {
+                    let cursor_x = self.last_cursor_pos.map(|p| p.x).unwrap_or(0.0);
+                    self.tab_drag = Some(TabDragState {
+                        tab_idx: idx,
+                        start_x: cursor_x,
+                        current_x: cursor_x,
+                        has_moved: false,
+                    });
+                    if self.active_tab_idx != Some(idx) {
+                        return self.update(Message::SelectTab(idx));
+                    }
+                }
+                Task::none()
+            }
+
+            Message::HeaderRightClicked => {
+                if !self.config.custom_titlebar {
+                    return Task::none();
+                }
+                if let Some(main_id) = self.main_window_id {
+                    return window::show_system_menu(main_id);
+                }
+                Task::none()
+            }
+
+            Message::MinimizeMainWindow => {
+                if let Some(main_id) = self.main_window_id {
+                    if !self.config.auto_pip_on_unfocus && self.pip_window_id.is_none() {
+                        self.is_window_minimized = true;
+                        if let Some(player) = &self.player {
+                            player.set_rendering_active(false);
+                        }
+                    }
+                    return window::minimize(main_id, true);
+                }
+                Task::none()
+            }
+
+            Message::ToggleMaximizeMainWindow => {
+                if let Some(main_id) = self.main_window_id {
+                    self.is_maximized = !self.is_maximized;
+                    if !self.is_fullscreen && self.pip_window_id.is_none() {
+                        save_window_state(self.window_size.0, self.window_size.1, self.is_maximized);
+                    }
+                    return window::maximize(main_id, self.is_maximized);
+                }
+                Task::none()
+            }
+
+            Message::CloseMainWindow => {
+                if let Some(main_id) = self.main_window_id {
+                    return self.update(Message::EventOccurred(
+                        iced::Event::Window(iced::window::Event::CloseRequested),
+                        main_id,
+                    ));
+                }
+                Task::none()
+            }
+
+            Message::StartMainWindowResize(edge) => {
+                if !self.config.custom_titlebar || self.is_maximized || self.is_fullscreen {
+                    return Task::none();
+                }
+                if let Some(main_id) = self.main_window_id {
+                    use iced::window::ResizeEdge as E;
+                    let e = match edge {
+                        PipResizeEdge::Right => E::East,
+                        PipResizeEdge::Left => E::West,
+                        PipResizeEdge::Top => E::North,
+                        PipResizeEdge::Bottom => E::South,
+                        PipResizeEdge::TopRight => E::NorthEast,
+                        PipResizeEdge::TopLeft => E::NorthWest,
+                        PipResizeEdge::BottomRight => E::SouthEast,
+                        PipResizeEdge::BottomLeft => E::SouthWest,
+                    };
+                    return window::drag_resize(main_id, e);
+                }
+                Task::none()
+            }
+
+            Message::ToggleCustomTitlebar => {
+                self.config.custom_titlebar = !self.config.custom_titlebar;
+                self.config.save_async();
+                if let Some(main_id) = self.main_window_id {
+                    return window::toggle_decorations(main_id);
+                }
                 Task::none()
             }
 
@@ -4947,7 +5297,7 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                     }
                 }
 
-                let _ = std::process::Command::new("xdg-open").arg(&url).spawn();
+                open_external_url(&url);
                 Task::none()
             }
 
@@ -5278,6 +5628,8 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                         })
                     });
 
+                let is_live_video = matched_card.as_ref().map(|c| c.is_live).unwrap_or(false);
+
                 let title = matched_card
                     .map(|v| v.title.clone())
                     .unwrap_or_else(|| "Video".to_string());
@@ -5313,7 +5665,7 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                     Message::WatchDetailsLoadedPassive,
                 );
 
-                if self.config.full_buffer_tabs {
+                if self.config.full_buffer_tabs && !is_live_video {
                     Task::batch([self.update(Message::TriggerFullBuffer(video_id)), scroll_task, prefetch_task])
                 } else {
                     Task::batch([scroll_task, prefetch_task])
@@ -5321,6 +5673,11 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
             }
 
             Message::SelectTab(idx) => {
+                if let Some(drag) = &self.tab_drag {
+                    if drag.has_moved {
+                        return Task::none();
+                    }
+                }
                 if idx < self.tabs.len() {
                     if let Some(cur_idx) = self.active_tab_idx {
                         if cur_idx == idx {
@@ -5425,6 +5782,9 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                             self.inactive_tab_osd_state.first_frame_rendered = false;
                             self.inactive_tab_osd_state.is_buffering = false;
                             self.inactive_tab_osd_state.has_playback_error = false;
+
+                            let is_completed_buf = self.buffer_downloads.get(&vid).map(|s| s.is_complete).unwrap_or(false);
+                            self.inactive_tab_osd_state.is_fully_buffered = is_completed_buf;
 
                             let thumb_task = self.ensure_watch_thumbnails_queued(&cached);
                             self.watch_details = Some(cached);
@@ -5600,6 +5960,12 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
 
             Message::CloseTab(idx) => {
                 if idx < self.tabs.len() {
+                    self.tabs_max_scroll_x = 0.0;
+                    if let Some(drag) = &self.tab_drag {
+                        if drag.tab_idx == idx {
+                            self.tab_drag = None;
+                        }
+                    }
                     let removed = self.tabs.remove(idx);
                     if self.playing_video_id.as_deref() == Some(removed.video_id.as_str()) {
                         self.finish_active_watch_session();
@@ -5713,9 +6079,7 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
             }
 
             Message::OpenBrowserLogin => {
-                let _ = std::process::Command::new("xdg-open")
-                    .arg("https://accounts.google.com/ServiceLogin?service=youtube&continue=https%3A%2F%2Fwww.youtube.com%2Fsignin%3Faction_handle_signin%3Dtrue")
-                    .spawn();
+                open_external_url("https://accounts.google.com/ServiceLogin?service=youtube&continue=https%3A%2F%2Fwww.youtube.com%2Fsignin%3Faction_handle_signin%3Dtrue");
                 self.auth_status = "Navegador abierto. Inicia sesión en YouTube y luego pulsa 'Sincronizar sesión de Navegador'.".to_string();
                 Task::none()
             }
@@ -5724,28 +6088,60 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                 self.auth_status = "Detectando y sincronizando sesión desde tu navegador...".to_string();
                 Task::perform(
                     async move {
-                        // Priority 1: Check Firefox
-                        if let Ok(ff) = tokio::task::spawn_blocking(AuthSession::from_firefox).await.unwrap_or(Err("".into())) {
-                            if ff.verify_active_session().await {
-                                return Ok(ff);
+                        let firefox = tokio::task::spawn_blocking(AuthSession::from_firefox)
+                            .await
+                            .ok()
+                            .and_then(|res| res.ok());
+                        let chrome = tokio::task::spawn_blocking(AuthSession::from_chrome)
+                            .await
+                            .ok()
+                            .and_then(|res| res.ok());
+
+                        // Prefer a session that YouTube confirms as active.
+                        if let Some(session) = &firefox {
+                            if session.verify_active_session().await {
+                                return Ok(session.clone());
                             }
                         }
-                        // Priority 2: Check Chrome
-                        if let Ok(cr) = tokio::task::spawn_blocking(AuthSession::from_chrome).await.unwrap_or(Err("".into())) {
-                            if cr.verify_active_session().await {
-                                return Ok(cr);
+                        if let Some(session) = &chrome {
+                            if session.verify_active_session().await {
+                                return Ok(session.clone());
                             }
                         }
-                        // Priority 3: Fallback without strict verify if cookies extracted
-                        if let Ok(ff) = tokio::task::spawn_blocking(AuthSession::from_firefox).await.unwrap_or(Err("".into())) {
-                            if ff.is_authenticated() {
-                                return Ok(ff);
+
+                        // Fall back to accepting extracted cookies even if the
+                        // verification endpoint was unreachable/rate-limited.
+                        if let Some(session) = firefox {
+                            if session.is_authenticated() {
+                                return Ok(session);
                             }
                         }
-                        Err("No se detectó ninguna sesión activa de YouTube en tus navegadores. Inicia sesión primero con el botón de arriba.".to_string())
+                        if let Some(session) = chrome {
+                            if session.is_authenticated() {
+                                return Ok(session);
+                            }
+                        }
+
+                        Err("No se detectó ninguna sesión activa de YouTube en Firefox ni Chrome/Chromium. Inicia sesión primero con el botón de arriba.".to_string())
                     },
                     Message::FirefoxCookiesImported,
                 )
+            }
+
+            Message::AuthValidated(valid) => {
+                if valid {
+                    self.auth_status = "[OK] Sesion activa de YouTube".to_string();
+                    return Task::none();
+                }
+                let still_authed = self
+                    .auth_session
+                    .try_read()
+                    .map(|s| s.is_authenticated())
+                    .unwrap_or(false);
+                if still_authed {
+                    return self.update(Message::SessionExpired);
+                }
+                Task::none()
             }
 
             Message::SessionExpired => {
@@ -5759,6 +6155,12 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                 self.config.cached_user_name = None;
                 self.config.cached_avatar_url = None;
                 self.config.save_async();
+                self.cached_subscriptions.clear();
+                self.cached_history.clear();
+                self.subscriptions_loaded_at = None;
+                self.history_loaded_at = None;
+                self.profile_hovered = false;
+                self.profile_anim = None;
                 self.toast_state = Some(ToastState {
                     icon: ToastIcon::None,
                     text: "Tu sesión de Google expiró. Has pasado a Modo Invitado.".to_string(),
@@ -5827,7 +6229,7 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                         return Task::batch([self.update(Message::ReloadFeed), profile_task]);
                     }
                     Err(e) => {
-                        self.auth_status = format!("Error al leer Chrome: {e}");
+                        self.auth_status = format!("Error al importar Chrome: {e}");
                     }
                 }
                 Task::none()
@@ -5844,6 +6246,12 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                 self.config.cached_user_name = None;
                 self.config.cached_avatar_url = None;
                 self.config.save_async();
+                self.cached_subscriptions.clear();
+                self.cached_history.clear();
+                self.subscriptions_loaded_at = None;
+                self.history_loaded_at = None;
+                self.profile_hovered = false;
+                self.profile_anim = None;
                 self.toast_state = Some(ToastState {
                     icon: ToastIcon::Check,
                     text: "Sesión cerrada exitosamente".to_string(),
@@ -5855,8 +6263,14 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
             Message::ReloadFeed => {
                 self.trigger_blur_loading();
                 match self.current_view.clone() {
-                    ViewMode::Subscriptions => return self.update(Message::OpenSubscriptions),
-                    ViewMode::History => return self.update(Message::OpenHistory),
+                    ViewMode::Subscriptions => {
+                        self.subscriptions_loaded_at = None;
+                        return self.update(Message::OpenSubscriptions);
+                    }
+                    ViewMode::History => {
+                        self.history_loaded_at = None;
+                        return self.update(Message::OpenHistory);
+                    }
                     ViewMode::Downloads => return self.update(Message::OpenDownloads),
                     ViewMode::Playlists => return self.update(Message::OpenPlaylists),
                     ViewMode::Channel(cid) => return self.update(Message::OpenChannel(cid)),
@@ -5879,6 +6293,47 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                         let dx = prev_pos.map(|p| (p.x - position.x).abs()).unwrap_or(100.0);
                         let dy = prev_pos.map(|p| (p.y - position.y).abs()).unwrap_or(100.0);
                         let significant_move = dx >= 2.0 || dy >= 2.0;
+
+                        if Some(win_id) == self.main_window_id {
+                            if let Some((_, start_pos)) = self.header_drag_pending {
+                                let dist = (position.x - start_pos.x).hypot(position.y - start_pos.y);
+                                if dist >= 4.0 {
+                                    self.header_drag_pending = None;
+                                    if let Some(main_id) = self.main_window_id {
+                                        if self.is_maximized {
+                                            self.is_maximized = false;
+                                            save_window_state(self.window_size.0, self.window_size.1, false);
+                                            let unmax_task = window::maximize(main_id, false);
+                                            let drag_task = window::drag(main_id);
+                                            return Task::batch([unmax_task, drag_task]);
+                                        } else {
+                                            return window::drag(main_id);
+                                        }
+                                    }
+                                }
+                            }
+
+                            if let Some(drag) = &mut self.tab_drag {
+                                drag.current_x = position.x;
+                                let delta_x = drag.current_x - drag.start_x;
+                                if delta_x.abs() > 6.0 {
+                                    drag.has_moved = true;
+                                }
+                                if delta_x > 45.0 && drag.tab_idx + 1 < self.tabs.len() {
+                                    let next_idx = drag.tab_idx + 1;
+                                    self.tabs.swap(drag.tab_idx, next_idx);
+                                    drag.tab_idx = next_idx;
+                                    drag.start_x = position.x;
+                                    self.active_tab_idx = Some(next_idx);
+                                } else if delta_x < -45.0 && drag.tab_idx > 0 {
+                                    let prev_idx = drag.tab_idx - 1;
+                                    self.tabs.swap(drag.tab_idx, prev_idx);
+                                    drag.tab_idx = prev_idx;
+                                    drag.start_x = position.x;
+                                    self.active_tab_idx = Some(prev_idx);
+                                }
+                            }
+                        }
 
                         if Some(win_id) == self.pip_window_id {
                             self.pip_cursor_hovered = true;
@@ -6067,6 +6522,15 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                     }
                     iced::Event::Mouse(iced::mouse::Event::ButtonReleased(iced::mouse::Button::Left)) => {
                         self.is_seeking_drag = false;
+                        self.header_drag_pending = None;
+                        if let Some(drag) = self.tab_drag.take() {
+                            if drag.has_moved {
+                                self.save_session();
+                                self.config.saved_tabs = self.tabs.clone();
+                                self.config.active_tab_idx = self.active_tab_idx;
+                                self.config.save_async();
+                            }
+                        }
                     }
                     iced::Event::Mouse(iced::mouse::Event::CursorEntered) => {
                         if Some(win_id) == self.pip_window_id {
@@ -6407,6 +6871,24 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
             }
 
             Message::TriggerFullBuffer(video_id) => {
+                // Live streams must never be automatically downloaded into local cache:
+                // they are endless real-time broadcasts without fixed content length.
+                if let Some(details) = &self.watch_details {
+                    if details.video_id == video_id && details.is_live {
+                        return Task::none();
+                    }
+                }
+                if let Some(details) = self.tab_details_cache.get(&video_id) {
+                    if details.is_live {
+                        return Task::none();
+                    }
+                }
+                if let Some(card) = self.home_videos.iter().find(|v| v.video_id == video_id) {
+                    if card.is_live {
+                        return Task::none();
+                    }
+                }
+
                 if let Some(state) = self.buffer_downloads.get(&video_id) {
                     if state.is_complete || (state.percent > 0 && state.percent < 100) {
                         return Task::none();
@@ -6509,18 +6991,28 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                 Task::none()
             }
 
+            Message::ProfileHoverChanged(hovered) => {
+                if hovered != self.profile_hovered {
+                    // Launch from the current visual size BEFORE flipping the
+                    // hover flag, otherwise the animation starts already at its target.
+                    self.trigger_profile_anim(if hovered { 1.0 } else { 0.0 });
+                    self.profile_hovered = hovered;
+                }
+                Task::none()
+            }
+
             Message::SearchHoverChanged(hovered) => {
                 if hovered {
                     self.search_hover_exit_at = None;
                     if !self.search_hovered {
-                        self.search_hovered = true;
+                        // Compute the start width before marking hover as active.
                         self.trigger_search_anim(300.0);
+                        self.search_hovered = true;
                     }
                 } else if self.search_hovered {
-                    // Grace period: cancel hover only if not immediately re-entered
-                    self.search_hovered = false;
                     let is_expanded = self.search_input_focused || !self.search_query.is_empty();
                     self.trigger_search_anim(if is_expanded { 300.0 } else { 145.0 });
+                    self.search_hovered = false;
                 }
                 Task::none()
             }
@@ -6583,6 +7075,7 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
 
             Message::DownloadsScanned(list) => {
                 self.cached_videos = list;
+                self.trigger_view_fade();
                 Task::none()
             }
 
@@ -6590,8 +7083,23 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                 self.config.full_buffer_tabs = !self.config.full_buffer_tabs;
                 self.config.save();
                 if self.config.full_buffer_tabs {
-                    // Start preloading every tab that is already open
-                    let ids: Vec<String> = self.tabs.iter().map(|t| t.video_id.clone()).filter(|v| !v.is_empty()).collect();
+                    // Start preloading every tab that is already open (excluding live streams)
+                    let ids: Vec<String> = self
+                        .tabs
+                        .iter()
+                        .map(|t| t.video_id.clone())
+                        .filter(|v| {
+                            if v.is_empty() {
+                                return false;
+                            }
+                            if let Some(details) = self.tab_details_cache.get(v) {
+                                if details.is_live {
+                                    return false;
+                                }
+                            }
+                            true
+                        })
+                        .collect();
                     let tasks: Vec<Task<Message>> = ids.into_iter().map(|id| self.update(Message::TriggerFullBuffer(id))).collect();
                     return Task::batch(tasks);
                 }
@@ -7218,6 +7726,14 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
 
     fn view_main(&self) -> Element<'_, Message> {
         let blur_amount = self.view_transition_alpha.clamp(0.0, 1.0);
+        let view_fade = if matches!(
+            self.current_view,
+            ViewMode::Home | ViewMode::Subscriptions | ViewMode::History | ViewMode::Downloads
+        ) {
+            self.view_fade_alpha.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
         let is_pip_active = self.pip_window_id.is_some();
         if self.is_fullscreen {
             if let Some(details) = &self.watch_details {
@@ -7356,12 +7872,15 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
             is_authed,
             self.user_display_name.as_deref(),
             self.user_avatar_handle.as_ref(),
+            self.current_profile_expand(),
             is_subscriptions,
             is_history,
             is_downloads,
             is_home,
             &self.tabs,
             self.active_tab_idx,
+            self.hovered_tab.map(|(idx, _)| idx),
+            self.tab_drag.as_ref().map(|d| d.tab_idx),
             self.playing_video_id.as_deref(),
             is_video_playing,
             newly_opened,
@@ -7369,6 +7888,8 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
             self.window_size.0,
             self.tabs_scroll_x,
             self.tabs_max_scroll_x,
+            self.config.custom_titlebar,
+            self.is_maximized,
             Message::SearchInputChanged,
             Message::SearchSubmitted,
             Message::SearchHoverChanged,
@@ -7379,13 +7900,20 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
             Message::OpenHistory,
             Message::OpenDownloads,
             Message::ToggleLoginModal,
+            Message::ProfileHoverChanged,
             Message::ReloadFeed,
             Message::SelectTab,
+            Message::TabPressed,
             Message::CloseTab,
             Message::TabHoverChanged,
             Message::TabsScrolled,
             Message::ScrollTabsLeft,
             Message::ScrollTabsRight,
+            Message::HeaderDragPressed,
+            Message::HeaderRightClicked,
+            Message::MinimizeMainWindow,
+            Message::ToggleMaximizeMainWindow,
+            Message::CloseMainWindow,
         );
 
         let content: Element<'_, Message> = match &self.current_view {
@@ -7650,29 +8178,33 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
         };
 
         let is_video_view = matches!(self.current_view, ViewMode::Watch(_) | ViewMode::VideoFullscreen);
-        let content_with_transition: Element<'_, Message> = if !is_video_view && blur_amount > 0.015 {
-            // Soft frosted glass structural diffusion layer over grid views during blur/unblur transition
-            let alpha = (blur_amount * 0.45).clamp(0.0, 0.55);
-            let fade_veil = container(iced::widget::Space::with_width(Length::Fill).height(Length::Fill))
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .style(move |_t| container::Style {
-                    background: Some(
-                        iced::Color {
-                            a: alpha,
-                            ..COLOR_BG
-                        }
-                        .into(),
-                    ),
-                    ..container::Style::default()
-                });
-            stack![content, fade_veil]
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .into()
-        } else {
-            content
-        };
+        let content_with_transition: Element<'_, Message> =
+            if !is_video_view && (blur_amount > 0.015 || view_fade > 0.001) {
+                // Soft frosted glass structural diffusion layer over grid views
+                // during blur/unblur and the short content fade-in.
+                let blur_alpha = (blur_amount * 0.45).clamp(0.0, 0.55);
+                // Background-colored veils compose multiplicatively.
+                let alpha = 1.0 - (1.0 - blur_alpha) * (1.0 - view_fade);
+                let fade_veil = container(iced::widget::Space::with_width(Length::Fill).height(Length::Fill))
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .style(move |_t| container::Style {
+                        background: Some(
+                            iced::Color {
+                                a: alpha,
+                                ..COLOR_BG
+                            }
+                            .into(),
+                        ),
+                        ..container::Style::default()
+                    });
+                stack![content, fade_veil]
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .into()
+            } else {
+                content
+            };
 
         let clipped_content = container(content_with_transition)
             .width(Length::Fill)
@@ -7910,6 +8442,7 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
                 self.config.card_style,
                 self.config.home_columns,
                 self.config.theme,
+                self.config.custom_titlebar,
                 self.config.incognito_mode,
                 self.config.auto_pip_on_unfocus,
                 self.config.full_buffer_tabs,
@@ -7932,6 +8465,7 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
                 Message::SetCardStyle,
                 Message::SetHomeColumns,
                 Message::SetAppTheme,
+                Message::ToggleCustomTitlebar,
                 Message::ToggleIncognito,
                 Message::ToggleAutoPipOnUnfocus,
                 Message::ToggleFullBufferTabs,
@@ -7941,6 +8475,105 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
                 Message::NoOp,
                 Message::ToggleLoginModal,
             ));
+        }
+
+        // Native compositor-driven edge/corner resize handles when CSD custom titlebar is active and window is restored
+        if self.config.custom_titlebar && !self.is_maximized && !self.is_fullscreen && !is_pip_active {
+            let border_sz = 5.0;
+            let corner_sz = 12.0;
+
+            let right_h: Element<'_, Message> = container(
+                iced::widget::mouse_area(Space::new(Length::Fixed(border_sz), Length::Fill))
+                    .interaction(iced::mouse::Interaction::ResizingHorizontally)
+                    .on_press(Message::StartMainWindowResize(PipResizeEdge::Right)),
+            )
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .align_x(iced::alignment::Horizontal::Right)
+            .into();
+
+            let left_h: Element<'_, Message> = container(
+                iced::widget::mouse_area(Space::new(Length::Fixed(border_sz), Length::Fill))
+                    .interaction(iced::mouse::Interaction::ResizingHorizontally)
+                    .on_press(Message::StartMainWindowResize(PipResizeEdge::Left)),
+            )
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .align_x(iced::alignment::Horizontal::Left)
+            .into();
+
+            let bottom_h: Element<'_, Message> = container(
+                iced::widget::mouse_area(Space::new(Length::Fill, Length::Fixed(border_sz)))
+                    .interaction(iced::mouse::Interaction::ResizingVertically)
+                    .on_press(Message::StartMainWindowResize(PipResizeEdge::Bottom)),
+            )
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .align_y(iced::alignment::Vertical::Bottom)
+            .into();
+
+            let top_h: Element<'_, Message> = container(
+                iced::widget::mouse_area(Space::new(Length::Fill, Length::Fixed(border_sz)))
+                    .interaction(iced::mouse::Interaction::ResizingVertically)
+                    .on_press(Message::StartMainWindowResize(PipResizeEdge::Top)),
+            )
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .align_y(iced::alignment::Vertical::Top)
+            .into();
+
+            let br_c: Element<'_, Message> = container(
+                iced::widget::mouse_area(Space::new(Length::Fixed(corner_sz), Length::Fixed(corner_sz)))
+                    .interaction(iced::mouse::Interaction::ResizingDiagonallyDown)
+                    .on_press(Message::StartMainWindowResize(PipResizeEdge::BottomRight)),
+            )
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .align_x(iced::alignment::Horizontal::Right)
+            .align_y(iced::alignment::Vertical::Bottom)
+            .into();
+
+            let bl_c: Element<'_, Message> = container(
+                iced::widget::mouse_area(Space::new(Length::Fixed(corner_sz), Length::Fixed(corner_sz)))
+                    .interaction(iced::mouse::Interaction::ResizingDiagonallyUp)
+                    .on_press(Message::StartMainWindowResize(PipResizeEdge::BottomLeft)),
+            )
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .align_x(iced::alignment::Horizontal::Left)
+            .align_y(iced::alignment::Vertical::Bottom)
+            .into();
+
+            let tr_c: Element<'_, Message> = container(
+                iced::widget::mouse_area(Space::new(Length::Fixed(corner_sz), Length::Fixed(corner_sz)))
+                    .interaction(iced::mouse::Interaction::ResizingDiagonallyUp)
+                    .on_press(Message::StartMainWindowResize(PipResizeEdge::TopRight)),
+            )
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .align_x(iced::alignment::Horizontal::Right)
+            .align_y(iced::alignment::Vertical::Top)
+            .into();
+
+            let tl_c: Element<'_, Message> = container(
+                iced::widget::mouse_area(Space::new(Length::Fixed(corner_sz), Length::Fixed(corner_sz)))
+                    .interaction(iced::mouse::Interaction::ResizingDiagonallyDown)
+                    .on_press(Message::StartMainWindowResize(PipResizeEdge::TopLeft)),
+            )
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .align_x(iced::alignment::Horizontal::Left)
+            .align_y(iced::alignment::Vertical::Top)
+            .into();
+
+            layers.push(right_h);
+            layers.push(left_h);
+            layers.push(bottom_h);
+            layers.push(top_h);
+            layers.push(br_c);
+            layers.push(bl_c);
+            layers.push(tr_c);
+            layers.push(tl_c);
         }
 
         stack(layers)
@@ -8050,6 +8683,7 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
             .unwrap_or(false);
 
         let is_window_visible = !self.is_window_minimized && !self.is_window_hidden;
+        let is_view_fading = self.view_fade_start.is_some();
         let is_video_active = is_watching && self.osd_state.is_playing && (is_window_visible || is_pip);
 
         if is_video_active {
@@ -8064,10 +8698,14 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
         let is_search_animating = self.search_anim
             .map(|(_, _, t, dur)| t.elapsed().as_secs_f32() < dur)
             .unwrap_or(false);
+        let is_profile_animating = self.profile_anim
+            .map(|(_, _, t, dur)| t.elapsed().as_secs_f32() < dur)
+            .unwrap_or(false);
         let target_glow = if self.search_input_focused { 1.0 } else { 0.0 };
         let is_search_glow_animating = (self.search_focus_glow - target_glow).abs() > 0.005;
 
         let has_active_animation = is_transitioning
+            || is_view_fading
             || has_ripple
             || has_seek_anim
             || is_fs_anim
@@ -8077,6 +8715,7 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
             || has_tab_open
             || is_tab_hover_animating
             || is_search_animating
+            || is_profile_animating
             || is_search_glow_animating;
 
         let has_playing_tab_glow = self.osd_state.is_playing
@@ -8246,6 +8885,23 @@ Type=Application
         let _ = std::process::Command::new("gtk-update-icon-cache").arg("-f").arg("-t").arg(&icons_base).output();
         let _ = std::process::Command::new("kbuildsycoca6").arg("--noincremental").output();
     });
+}
+
+fn open_external_url(url: &str) {
+    #[cfg(target_os = "windows")]
+    {
+        let _ = std::process::Command::new("cmd")
+            .args(["/C", "start", "", url])
+            .spawn();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("open").arg(url).spawn();
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let _ = std::process::Command::new("xdg-open").arg(url).spawn();
+    }
 }
 
 fn main() -> iced::Result {

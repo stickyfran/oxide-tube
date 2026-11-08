@@ -939,10 +939,12 @@ pub fn view_watch_page<'a, Message: Clone + 'static>(
         share_btn.into(),
         like_btn.into(),
         dislike_btn.into(),
-        buffer_btn.into(),
     ];
-    if let Some(del_btn) = delete_cached_btn {
-        channel_row_items.push(del_btn.into());
+    if !details.is_live {
+        channel_row_items.push(buffer_btn.into());
+        if let Some(del_btn) = delete_cached_btn {
+            channel_row_items.push(del_btn.into());
+        }
     }
     let channel_row = iced::widget::Row::with_children(channel_row_items)
         .spacing(10)

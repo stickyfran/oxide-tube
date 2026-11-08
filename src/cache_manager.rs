@@ -268,7 +268,87 @@ pub fn prune_cache_if_needed(max_bytes: u64, protected_ids: &[String]) -> u64 {
         let _ = fs::remove_dir_all(&legacy);
     }
 
+    // Retroactive cleanup: remove abandoned .part files and thumbnail garbage
+    clean_orphaned_part_files(&protected_ids);
+    prune_thumbnails_cache_if_needed();
+
     freed
+}
+
+/// Cleans abandoned .part files from previous interrupted sessions.
+pub fn clean_orphaned_part_files(active_downloads: &[String]) {
+    let dir = video_cache_dir();
+    if let Ok(entries) = fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                if ext.eq_ignore_ascii_case("part") {
+                    let fname = entry.file_name().to_string_lossy().to_string();
+                    let is_active = active_downloads.iter().any(|id| !id.is_empty() && fname.starts_with(id));
+                    if !is_active {
+                        let _ = fs::remove_file(&path);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Prunes thumbnail cache: files older than 30 days or trims down if total thumbnails exceed 250 MB.
+pub fn prune_thumbnails_cache_if_needed() {
+    let dir = thumbnail_cache_dir();
+    if !dir.exists() {
+        return;
+    }
+
+    struct ThumbEntry {
+        path: PathBuf,
+        size: u64,
+        modified: SystemTime,
+    }
+
+    let mut thumbs = Vec::new();
+    let mut total_size: u64 = 0;
+    let now = SystemTime::now();
+    let thirty_days = std::time::Duration::from_secs(30 * 86400);
+
+    if let Ok(entries) = fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            if let Ok(meta) = entry.metadata() {
+                if meta.is_file() {
+                    let size = meta.len();
+                    let modified = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+                    // Remove if older than 30 days
+                    if let Ok(age) = now.duration_since(modified) {
+                        if age > thirty_days {
+                            let _ = fs::remove_file(entry.path());
+                            continue;
+                        }
+                    }
+                    total_size += size;
+                    thumbs.push(ThumbEntry {
+                        path: entry.path(),
+                        size,
+                        modified,
+                    });
+                }
+            }
+        }
+    }
+
+    // Limit thumbnails directory to 250 MB max
+    const MAX_THUMB_BYTES: u64 = 250 * 1024 * 1024;
+    if total_size > MAX_THUMB_BYTES {
+        thumbs.sort_by_key(|t| t.modified); // oldest first
+        for t in thumbs {
+            if total_size <= MAX_THUMB_BYTES {
+                break;
+            }
+            if fs::remove_file(&t.path).is_ok() {
+                total_size = total_size.saturating_sub(t.size);
+            }
+        }
+    }
 }
 
 fn clear_dir_contents(path: &std::path::Path) -> u64 {

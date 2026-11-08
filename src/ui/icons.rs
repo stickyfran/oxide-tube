@@ -329,6 +329,31 @@ pub fn icon_incognito<'a, Message: 'static>(size: f32) -> Element<'a, Message> {
     render_cached_svg(&HANDLE, SVG, size)
 }
 
+pub fn icon_win_minimize<'a, Message: 'static>(size: f32) -> Element<'a, Message> {
+    static HANDLE: OnceLock<svg::Handle> = OnceLock::new();
+    const SVG: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="none" stroke="#f1f1f1" stroke-width="1.4" stroke-linecap="round"><line x1="3" y1="8.5" x2="13" y2="8.5"/></svg>"##;
+    render_cached_svg(&HANDLE, SVG, size)
+}
+
+pub fn icon_win_maximize<'a, Message: 'static>(size: f32) -> Element<'a, Message> {
+    static HANDLE: OnceLock<svg::Handle> = OnceLock::new();
+    const SVG: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="none" stroke="#f1f1f1" stroke-width="1.4" stroke-linejoin="round"><rect x="3.2" y="3.2" width="9.6" height="9.6" rx="1.2"/></svg>"##;
+    render_cached_svg(&HANDLE, SVG, size)
+}
+
+pub fn icon_win_restore<'a, Message: 'static>(size: f32) -> Element<'a, Message> {
+    static HANDLE: OnceLock<svg::Handle> = OnceLock::new();
+    const SVG: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="none" stroke="#f1f1f1" stroke-width="1.35" stroke-linejoin="round"><rect x="2.8" y="5.0" width="8.2" height="8.2" rx="1.0"/><path d="M5.2 5.0V3.6A1.0 1.0 0 0 1 6.2 2.6H12.4A1.0 1.0 0 0 1 13.4 3.6V9.8A1.0 1.0 0 0 1 12.4 10.8H11.0"/></svg>"##;
+    render_cached_svg(&HANDLE, SVG, size)
+}
+
+pub fn icon_win_close<'a, Message: 'static>(size: f32) -> Element<'a, Message> {
+    static HANDLE: OnceLock<svg::Handle> = OnceLock::new();
+    const SVG: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="none" stroke="#f1f1f1" stroke-width="1.5" stroke-linecap="round"><line x1="3.5" y1="3.5" x2="12.5" y2="12.5"/><line x1="12.5" y1="3.5" x2="3.5" y2="12.5"/></svg>"##;
+    render_cached_svg(&HANDLE, SVG, size)
+}
+
+
 
 
 

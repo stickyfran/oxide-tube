@@ -9,10 +9,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
-const INNERTUBE_CLIENT_NAME: &str = "1";
-const INNERTUBE_CLIENT_VERSION: &str = "2.20261015.01.00";
-const YOUTUBE_ORIGIN: &str = "https://www.youtube.com";
-const USER_AGENT_STR: &str = "Mozilla/5.0 (X11; Linux x86_64; rv:132.0) Gecko/20100101 Firefox/132.0";
+pub(crate) const INNERTUBE_CLIENT_NAME: &str = "1";
+pub(crate) const INNERTUBE_CLIENT_VERSION: &str = "2.20261015.01.00";
+pub(crate) const YOUTUBE_ORIGIN: &str = "https://www.youtube.com";
+pub(crate) const USER_AGENT_STR: &str =
+    "Mozilla/5.0 (X11; Linux x86_64; rv:132.0) Gecko/20100101 Firefox/132.0";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VideoCard {
@@ -325,8 +326,20 @@ impl InnerTubeClient {
         self.incognito.store(incognito, Ordering::Relaxed);
     }
 
-    async fn try_refresh_firefox_session(&self) -> bool {
+    /// Re-reads live cookies from a local browser after YouTube rejects the
+    /// in-memory session. Rotated `__Secure-1PSIDTS` tokens only exist in the
+    /// browser database, so both Firefox and Chromium-based browsers are tried.
+    async fn try_refresh_browser_session(&self) -> bool {
         let fresh_res = tokio::task::spawn_blocking(AuthSession::from_firefox).await;
+        if let Ok(Ok(fresh)) = fresh_res {
+            if fresh.is_authenticated() {
+                let mut s = self.session.write().await;
+                *s = fresh;
+                return true;
+            }
+        }
+
+        let fresh_res = tokio::task::spawn_blocking(AuthSession::from_chrome).await;
         if let Ok(Ok(fresh)) = fresh_res {
             if fresh.is_authenticated() {
                 let mut s = self.session.write().await;
@@ -906,7 +919,7 @@ impl InnerTubeClient {
                         }
                     }
                 }
-                if !videos.is_empty() || attempt == 1 || !self.try_refresh_firefox_session().await {
+                if !videos.is_empty() || attempt == 1 || !self.try_refresh_browser_session().await {
                     break;
                 }
             }
@@ -963,7 +976,7 @@ impl InnerTubeClient {
             Self::collect_video_cards(&json_val, &mut videos);
             next_token = Self::extract_feed_continuation_token(&json_val);
 
-            if !videos.is_empty() || attempt == 1 || !self.try_refresh_firefox_session().await {
+            if !videos.is_empty() || attempt == 1 || !self.try_refresh_browser_session().await {
                 break;
             }
         }
@@ -1133,7 +1146,7 @@ impl InnerTubeClient {
             Self::collect_video_cards(&json_val, &mut videos);
             next_token = Self::extract_feed_continuation_token(&json_val);
 
-            if !videos.is_empty() || attempt == 1 || !self.try_refresh_firefox_session().await {
+            if !videos.is_empty() || attempt == 1 || !self.try_refresh_browser_session().await {
                 break;
             }
         }
@@ -1164,7 +1177,7 @@ impl InnerTubeClient {
             self.capture_visitor_data(&json_val).await;
             Self::collect_video_cards(&json_val, &mut videos);
 
-            if !videos.is_empty() || attempt == 1 || !self.try_refresh_firefox_session().await {
+            if !videos.is_empty() || attempt == 1 || !self.try_refresh_browser_session().await {
                 break;
             }
         }
@@ -2035,16 +2048,67 @@ impl InnerTubeClient {
     }
 
     fn find_ytdlp_binary() -> std::path::PathBuf {
-        if let Some(home) = dirs::home_dir() {
-            let user_local = home.join(".local/bin/yt-dlp");
-            if user_local.exists() {
-                return user_local;
+        let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+
+        // Prefer a copy shipped next to the executable (Windows installer / tarball).
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(dir) = exe.parent() {
+                candidates.push(dir.join("yt-dlp.exe"));
+                candidates.push(dir.join("yt-dlp"));
             }
         }
-        if std::path::Path::new("/usr/bin/yt-dlp").exists() {
-            return std::path::PathBuf::from("/usr/bin/yt-dlp");
+
+        if let Some(home) = dirs::home_dir() {
+            #[cfg(target_os = "linux")]
+            {
+                candidates.push(home.join(".local/bin/yt-dlp"));
+                candidates.push(home.join(".nix-profile/bin/yt-dlp"));
+                candidates.push(home.join(".local/share/pipx/venvs/yt-dlp/bin/yt-dlp"));
+            }
+            #[cfg(target_os = "windows")]
+            {
+                candidates.push(home.join(".local/bin/yt-dlp.exe"));
+                candidates.push(home.join("scoop/shims/yt-dlp.exe"));
+                candidates.push(home.join("scoop/apps/yt-dlp/current/yt-dlp.exe"));
+                candidates.push(home.join("AppData/Local/Programs/yt-dlp/yt-dlp.exe"));
+                candidates.push(home.join("AppData/Roaming/Python/Scripts/yt-dlp.exe"));
+            }
+            #[cfg(target_os = "macos")]
+            {
+                candidates.push(home.join(".local/bin/yt-dlp"));
+                candidates.push(std::path::PathBuf::from("/opt/homebrew/bin/yt-dlp"));
+                candidates.push(std::path::PathBuf::from("/usr/local/bin/yt-dlp"));
+            }
         }
-        std::path::PathBuf::from("yt-dlp")
+
+        #[cfg(target_os = "windows")]
+        {
+            if let Some(local) = dirs::data_local_dir() {
+                candidates.push(local.join("Programs/yt-dlp/yt-dlp.exe"));
+                candidates.push(local.join("Microsoft/WinGet/Links/yt-dlp.exe"));
+            }
+            if let Some(data) = dirs::data_dir() {
+                candidates.push(data.join("Python/Scripts/yt-dlp.exe"));
+            }
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            candidates.push(std::path::PathBuf::from("/usr/bin/yt-dlp"));
+            candidates.push(std::path::PathBuf::from("/usr/local/bin/yt-dlp"));
+        }
+
+        for candidate in candidates {
+            if candidate.exists() {
+                return candidate;
+            }
+        }
+
+        if cfg!(target_os = "windows") {
+            std::path::PathBuf::from("yt-dlp.exe")
+        } else {
+            std::path::PathBuf::from("yt-dlp")
+        }
     }
 
     async fn extract_streams_via_ytdlp(
@@ -2126,7 +2190,36 @@ impl InnerTubeClient {
         let duration = json.get("duration").and_then(|v| v.as_f64()).unwrap_or(0.0);
         let approx_duration_ms = (duration * 1000.0) as u64;
 
+        let is_live_stream = json.get("is_live").and_then(|v| v.as_bool()).unwrap_or(false)
+            || json.get("live_status").and_then(|v| v.as_str()).map(|s| s == "is_live").unwrap_or(false);
+
         if let Some(formats) = json.get("formats").and_then(|v| v.as_array()) {
+            // For live streams, check if a master HLS manifest exists (e.g. index.m3u8).
+            // Passing the unified HLS master playlist to libmpv enables seamless live streaming with
+            // continuous chunk discovery and rolling DVR backward seeking.
+            if is_live_stream {
+                if let Some(master_m3u8) = formats.iter().find_map(|f| f.get("manifest_url").and_then(|u| u.as_str())).filter(|u| !u.is_empty()) {
+                    video_streams.push(StreamQuality {
+                        itag: 9999,
+                        quality_label: "Live / Auto".to_string(),
+                        mime_type: "application/x-mpegURL".to_string(),
+                        codecs: "avc1".to_string(),
+                        bitrate: 4_500_000,
+                        width: 1920,
+                        height: 1080,
+                        fps: 60,
+                        url: master_m3u8.to_string(),
+                        is_audio: false,
+                        audio_track_id: String::new(),
+                        audio_track_name: String::new(),
+                        is_default_audio: false,
+                        init_range: None,
+                        index_range: None,
+                        approx_duration_ms: 0,
+                    });
+                }
+            }
+
             for fmt in formats {
                 let url = fmt.get("url").and_then(|v| v.as_str()).unwrap_or("");
                 if url.is_empty() {

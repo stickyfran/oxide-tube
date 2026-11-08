@@ -134,12 +134,15 @@ pub fn view_header_bar<'a, Message: Clone + 'static>(
     is_authenticated: bool,
     user_name: Option<&'a str>,
     user_avatar_handle: Option<&'a iced::widget::image::Handle>,
+    profile_expand: f32,
     is_subscriptions: bool,
     is_history: bool,
     is_downloads: bool,
     is_home: bool,
     tabs: &'a [VideoTab],
     active_tab_idx: Option<usize>,
+    hovered_tab_idx: Option<usize>,
+    dragging_tab_idx: Option<usize>,
     playing_video_id: Option<&'a str>,
     is_video_playing: bool,
     newly_opened_tab: Option<(usize, f32)>,
@@ -147,6 +150,8 @@ pub fn view_header_bar<'a, Message: Clone + 'static>(
     window_width: f32,
     tabs_scroll_x: f32,
     tabs_max_scroll_x: f32,
+    custom_titlebar: bool,
+    is_maximized: bool,
     on_search_input: impl Fn(String) -> Message + 'static,
     on_search_submit: Message,
     on_search_hover: impl Fn(bool) -> Message + Copy + 'static,
@@ -157,25 +162,39 @@ pub fn view_header_bar<'a, Message: Clone + 'static>(
     on_open_history: Message,
     on_open_downloads: Message,
     on_toggle_login_modal: Message,
+    on_profile_hover: impl Fn(bool) -> Message + Copy + 'static,
     on_reload: Message,
     on_select_tab: impl Fn(usize) -> Message + Copy + 'static,
+    on_tab_press: impl Fn(usize) -> Message + Copy + 'static,
     on_close_tab: impl Fn(usize) -> Message + Copy + 'static,
     on_hover_tab: impl Fn(usize, bool) -> Message + Copy + 'static,
     on_scroll_tabs: impl Fn(iced::widget::scrollable::Viewport) -> Message + Copy + 'static,
     on_scroll_tabs_left: Message,
     on_scroll_tabs_right: Message,
+    on_header_drag: Message,
+    on_header_menu: Message,
+    on_minimize_window: Message,
+    on_maximize_window: Message,
+    on_close_window: Message,
 ) -> Element<'a, Message> {
+    let fitts_top = custom_titlebar && is_maximized;
+    let tab_height: f32 = if fitts_top { 44.0 } else { 38.0 };
+
     // 1. Left section: Back, Home button (with uniform active styling)
     let back_btn = button(icon_back(18.0))
         .style(ghost_button)
-        .padding([6, 10])
+        .padding([7, 10])
         .on_press(on_go_back);
 
     let home_btn = nav_tab_button(icon_home(16.0), is_home, on_go_home);
 
-    let left_section = row![back_btn, home_btn]
-        .spacing(6)
-        .align_y(Alignment::Center);
+    let left_section = container(
+        row![back_btn, home_btn]
+            .spacing(6)
+            .align_y(Alignment::Center),
+    )
+    .height(Length::Fill)
+    .align_y(iced::alignment::Vertical::Center);
 
     // 2. Suscripciones (icon-only) + Historial + Descargas + Search Bar
     let subs_btn = nav_tab_button(icon_subscriptions(16.0), is_subscriptions, on_open_subscriptions);
@@ -193,12 +212,12 @@ pub fn view_header_bar<'a, Message: Clone + 'static>(
         .on_input(on_search_input)
         .on_submit(on_search_submit.clone())
         .style(animated_search_input(search_focus_glow))
-        .padding([6, 12])
+        .padding([7, 12])
         .width(Length::Fixed(search_bar_width));
 
     let search_btn = button(icon_search(14.0))
         .style(secondary_button)
-        .padding([6, 10])
+        .padding([7, 10])
         .on_press(on_search_submit);
 
     let search_bar_compound = mouse_area(
@@ -209,11 +228,15 @@ pub fn view_header_bar<'a, Message: Clone + 'static>(
     .on_enter(on_search_hover(true))
     .on_exit(on_search_hover(false));
 
-    let search_container = row![subs_btn, history_btn, downloads_btn, search_bar_compound]
-        .spacing(4)
-        .align_y(Alignment::Center);
+    let search_container = container(
+        row![subs_btn, history_btn, downloads_btn, search_bar_compound]
+            .spacing(4)
+            .align_y(Alignment::Center),
+    )
+    .height(Length::Fill)
+    .align_y(iced::alignment::Vertical::Center);
 
-    // 3. Center/Horizontal Tabs section: Pestañas de video abiertas con middle-click
+    // 3. Center/Horizontal Tabs section: Pestañas ergonómicas estilo Firefox (38-44px alto, clic completo)
     let glow_phase = (std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -221,19 +244,23 @@ pub fn view_header_bar<'a, Message: Clone + 'static>(
         % 2200) as f32
         / 2200.0;
 
-    let mut tabs_row = row![].spacing(6).align_y(Alignment::Center);
+    let mut tabs_row = row![]
+        .spacing(6)
+        .align_y(if fitts_top { Alignment::Start } else { Alignment::Center });
     let mut sum_tabs_width: f32 = 0.0;
 
     for (idx, tab) in tabs.iter().enumerate() {
         let is_active = active_tab_idx == Some(idx);
+        let is_hovered = hovered_tab_idx == Some(idx);
+        let is_dragging_this = dragging_tab_idx == Some(idx);
         let is_playing_this_tab =
             is_video_playing && !tab.video_id.is_empty() && playing_video_id == Some(tab.video_id.as_str());
         let open_elapsed = newly_opened_tab.and_then(|(n_idx, el)| if n_idx == idx { Some(el) } else { None });
         let is_newly_opened = open_elapsed.is_some();
         let shake_elapsed = shaking_tab.and_then(|(s_idx, el)| if s_idx == idx { Some(el) } else { None });
 
-        let tab_title = if tab.title.chars().count() > 32 {
-            let mut t: String = tab.title.chars().take(30).collect();
+        let tab_title = if tab.title.chars().count() > 30 {
+            let mut t: String = tab.title.chars().take(28).collect();
             t.push_str("..");
             t
         } else if tab.title.is_empty() {
@@ -243,39 +270,72 @@ pub fn view_header_bar<'a, Message: Clone + 'static>(
         };
 
         let char_count = tab_title.chars().count() as f32;
-        let est_this_tab_w = (char_count * 6.5 + if is_playing_this_tab { 48.0 } else { 34.0 }).clamp(110.0, 235.0);
+        let est_this_tab_w = (char_count * 7.2 + if is_playing_this_tab { 62.0 } else { 46.0 }).clamp(132.0, 248.0);
         sum_tabs_width += est_this_tab_w + if idx > 0 { 6.0 } else { 0.0 };
+
+        let text_color = if is_active || is_hovered || is_playing_this_tab || is_dragging_this {
+            iced::Color::WHITE
+        } else {
+            COLOR_TEXT_PRIMARY
+        };
 
         let label_content: Element<'a, Message> = if is_playing_this_tab {
             row![
-                icon_play(10.0),
+                icon_play(11.5),
                 text(tab_title)
-                    .size(11)
+                    .size(12.5)
                     .wrapping(text::Wrapping::None)
-                    .color(iced::Color::WHITE),
+                    .color(text_color),
             ]
-            .spacing(5)
+            .spacing(6)
             .align_y(Alignment::Center)
             .into()
         } else {
             text(tab_title)
-                .size(11)
+                .size(12.5)
                 .wrapping(text::Wrapping::None)
-                .color(if is_active { iced::Color::WHITE } else { COLOR_TEXT_SECONDARY })
+                .color(text_color)
                 .into()
         };
 
-        let select_btn = button(label_content)
-            .style(ghost_button)
-            .padding([4, 6])
-            .on_press(on_select_tab(idx));
+        let tab_body = container(label_content)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .clip(true)
+            .align_y(iced::alignment::Vertical::Center)
+            .padding(iced::Padding {
+                top: if fitts_top { 4.0 } else { 0.0 },
+                bottom: 0.0,
+                left: 12.0,
+                right: 4.0,
+            });
 
-        let close_btn = button(icon_close(10.0))
-            .style(ghost_button)
-            .padding([4, 4])
-            .on_press(on_close_tab(idx));
+        let close_btn = container(
+            button(
+                container(icon_close(11.0))
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .align_x(iced::alignment::Horizontal::Center)
+                    .align_y(iced::alignment::Vertical::Center),
+            )
+            .width(Length::Fixed(24.0))
+            .height(Length::Fixed(24.0))
+            .padding(0)
+            .style(tab_close_button)
+            .on_press(on_close_tab(idx)),
+        )
+        .height(Length::Fill)
+        .padding(iced::Padding {
+            top: if fitts_top { 4.0 } else { 0.0 },
+            bottom: 0.0,
+            left: 2.0,
+            right: 6.0,
+        })
+        .align_y(iced::alignment::Vertical::Center);
 
-        let (shake_offset, border_color, border_width) = if let Some(el) = shake_elapsed {
+        let (shake_offset, border_color, border_width) = if is_dragging_this {
+            (0.0, iced::Color::from_rgb8(0x3e, 0xa6, 0xff), 2.0)
+        } else if let Some(el) = shake_elapsed {
             let decay = (1.0 - el / 0.6).clamp(0.0, 1.0);
             let offset = (el * 38.0).sin() * 5.0 * decay;
             let c = iced::Color::from_rgba(0.9, 0.3, 0.3, 0.2 + 0.8 * decay);
@@ -283,39 +343,72 @@ pub fn view_header_bar<'a, Message: Clone + 'static>(
         } else if is_playing_this_tab {
             (0.0, iced::Color::TRANSPARENT, 0.0)
         } else if is_active {
-            (0.0, iced::Color::from_rgb8(0xff, 0x33, 0x33), 1.5)
+            (0.0, iced::Color::from_rgb8(0xff, 0x3b, 0x3b), 1.5)
         } else if is_newly_opened {
             (0.0, iced::Color::from_rgb8(0xff, 0x55, 0x55), 1.5)
+        } else if is_hovered {
+            (0.0, iced::Color::from_rgb8(0x52, 0x52, 0x5a), 1.0)
         } else {
-            (0.0, COLOR_BORDER, 1.0)
+            (0.0, color_border(), 1.0)
         };
 
-        let pad_l = (4.0 + shake_offset).max(0.0);
-        let pad_r = (4.0 - shake_offset).max(0.0);
+        let pad_l = shake_offset.max(0.0);
+        let pad_r = (-shake_offset).max(0.0);
+        let tab_radius = if fitts_top {
+            iced::border::Radius {
+                top_left: 0.0,
+                top_right: 0.0,
+                bottom_right: 8.0,
+                bottom_left: 8.0,
+            }
+        } else {
+            iced::border::Radius::from(8.0)
+        };
 
         let inner_pill = container(
-            row![select_btn, close_btn]
-                .align_y(Alignment::Center)
-                .spacing(2),
+            row![
+                tab_body,
+                close_btn,
+            ]
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .align_y(Alignment::Center)
+            .spacing(0),
         )
+        .width(Length::Fixed(est_this_tab_w))
+        .height(Length::Fixed(tab_height))
         .style(move |_t| container::Style {
-            background: Some(if is_active {
-                iced::Color::from_rgb8(0xcc, 0x00, 0x00).into()
+            background: Some(if is_dragging_this {
+                iced::Color::from_rgb8(0x22, 0x27, 0x38).into()
+            } else if is_active {
+                if is_hovered {
+                    iced::Color::from_rgb8(0xd9, 0x11, 0x11).into()
+                } else {
+                    iced::Color::from_rgb8(0xcc, 0x00, 0x00).into()
+                }
             } else if is_playing_this_tab {
-                iced::Color::from_rgb8(0x2b, 0x10, 0x10).into()
+                if is_hovered {
+                    iced::Color::from_rgb8(0x3a, 0x16, 0x16).into()
+                } else {
+                    iced::Color::from_rgb8(0x2b, 0x10, 0x10).into()
+                }
             } else if is_newly_opened {
                 iced::Color::from_rgb8(0x44, 0x11, 0x11).into()
+            } else if is_hovered {
+                iced::Color::from_rgb8(0x28, 0x28, 0x2e).into()
             } else {
-                iced::Color::from_rgb8(0x18, 0x18, 0x18).into()
+                iced::Color::from_rgb8(0x1a, 0x1a, 0x1e).into()
             }),
-            border: iced::border::rounded(6)
-                .color(border_color)
-                .width(border_width),
+            border: iced::Border {
+                color: border_color,
+                width: border_width,
+                radius: tab_radius,
+            },
             ..container::Style::default()
         })
         .padding(iced::Padding {
-            top: 1.0,
-            bottom: 1.0,
+            top: 0.0,
+            bottom: 0.0,
             left: pad_l,
             right: pad_r,
         });
@@ -329,6 +422,8 @@ pub fn view_header_bar<'a, Message: Clone + 'static>(
             .height(Length::Fill);
 
             container(stack![inner_pill, glow_canvas])
+                .width(Length::Fixed(est_this_tab_w))
+                .height(Length::Fixed(tab_height))
         } else {
             inner_pill
         };
@@ -338,7 +433,7 @@ pub fn view_header_bar<'a, Message: Clone + 'static>(
             if el < 0.22 {
                 let t = (el / 0.22).clamp(0.0, 1.0);
                 let ease = 1.0 - (1.0 - t).powi(3);
-                let target_w = 210.0;
+                let target_w = est_this_tab_w;
                 tab_container = tab_container
                     .width(Length::Fixed((target_w * ease).max(2.0)))
                     .clip(true);
@@ -346,14 +441,36 @@ pub fn view_header_bar<'a, Message: Clone + 'static>(
         }
 
         let tab_pill = mouse_area(tab_container)
+            .interaction(if is_dragging_this {
+                iced::mouse::Interaction::Grabbing
+            } else {
+                iced::mouse::Interaction::Pointer
+            })
             .on_enter(on_hover_tab(idx, true))
             .on_exit(on_hover_tab(idx, false))
+            .on_press(on_tab_press(idx))
+            .on_release(on_select_tab(idx))
             .on_middle_press(on_close_tab(idx));
 
         tabs_row = tabs_row.push(tab_pill);
     }
 
+    // Chrome/Firefox overflow detection accounting for CSD window buttons
+    let right_account_width = if is_authenticated && user_name.is_some() { 160.0 } else { 125.0 };
+    let csd_controls_width = if custom_titlebar { 136.0 + 32.0 } else { 0.0 };
+    let non_tabs_width = 240.0 + search_bar_width + right_account_width + csd_controls_width;
+    let available_tabs_width = (window_width - non_tabs_width).max(80.0);
+    let heuristic_max_scroll = (sum_tabs_width - available_tabs_width).max(0.0);
+    let effective_max_scroll = tabs_max_scroll_x.max(heuristic_max_scroll);
+    let clamped_scroll_x = tabs_scroll_x.clamp(0.0, effective_max_scroll);
+
+    // Only show scroll controls when tabs actually exceed the viewport
+    let has_overflow = effective_max_scroll > 8.0;
+    let can_scroll_left = has_overflow && clamped_scroll_x > 4.0;
+    let can_scroll_right = has_overflow && (clamped_scroll_x + 6.0) < effective_max_scroll;
+
     let tabs_scrollable = iced::widget::scrollable(tabs_row)
+        .width(Length::Fill)
         .direction(iced::widget::scrollable::Direction::Horizontal(
             iced::widget::scrollable::Scrollbar::new()
                 .width(0.0)
@@ -382,28 +499,40 @@ pub fn view_header_bar<'a, Message: Clone + 'static>(
         .id(iced::widget::scrollable::Id::new("tabs_scrollable"))
         .on_scroll(on_scroll_tabs);
 
-    // Chrome-like overflow detection:
-    // Real occupied width by non-tab elements in header:
-    // left_section (~116) + search_container (buttons ~72 + search_bar) + margins/spacings (~52) + right_section (~160)
-    let right_account_width = if is_authenticated && user_name.is_some() { 160.0 } else { 125.0 };
-    let non_tabs_width = 240.0 + search_bar_width + right_account_width;
-    let available_tabs_width = (window_width - non_tabs_width).max(80.0);
-    let heuristic_max_scroll = (sum_tabs_width - available_tabs_width).max(0.0);
-    let effective_max_scroll = tabs_max_scroll_x.max(heuristic_max_scroll);
-    let clamped_scroll_x = tabs_scroll_x.clamp(0.0, effective_max_scroll);
-
-    // Only show scroll controls when tabs actually exceed the viewport
-    let has_overflow = effective_max_scroll > 8.0;
-    let can_scroll_left = has_overflow && clamped_scroll_x > 4.0;
-    let can_scroll_right = has_overflow && (clamped_scroll_x + 6.0) < effective_max_scroll;
-
     let tabs_section: Element<'a, Message> = {
-        let base_scrollable = container(tabs_scrollable)
+        let tabs_align_y = if fitts_top {
+            iced::alignment::Vertical::Top
+        } else {
+            iced::alignment::Vertical::Center
+        };
+
+        let free_drag_space: Element<'a, Message> = mouse_area(
+            Space::new(Length::Fill, Length::Fill),
+        )
+        .on_press(on_header_drag.clone())
+        .on_right_press(on_header_menu.clone())
+        .into();
+
+        let base_row: Element<'a, Message> = if has_overflow {
+            container(tabs_scrollable)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .align_y(tabs_align_y)
+                .into()
+        } else {
+            row![
+                container(tabs_scrollable)
+                    .width(Length::Fixed(sum_tabs_width))
+                    .height(Length::Fill)
+                    .align_y(tabs_align_y),
+                free_drag_space,
+            ]
             .width(Length::Fill)
             .height(Length::Fill)
-            .align_y(iced::alignment::Vertical::Center);
+            .into()
+        };
 
-        let mut layers: Vec<Element<'a, Message>> = vec![base_scrollable.into()];
+        let mut layers: Vec<Element<'a, Message>> = vec![base_row];
 
         if can_scroll_left {
             let left_btn = button(
@@ -413,20 +542,20 @@ pub fn view_header_bar<'a, Message: Clone + 'static>(
                     .align_x(iced::alignment::Horizontal::Center)
                     .align_y(iced::alignment::Vertical::Center),
             )
-            .width(Length::Fixed(24.0))
-            .height(Length::Fixed(24.0))
+            .width(Length::Fixed(26.0))
+            .height(Length::Fixed(26.0))
             .padding(0)
             .style(|_t, status| match status {
                 button::Status::Hovered | button::Status::Pressed => button::Style {
                     background: Some(iced::Color::from_rgba(0.24, 0.24, 0.24, 0.95).into()),
-                    border: iced::border::rounded(12)
+                    border: iced::border::rounded(13)
                         .color(iced::Color::from_rgb8(0x80, 0x80, 0x80))
                         .width(1.0),
                     ..button::Style::default()
                 },
                 _ => button::Style {
                     background: Some(iced::Color::from_rgba(0.12, 0.12, 0.12, 0.90).into()),
-                    border: iced::border::rounded(12).color(COLOR_BORDER).width(1.0),
+                    border: iced::border::rounded(13).color(COLOR_BORDER).width(1.0),
                     ..button::Style::default()
                 },
             })
@@ -449,20 +578,20 @@ pub fn view_header_bar<'a, Message: Clone + 'static>(
                     .align_x(iced::alignment::Horizontal::Center)
                     .align_y(iced::alignment::Vertical::Center),
             )
-            .width(Length::Fixed(24.0))
-            .height(Length::Fixed(24.0))
+            .width(Length::Fixed(26.0))
+            .height(Length::Fixed(26.0))
             .padding(0)
             .style(|_t, status| match status {
                 button::Status::Hovered | button::Status::Pressed => button::Style {
                     background: Some(iced::Color::from_rgba(0.24, 0.24, 0.24, 0.95).into()),
-                    border: iced::border::rounded(12)
+                    border: iced::border::rounded(13)
                         .color(iced::Color::from_rgb8(0x80, 0x80, 0x80))
                         .width(1.0),
                     ..button::Style::default()
                 },
                 _ => button::Style {
                     background: Some(iced::Color::from_rgba(0.12, 0.12, 0.12, 0.90).into()),
-                    border: iced::border::rounded(12).color(COLOR_BORDER).width(1.0),
+                    border: iced::border::rounded(13).color(COLOR_BORDER).width(1.0),
                     ..button::Style::default()
                 },
             })
@@ -480,8 +609,8 @@ pub fn view_header_bar<'a, Message: Clone + 'static>(
         stack(layers).width(Length::Fill).height(Length::Fill).into()
     };
 
-    // 4. Right section: Account & Reload
-    let auth_btn_content: Element<'a, Message> = if is_authenticated {
+    // 4. Right section: Account, Reload & CSD Window Controls (Minimize, Maximize/Restore, Close)
+    let auth_btn: Element<'a, Message> = if is_authenticated {
         let avatar_el: Element<'a, Message> = if let Some(handle) = user_avatar_handle {
             container(
                 image(handle.clone())
@@ -502,44 +631,56 @@ pub fn view_header_bar<'a, Message: Clone + 'static>(
             icon_user(16.0)
         };
 
+        // Animate the pill from avatar-only to avatar + full name.
+        let expand = profile_expand.clamp(0.0, 1.0);
+        let name_width = user_name
+            .map(|name| (name.chars().count() as f32 * 8.0).clamp(32.0, 200.0))
+            .unwrap_or(0.0);
+        let collapsed_width = 28.0;
+        let expanded_width = 28.0 + 8.0 + name_width;
+        let pill_width = collapsed_width + (expanded_width - collapsed_width) * expand;
+        let name_alpha = expand.powf(1.35);
+
+        let mut profile_row = row![avatar_el].spacing(8).align_y(Alignment::Center);
         if let Some(name) = user_name {
-            row![
-                avatar_el,
+            profile_row = profile_row.push(
                 text(name)
                     .size(13)
-                    .color(COLOR_TEXT_PRIMARY),
-            ]
-            .spacing(8)
-            .align_y(Alignment::Center)
-            .into()
-        } else {
-            avatar_el
+                    .color(Color {
+                        a: name_alpha,
+                        ..COLOR_TEXT_PRIMARY
+                    }),
+            );
         }
-    } else {
-        row![icon_user(14.0), text("Iniciar Sesión").size(12)]
-            .spacing(6)
-            .align_y(Alignment::Center)
-            .into()
-    };
 
-    let auth_btn = button(auth_btn_content)
-        .style(if is_authenticated {
-            secondary_button
-        } else {
-            primary_button
-        })
-        .padding(if is_authenticated {
-            if user_name.is_some() {
-                [4, 10]
-            } else if user_avatar_handle.is_some() {
-                [2, 2]
-            } else {
-                [6, 8]
-            }
-        } else {
-            [6, 12]
-        })
-        .on_press(on_toggle_login_modal.clone());
+        let profile_content = container(profile_row)
+            .width(Length::Fixed((pill_width - 4.0).max(24.0)))
+            .height(Length::Fixed(24.0))
+            .clip(true)
+            .align_x(iced::alignment::Horizontal::Left)
+            .align_y(iced::alignment::Vertical::Center);
+
+        let profile_btn = button(profile_content)
+            .style(secondary_button)
+            .padding([2, 2])
+            .width(Length::Fixed(pill_width))
+            .on_press(on_toggle_login_modal.clone());
+
+        mouse_area(profile_btn)
+            .on_enter(on_profile_hover(true))
+            .on_exit(on_profile_hover(false))
+            .into()
+    } else {
+        button(
+            row![icon_user(14.0), text("Iniciar Sesión").size(12)]
+                .spacing(6)
+                .align_y(Alignment::Center),
+        )
+        .style(primary_button)
+        .padding([6, 12])
+        .on_press(on_toggle_login_modal.clone())
+        .into()
+    };
 
     let incognito_badge: Option<Element<'a, Message>> = if is_incognito {
         Some(
@@ -574,28 +715,113 @@ pub fn view_header_bar<'a, Message: Clone + 'static>(
         right_row = right_row.push(badge);
     }
     right_row = right_row.push(auth_btn).push(reload_btn);
-    let right_section = right_row;
 
-    container(
-        row![
-            left_section,
-            search_container,
-            Space::with_width(Length::Fixed(12.0)),
-            container(tabs_section).width(Length::Fill),
-            Space::with_width(Length::Fixed(12.0)),
-            right_section,
-        ]
-        .align_y(Alignment::Center)
-        .padding([6, 14]),
-    )
-    .style(|_t| container::Style {
-        background: Some(COLOR_BG.into()),
-        border: iced::border::color(COLOR_BORDER).width(1.0),
-        ..container::Style::default()
-    })
-    .height(Length::Fixed(56.0))
-    .width(Length::Fill)
-    .into()
+    let right_tools = container(right_row)
+        .height(Length::Fill)
+        .align_y(iced::alignment::Vertical::Center);
+
+    let mut main_header_row = row![
+        Space::with_width(Length::Fixed(12.0)),
+        left_section,
+        Space::with_width(Length::Fixed(6.0)),
+        search_container,
+        Space::with_width(Length::Fixed(8.0)),
+        container(tabs_section).width(Length::Fill).height(Length::Fill),
+        Space::with_width(Length::Fixed(8.0)),
+        right_tools,
+    ]
+    .height(Length::Fill)
+    .align_y(Alignment::Center);
+
+    if custom_titlebar {
+        let win_btn_h = if fitts_top { 44.0 } else { 36.0 };
+        let win_btn_w = if fitts_top { 44.0 } else { 40.0 };
+
+        let min_btn = button(
+            container(icon_win_minimize(13.0))
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .align_x(iced::alignment::Horizontal::Center)
+                .align_y(iced::alignment::Vertical::Center),
+        )
+        .width(Length::Fixed(win_btn_w))
+        .height(Length::Fixed(win_btn_h))
+        .padding(0)
+        .style(window_control_button(fitts_top))
+        .on_press(on_minimize_window);
+
+        let max_icon = if is_maximized {
+            icon_win_restore(13.0)
+        } else {
+            icon_win_maximize(13.0)
+        };
+
+        let max_btn = button(
+            container(max_icon)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .align_x(iced::alignment::Horizontal::Center)
+                .align_y(iced::alignment::Vertical::Center),
+        )
+        .width(Length::Fixed(win_btn_w))
+        .height(Length::Fixed(win_btn_h))
+        .padding(0)
+        .style(window_control_button(fitts_top))
+        .on_press(on_maximize_window);
+
+        let close_btn = button(
+            container(icon_win_close(13.0))
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .align_x(iced::alignment::Horizontal::Center)
+                .align_y(iced::alignment::Vertical::Center),
+        )
+        .width(Length::Fixed(if fitts_top { 46.0 } else { 40.0 }))
+        .height(Length::Fixed(win_btn_h))
+        .padding(0)
+        .style(window_close_button(fitts_top))
+        .on_press(on_close_window);
+
+        let win_controls = container(
+            row![min_btn, max_btn, close_btn]
+                .spacing(if fitts_top { 0 } else { 2 })
+                .align_y(Alignment::Center),
+        )
+        .height(Length::Fill)
+        .padding(iced::Padding {
+            top: 0.0,
+            bottom: 0.0,
+            left: 8.0,
+            right: if fitts_top { 0.0 } else { 8.0 },
+        })
+        .align_y(if fitts_top {
+            iced::alignment::Vertical::Top
+        } else {
+            iced::alignment::Vertical::Center
+        });
+
+        main_header_row = main_header_row.push(win_controls);
+    } else {
+        main_header_row = main_header_row.push(Space::with_width(Length::Fixed(14.0)));
+    }
+
+    let header_box = container(main_header_row)
+        .style(|_t| container::Style {
+            background: Some(color_bg().into()),
+            border: iced::border::color(color_border()).width(1.0),
+            ..container::Style::default()
+        })
+        .height(Length::Fixed(56.0))
+        .width(Length::Fill);
+
+    if custom_titlebar {
+        mouse_area(header_box)
+            .on_press(on_header_drag)
+            .on_right_press(on_header_menu)
+            .into()
+    } else {
+        header_box.into()
+    }
 }
 
 pub fn view_suggestions_overlay<'a, Message: Clone + 'static>(
@@ -724,6 +950,7 @@ pub fn view_auth_modal<'a, Message: Clone + 'static>(
     current_card_style: crate::config::CardStyle,
     current_columns: crate::config::GridColumnsConfig,
     current_theme: crate::config::AppTheme,
+    custom_titlebar: bool,
     incognito_mode: bool,
     auto_pip_on_unfocus: bool,
     full_buffer_tabs: bool,
@@ -746,6 +973,7 @@ pub fn view_auth_modal<'a, Message: Clone + 'static>(
     on_select_card_style: impl Fn(crate::config::CardStyle) -> Message + Copy + 'static,
     on_select_home_columns: impl Fn(crate::config::GridColumnsConfig) -> Message + Copy + 'static,
     on_select_theme: impl Fn(crate::config::AppTheme) -> Message + Copy + 'static,
+    on_toggle_custom_titlebar: Message,
     on_toggle_incognito: Message,
     on_toggle_auto_pip: Message,
     on_toggle_full_buffer_tabs: Message,
@@ -987,10 +1215,25 @@ pub fn view_auth_modal<'a, Message: Clone + 'static>(
             ]
             .spacing(6);
 
+            let row_custom_titlebar = row![
+                column![
+                    text("Integrar Pestañas en Barra de Título (Estilo Firefox / CSD)").size(13).color(COLOR_TEXT_PRIMARY),
+                    text("Unifica las pestañas y los controles de ventana en el header sin barra nativa del sistema.")
+                        .size(11)
+                        .color(COLOR_TEXT_SECONDARY),
+                ]
+                .spacing(2)
+                .width(Length::Fill),
+                render_toggle_switch(custom_titlebar, on_toggle_custom_titlebar),
+            ]
+            .spacing(12)
+            .align_y(Alignment::Center);
+
             column![
                 text("Apariencia y Diseño").size(15).color(COLOR_TEXT_PRIMARY),
                 section_card(
                     column![
+                        row_custom_titlebar,
                         column![
                             text("Tema de la Interfaz").size(12).color(COLOR_TEXT_SECONDARY),
                             theme_row,
@@ -1227,6 +1470,10 @@ pub fn view_auth_modal<'a, Message: Clone + 'static>(
                 .spacing(8),
             );
 
+            let chrome_failed = status_msg.starts_with("Error al importar Chrome")
+                || status_msg.contains("No se detectó ninguna sesión")
+                || status_msg.contains("App-Bound");
+
             let auth_action_content: Element<'a, Message> = if is_authenticated {
                 let logout_btn = button(
                     row![
@@ -1289,28 +1536,73 @@ pub fn view_auth_modal<'a, Message: Clone + 'static>(
                 .on_press(on_sync_browser_session);
 
                 let firefox_btn = button(
-                    row![
-                        icon_user(12.0),
-                        text("Firefox directo").size(11).color(COLOR_TEXT_SECONDARY),
+                    column![
+                        text("Firefox").size(12).color(COLOR_TEXT_PRIMARY),
+                        text("Importación automática").size(10).color(COLOR_TEXT_SECONDARY),
                     ]
-                    .spacing(4)
-                    .align_y(Alignment::Center),
+                    .spacing(2),
                 )
-                .style(ghost_button)
-                .padding([4, 8])
+                .style(secondary_button)
+                .padding([8, 12])
+                .width(Length::Fill)
                 .on_press(on_import_firefox);
 
                 let chrome_btn = button(
-                    row![
-                        icon_user(12.0),
-                        text("Chrome directo").size(11).color(COLOR_TEXT_SECONDARY),
+                    column![
+                        text("Chrome / Chromium").size(12).color(COLOR_TEXT_PRIMARY),
+                        text("Importación automática").size(10).color(COLOR_TEXT_SECONDARY),
                     ]
-                    .spacing(4)
-                    .align_y(Alignment::Center),
+                    .spacing(2),
                 )
-                .style(ghost_button)
-                .padding([4, 8])
+                .style(secondary_button)
+                .padding([8, 12])
+                .width(Length::Fill)
                 .on_press(on_import_chrome);
+
+                let chrome_help_card: Element<'a, Message> = container(
+                    column![
+                        row![
+                            icon_settings(13.0),
+                            text("¿Chrome no importó tu sesión?")
+                                .size(12)
+                                .color(COLOR_TEXT_PRIMARY),
+                        ]
+                        .spacing(6)
+                        .align_y(Alignment::Center),
+                        text("Sigue estos pasos, en orden:")
+                            .size(11)
+                            .color(COLOR_TEXT_SECONDARY),
+                        text("1. Abre Chrome y confirma en youtube.com que ya estás con tu cuenta.")
+                            .size(11)
+                            .color(COLOR_TEXT_SECONDARY),
+                        text("2. Cierra Chrome por completo (en Windows: icono de la bandeja → Salir).")
+                            .size(11)
+                            .color(COLOR_TEXT_SECONDARY),
+                        text("3. Vuelve aquí y pulsa otra vez “Importar desde Chrome”.")
+                            .size(11)
+                            .color(COLOR_TEXT_SECONDARY),
+                        text("4. Si sigue fallando en Windows, Chrome 127+ usa cifrado App-Bound (v20). Usa Firefox: es la opción más fiable.")
+                            .size(11)
+                            .color(COLOR_TEXT_SECONDARY),
+                        text("5. Plan B: instala la extensión “Get cookies.txt LOCALLY”, exporta youtube.com y pega aquí la línea de SAPISID o el header Cookie completo.")
+                            .size(11)
+                            .color(COLOR_TEXT_SECONDARY),
+                        text("En Linux, además, necesitas yt-dlp instalado y el llavero de GNOME/KWallet desbloqueado.")
+                            .size(10)
+                            .color(COLOR_TEXT_SECONDARY),
+                    ]
+                    .spacing(6),
+                )
+                .style(|_t| container::Style {
+                    background: Some(iced::Color::from_rgba(0.16, 0.13, 0.07, 0.95).into()),
+                    border: iced::border::rounded(10)
+                        .color(iced::Color::from_rgb8(0x8a, 0x6d, 0x2f))
+                        .width(1.0),
+                    ..container::Style::default()
+                })
+                .padding(12)
+                .width(Length::Fill)
+                .into();
 
                 let input = text_input("O pega aquí tu Cookie: SAPISID=...; HSID=...", raw_cookie_input)
                     .on_input(on_cookie_input)
@@ -1322,6 +1614,20 @@ pub fn view_auth_modal<'a, Message: Clone + 'static>(
                     .padding([6, 12])
                     .on_press(on_save_raw_cookie);
 
+                let mut import_section = column![
+                    text("Importar directamente desde un navegador")
+                        .size(11)
+                        .color(COLOR_TEXT_SECONDARY),
+                    row![firefox_btn, chrome_btn]
+                        .spacing(8)
+                        .align_y(Alignment::Center),
+                ]
+                .spacing(6);
+
+                if chrome_failed {
+                    import_section = import_section.push(chrome_help_card);
+                }
+
                 column![
                     text(
                         "Inicia sesión para sincronizar tus suscripciones, historial y recomendaciones.\nTus credenciales se conservan localmente y nunca salen de tu equipo.",
@@ -1329,11 +1635,7 @@ pub fn view_auth_modal<'a, Message: Clone + 'static>(
                     .size(11)
                     .color(COLOR_TEXT_SECONDARY),
                     row![browser_login_btn, sync_browser_btn].spacing(8).align_y(Alignment::Center),
-                    row![
-                        text("Opciones avanzadas:").size(11).color(COLOR_TEXT_SECONDARY),
-                        firefox_btn,
-                        chrome_btn
-                    ].spacing(6).align_y(Alignment::Center),
+                    import_section,
                     input,
                     row![save_btn].align_y(Alignment::Center),
                 ]
@@ -1546,4 +1848,102 @@ pub fn view_downloads<'a, Message: Clone + 'static>(
     }
 
     scrollable(list).width(Length::Fill).height(Length::Fill).into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Debug, Clone)]
+    #[allow(dead_code)]
+    enum TestMsg {
+        NoOp,
+        Tab(usize),
+        Hover(usize, bool),
+        Search(String),
+        Scroll(iced::widget::scrollable::Viewport),
+    }
+
+    #[test]
+    fn test_view_header_bar_multiple_tabs() {
+        let tabs = vec![
+            VideoTab {
+                video_id: "v1".into(),
+                title: "Rust Async Tutorial".into(),
+                channel_name: "RustLang".into(),
+                saved_pos_ms: 0,
+                thumbnail_url: "".into(),
+            },
+            VideoTab {
+                video_id: "v2".into(),
+                title: "KDE Plasma 6 Overview".into(),
+                channel_name: "KDE".into(),
+                saved_pos_ms: 1000,
+                thumbnail_url: "".into(),
+            },
+            VideoTab {
+                video_id: "v3".into(),
+                title: "Wayland Protocols Explained".into(),
+                channel_name: "Linux".into(),
+                saved_pos_ms: 5000,
+                thumbnail_url: "".into(),
+            },
+        ];
+
+        let _element = view_header_bar(
+            "",
+            200.0,
+            false,
+            0.0,
+            false,
+            &[],
+            false,
+            PowerProfile::Ac,
+            false,
+            None,
+            None,
+            0.0,
+            false,
+            false,
+            false,
+            false,
+            &tabs,
+            Some(0),
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
+            1280.0,
+            0.0,
+            0.0,
+            true,
+            false,
+            TestMsg::Search,
+            TestMsg::NoOp,
+            |_| TestMsg::NoOp,
+            |_| TestMsg::NoOp,
+            TestMsg::NoOp,
+            TestMsg::NoOp,
+            TestMsg::NoOp,
+            TestMsg::NoOp,
+            TestMsg::NoOp,
+            TestMsg::NoOp,
+            |_| TestMsg::NoOp,
+            TestMsg::NoOp,
+            TestMsg::Tab,
+            TestMsg::Tab,
+            TestMsg::Tab,
+            TestMsg::Hover,
+            TestMsg::Scroll,
+            TestMsg::NoOp,
+            TestMsg::NoOp,
+            TestMsg::NoOp,
+            TestMsg::NoOp,
+            TestMsg::NoOp,
+            TestMsg::NoOp,
+            TestMsg::NoOp,
+        );
+    }
 }

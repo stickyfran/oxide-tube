@@ -607,6 +607,7 @@ pub struct OsdState {
     pub set_as_default_quality: bool,
     pub has_playback_error: bool,
     pub is_fully_buffered: bool,
+    pub is_live: bool,
 }
 
 impl Default for OsdState {
@@ -643,6 +644,7 @@ impl Default for OsdState {
             set_as_default_quality: true,
             has_playback_error: false,
             is_fully_buffered: false,
+            is_live: false,
         }
     }
 }
@@ -1190,7 +1192,11 @@ pub fn view_control_bar<'a, Message: Clone + 'static>(
             .unwrap_or(0)
     };
 
-    let time_str = if let Some(ratio) = state.hover_seek_ratio {
+    let is_live = state.is_live;
+
+    let time_str = if is_live {
+        "EN VIVO".to_string()
+    } else if let Some(ratio) = state.hover_seek_ratio {
         let hover_secs = ((ratio.clamp(0.0, 1.0)) * (effective_dur.max(1) as f32)) as u64;
         format!(
             "{} ({}) / {}",
@@ -1238,14 +1244,21 @@ pub fn view_control_bar<'a, Message: Clone + 'static>(
     .width(Length::Fill)
     .height(Length::Fixed(16.0));
 
-    let interactive_seek_bar: Element<'a, Message> = mouse_area(
+    let interactive_seek_bar: Element<'a, Message> = if is_live {
         container(pb_canvas)
             .width(Length::Fill)
-            .padding([2, 0]),
-    )
-    .interaction(iced::mouse::Interaction::Pointer)
-    .on_press(on_seek(target_secs))
-    .into();
+            .padding([2, 0])
+            .into()
+    } else {
+        mouse_area(
+            container(pb_canvas)
+                .width(Length::Fill)
+                .padding([2, 0]),
+        )
+        .interaction(iced::mouse::Interaction::Pointer)
+        .on_press(on_seek(target_secs))
+        .into()
+    };
 
     let play_icon_el = if state.is_playing {
         icon_pause(18.0)
@@ -1324,11 +1337,20 @@ pub fn view_control_bar<'a, Message: Clone + 'static>(
     .padding([6, 8])
     .on_press(on_toggle_fullscreen);
 
-    let mut time_items = row![
-        text(time_str).size(13).color(COLOR_TEXT_PRIMARY),
-    ]
-    .spacing(6)
-    .align_y(Alignment::Center);
+    let mut time_items = if is_live {
+        row![
+            text("●").size(10).color(COLOR_ACCENT_RED),
+            text("EN VIVO").size(13).color(COLOR_ACCENT_RED),
+        ]
+        .spacing(5)
+        .align_y(Alignment::Center)
+    } else {
+        row![
+            text(time_str).size(13).color(COLOR_TEXT_PRIMARY),
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center)
+    };
 
     if !state.is_fully_buffered {
         if state.is_buffering {

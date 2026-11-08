@@ -174,6 +174,8 @@ pub struct AppConfig {
     pub theme: AppTheme,
     #[serde(default)]
     pub incognito_mode: bool,
+    #[serde(default = "default_true")]
+    pub custom_titlebar: bool,
 }
 
 fn default_true() -> bool {
@@ -208,6 +210,7 @@ impl Default for AppConfig {
             home_columns: GridColumnsConfig::Cols4,
             theme: AppTheme::Dark,
             incognito_mode: false,
+            custom_titlebar: true,
         }
     }
 }

@@ -3,6 +3,7 @@ use tokio::sync::broadcast;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrayAction {
+    Toggle,
     Restore,
     PlayPause,
     Stop,
@@ -179,7 +180,7 @@ mod linux {
         }
 
         fn activate(&self, _x: i32, _y: i32) {
-            let _ = self.sender.send(TrayAction::Restore);
+            let _ = self.sender.send(TrayAction::Toggle);
         }
 
         fn secondary_activate(&self, _x: i32, _y: i32) {
@@ -651,7 +652,7 @@ mod windows {
                 let event = lparam as u32;
                 if event == WM_LBUTTONUP {
                     if let Some(tx) = SENDER.get() {
-                        let _ = tx.send(TrayAction::Restore);
+                        let _ = tx.send(TrayAction::Toggle);
                     }
                 } else if event == WM_RBUTTONUP {
                     let mut pt: POINT = std::mem::zeroed();

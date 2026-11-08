@@ -390,3 +390,85 @@ pub fn segmented_button(is_selected: bool) -> impl Fn(&iced::Theme, button::Stat
     }
 }
 
+#[allow(dead_code)]
+pub fn tab_select_button(_theme: &iced::Theme, _status: button::Status) -> button::Style {
+    button::Style {
+        background: Some(Color::TRANSPARENT.into()),
+        text_color: COLOR_TEXT_PRIMARY,
+        border: border::rounded(0),
+        ..button::Style::default()
+    }
+}
+
+pub fn tab_close_button(_theme: &iced::Theme, status: button::Status) -> button::Style {
+    match status {
+        button::Status::Hovered => button::Style {
+            background: Some(Color::from_rgba(1.0, 1.0, 1.0, 0.22).into()),
+            text_color: Color::WHITE,
+            border: border::rounded(12),
+            ..button::Style::default()
+        },
+        button::Status::Pressed => button::Style {
+            background: Some(Color::from_rgba(1.0, 0.25, 0.25, 0.45).into()),
+            text_color: Color::WHITE,
+            border: border::rounded(12),
+            ..button::Style::default()
+        },
+        _ => button::Style {
+            background: Some(Color::TRANSPARENT.into()),
+            text_color: COLOR_TEXT_SECONDARY,
+            border: border::rounded(12),
+            ..button::Style::default()
+        },
+    }
+}
+
+pub fn window_control_button(is_maximized: bool) -> impl Fn(&iced::Theme, button::Status) -> button::Style {
+    let radius = if is_maximized { 0 } else { 6 };
+    move |_theme, status| match status {
+        button::Status::Hovered => button::Style {
+            background: Some(Color::from_rgba(1.0, 1.0, 1.0, 0.13).into()),
+            text_color: COLOR_TEXT_PRIMARY,
+            border: border::rounded(radius),
+            ..button::Style::default()
+        },
+        button::Status::Pressed => button::Style {
+            background: Some(Color::from_rgba(1.0, 1.0, 1.0, 0.20).into()),
+            text_color: COLOR_TEXT_PRIMARY,
+            border: border::rounded(radius),
+            ..button::Style::default()
+        },
+        _ => button::Style {
+            background: Some(Color::TRANSPARENT.into()),
+            text_color: COLOR_TEXT_SECONDARY,
+            border: border::rounded(radius),
+            ..button::Style::default()
+        },
+    }
+}
+
+pub fn window_close_button(is_maximized: bool) -> impl Fn(&iced::Theme, button::Status) -> button::Style {
+    let radius = if is_maximized { 0 } else { 6 };
+    move |_theme, status| match status {
+        button::Status::Hovered => button::Style {
+            background: Some(Color::from_rgb8(0xe8, 0x11, 0x23).into()),
+            text_color: Color::WHITE,
+            border: border::rounded(radius),
+            ..button::Style::default()
+        },
+        button::Status::Pressed => button::Style {
+            background: Some(Color::from_rgb8(0xc5, 0x0f, 0x1f).into()),
+            text_color: Color::WHITE,
+            border: border::rounded(radius),
+            ..button::Style::default()
+        },
+        _ => button::Style {
+            background: Some(Color::TRANSPARENT.into()),
+            text_color: COLOR_TEXT_SECONDARY,
+            border: border::rounded(radius),
+            ..button::Style::default()
+        },
+    }
+}
+
+
