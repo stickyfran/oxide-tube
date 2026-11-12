@@ -126,9 +126,9 @@ fn nav_tab_button<'a, Message: Clone + 'static>(
 /// the header does not become excessively tall.
 pub fn tab_pill_height(custom_titlebar: bool, is_maximized: bool, two_rows: bool) -> f32 {
     let fitts_top = custom_titlebar && is_maximized;
-    let base = if fitts_top { 44.0 } else { 38.0 };
+    let base: f32 = if fitts_top { 44.0 } else { 38.0 };
     if two_rows {
-        (base - 6.0).max(30.0)
+        (base - 6.0).max(30.0_f32)
     } else {
         base
     }
