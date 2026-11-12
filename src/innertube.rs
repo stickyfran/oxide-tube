@@ -131,6 +131,8 @@ pub struct WatchDetails {
     pub live_chat_continuation: Option<String>,
     pub recommended_videos: Vec<VideoCard>,
     pub comments: Vec<CommentItem>,
+    #[serde(default)]
+    pub comments_continuation: Option<String>,
     pub video_streams: Vec<StreamQuality>,
     pub audio_streams: Vec<StreamQuality>,
     pub caption_tracks: Vec<CaptionTrack>,
@@ -286,6 +288,67 @@ impl InnerTubeClient {
             Ok(v) => Ok(v),
             Err(_) => Ok(serde_json::from_slice::<Value>(&buf)?),
         }
+    }
+
+    /// Performs a JSON POST with a hard end-to-end timeout, including the body
+    /// read. This prevents a connected-but-stalled YouTube request from
+    /// blocking video startup indefinitely.
+    async fn post_json_timed(
+        client: &reqwest::Client,
+        url: &str,
+        headers: HeaderMap,
+        body: &Value,
+        timeout: Duration,
+    ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+        let future = async {
+            let resp = client.post(url).headers(headers).json(body).send().await?;
+            Self::resp_simd_json(resp).await
+        };
+
+        match tokio::time::timeout(timeout, future).await {
+            Ok(result) => result,
+            Err(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("InnerTube request timed out after {}s", timeout.as_secs()),
+            )
+            .into()),
+        }
+    }
+
+    /// Look up Return YouTube Dislike counters without blocking playback.
+    pub async fn get_ryd_counts(&self, video_id: &str) -> (String, String) {
+        let ryd_url = format!("https://returnyoutubedislikeapi.com/votes?videoId={video_id}");
+        let request = async {
+            let resp = self
+                .client
+                .get(&ryd_url)
+                .header(USER_AGENT, USER_AGENT_STR)
+                .send()
+                .await
+                .ok()?;
+            if !resp.status().is_success() {
+                return None;
+            }
+            Self::resp_simd_json(resp).await.ok()
+        };
+
+        let json = match tokio::time::timeout(Duration::from_millis(900), request).await {
+            Ok(Some(json)) => json,
+            _ => return (String::new(), String::new()),
+        };
+
+        let dislikes = json
+            .get("dislikes")
+            .and_then(|v| v.as_u64())
+            .map(Self::format_compact_count)
+            .unwrap_or_default();
+        let likes = json
+            .get("likes")
+            .and_then(|v| v.as_u64())
+            .filter(|&l| l > 0)
+            .map(Self::format_compact_count)
+            .unwrap_or_default();
+        (dislikes, likes)
     }
 
     async fn capture_visitor_data(&self, json_val: &Value) {
@@ -1541,36 +1604,6 @@ impl InnerTubeClient {
         let is_bot = self.bot_detected.load(Ordering::Relaxed);
 
         // Fetch dislikes (and fallback likes count) concurrently in background with a tight timeout
-        let ryd_client = self.client.clone();
-        let ryd_vid = video_id.to_string();
-        let ryd_handle = tokio::spawn(async move {
-            let ryd_url = format!("https://returnyoutubedislikeapi.com/votes?videoId={ryd_vid}");
-            if let Ok(Ok(ryd_resp)) = tokio::time::timeout(
-                Duration::from_millis(1000),
-                ryd_client.get(&ryd_url).header(USER_AGENT, USER_AGENT_STR).send(),
-            )
-            .await
-            {
-                if ryd_resp.status().is_success() {
-                    if let Ok(ryd_json) = Self::resp_simd_json(ryd_resp).await {
-                        let d_str = ryd_json
-                            .get("dislikes")
-                            .and_then(|v| v.as_u64())
-                            .map(Self::format_compact_count)
-                            .unwrap_or_default();
-                        let l_str = ryd_json
-                            .get("likes")
-                            .and_then(|v| v.as_u64())
-                            .filter(|&l| l > 0)
-                            .map(Self::format_compact_count)
-                            .unwrap_or_default();
-                        return (d_str, l_str);
-                    }
-                }
-            }
-            (String::new(), String::new())
-        });
-
         let next_url = format!("{YOUTUBE_ORIGIN}/youtubei/v1/next?prettyPrint=false");
         let next_body = serde_json::json!({
             "context": Self::innertube_context(),
@@ -1619,15 +1652,28 @@ impl InnerTubeClient {
         // Note: Do NOT add Authorization header to VISIONOS player requests.
         // Google's VisionOS client rejects web SAPISIDHASH signatures with HTTP 400 INVALID_ARGUMENT.
 
+        let request_timeout = Duration::from_secs(6);
         let (next_json, mut player_json): (Value, Value) = if is_bot {
-            let next_resp = self.client.post(&next_url).headers(headers).json(&next_body).send().await?;
-            let n_json: Value = Self::resp_simd_json(next_resp).await?;
+            let n_json = Self::post_json_timed(
+                &self.client,
+                &next_url,
+                headers,
+                &next_body,
+                request_timeout,
+            )
+            .await?;
             self.capture_visitor_data(&n_json).await;
             (n_json, Value::Null)
         } else if visitor_data.is_empty() {
             // Must fetch /next first to obtain visitorData required by VISIONOS
-            let next_resp = self.client.post(&next_url).headers(headers).json(&next_body).send().await?;
-            let n_json: Value = Self::resp_simd_json(next_resp).await?;
+            let n_json = Self::post_json_timed(
+                &self.client,
+                &next_url,
+                headers,
+                &next_body,
+                request_timeout,
+            )
+            .await?;
             self.capture_visitor_data(&n_json).await;
             let fresh_vd = self.visitor_data.read().await.clone();
             if !fresh_vd.is_empty() {
@@ -1640,24 +1686,38 @@ impl InnerTubeClient {
                 "context": { "client": client_obj },
                 "videoId": video_id
             });
-            let p_res = self.client.post(&player_url).headers(player_headers).json(&player_body_fresh).send().await;
-            let p_json = match p_res {
-                Ok(r) => Self::resp_simd_json(r).await.unwrap_or(Value::Null),
-                Err(_) => Value::Null,
-            };
+            let p_json = Self::post_json_timed(
+                &self.client,
+                &player_url,
+                player_headers,
+                &player_body_fresh,
+                request_timeout,
+            )
+            .await
+            .unwrap_or(Value::Null);
             (n_json, p_json)
         } else {
-            let (next_res, player_res) = tokio::join!(
-                self.client.post(&next_url).headers(headers).json(&next_body).send(),
-                self.client.post(&player_url).headers(player_headers.clone()).json(&player_body).send(),
+            let (n_json_res, p_json_res) = tokio::join!(
+                Self::post_json_timed(
+                    &self.client,
+                    &next_url,
+                    headers,
+                    &next_body,
+                    request_timeout,
+                ),
+                Self::post_json_timed(
+                    &self.client,
+                    &player_url,
+                    player_headers,
+                    &player_body,
+                    request_timeout,
+                ),
             );
-            let next_resp = next_res?;
-            let n_json: Value = Self::resp_simd_json(next_resp).await?;
-            self.capture_visitor_data(&n_json).await;
-            let p_json = match player_res {
-                Ok(r) => Self::resp_simd_json(r).await.unwrap_or(Value::Null),
-                Err(_) => Value::Null,
-            };
+            let n_json = n_json_res.unwrap_or(Value::Null);
+            if !n_json.is_null() {
+                self.capture_visitor_data(&n_json).await;
+            }
+            let p_json = p_json_res.unwrap_or(Value::Null);
             (n_json, p_json)
         };
 
@@ -1940,15 +2000,10 @@ impl InnerTubeClient {
         }
 
         // Extract Title, Channel, Likes, Description from next_json & player_json
-        let (title, channel_name, channel_id, channel_avatar, subscriber_count, mut likes_str, description, is_live, is_subscribed, like_status, published_date, views_str) =
+        let (title, channel_name, channel_id, channel_avatar, subscriber_count, likes_str, description, is_live, is_subscribed, like_status, published_date, views_str) =
             Self::parse_video_metadata(&next_json, &player_json);
 
-        // Await the concurrent dislikes/likes lookup started earlier
-        let (ryd_dislikes, ryd_likes) = ryd_handle.await.unwrap_or_default();
-        let dislikes_str = ryd_dislikes;
-        if (likes_str.is_empty() || likes_str == "Me gusta") && !ryd_likes.is_empty() {
-            likes_str = ryd_likes;
-        }
+        let dislikes_str = String::new();
 
         // Extract Live Chat continuation token
         let live_chat_continuation = next_json
@@ -1974,20 +2029,14 @@ impl InnerTubeClient {
             Self::collect_video_cards(secondary, &mut recommended_videos);
         }
 
-        // Extract top comments (try direct first, fallback to continuation token with timeout)
-        let mut comments = Self::parse_comments(&next_json);
-        if comments.is_empty() {
-            if let Some(token) = Self::extract_comment_continuation(&next_json) {
-                if let Ok(Ok(fetched)) = tokio::time::timeout(
-                    Duration::from_millis(750),
-                    self.get_comments_by_continuation(&token),
-                )
-                .await
-                {
-                    comments = fetched;
-                }
-            }
-        }
+        // Extract top comments (already present in the initial /next response).
+        // The continuation fetch is deferred so it never blocks video startup.
+        let comments = Self::parse_comments(&next_json);
+        let comments_continuation = if comments.is_empty() {
+            Self::extract_comment_continuation(&next_json)
+        } else {
+            None
+        };
 
         let mut chapters = Self::extract_chapters(&next_json, &description);
         if chapters.is_empty() {
@@ -2028,6 +2077,7 @@ impl InnerTubeClient {
             live_chat_continuation,
             recommended_videos,
             comments,
+            comments_continuation,
             video_streams,
             audio_streams,
             caption_tracks,

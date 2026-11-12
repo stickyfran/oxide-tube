@@ -464,7 +464,7 @@ impl WaylandZeroCopyPlayer {
                 (c"load-auto-profiles", c"no"),
                 (c"sub-auto", c"no"),
                 (c"audio-file-auto", c"no"),
-                (c"network-timeout", c"15"),
+                (c"network-timeout", c"8"),
                 (c"demuxer-max-bytes", c"25165824"),       // 24 MB forward buffer (<=1080p default; scales up dynamically for 1440p/4K/8K)
                 (c"demuxer-max-back-bytes", c"8388608"),   // 8 MB backward cache for instant reverse seek
                 (c"demuxer-readahead-secs", c"30"),        // 30 seconds readahead to absorb network jitter

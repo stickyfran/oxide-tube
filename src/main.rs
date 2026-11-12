@@ -126,6 +126,8 @@ pub enum Message {
     ToggleCaptions,
     SelectCaptionTrack(Option<usize>),
     CaptionsLoaded(String, Result<Vec<innertube::SubtitleCue>, String>),
+    CommentsLoaded(u64, String, Result<Vec<innertube::CommentItem>, String>),
+    RydCountsLoaded(String, String, String),
     ToggleTheater,
     ToggleFullscreen,
     TogglePip,
@@ -354,6 +356,7 @@ pub struct MitubApp {
     live_chat_poll_tick: u32,
     playing_video_id: Option<String>,
     video_started_at: Option<std::time::Instant>,
+    playback_retry_count: u8,
     recently_autoplayed: Vec<String>,
     description_content: iced::widget::text_editor::Content,
     last_snapshot_frame_ids: HashMap<String, u64>,
@@ -997,9 +1000,12 @@ fn start_full_buffer_task(
     initial_title: String,
     known_streams: Option<(String, Option<String>)>,
 ) -> Task<Message> {
+    static FULL_BUFFER_SEM: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
     Task::run(
         iced::stream::channel(100, move |mut output: iced::futures::channel::mpsc::Sender<Message>| async move {
             use iced::futures::SinkExt;
+
+            let _download_permit = FULL_BUFFER_SEM.acquire().await;
 
             let cache_dir = crate::cache_manager::video_cache_dir();
             let _ = tokio::fs::create_dir_all(&cache_dir).await;
@@ -1072,9 +1078,9 @@ fn start_full_buffer_task(
             let has_separate_audio = a_url.is_some();
             let v_range = if has_separate_audio { (3u8, 75u8) } else { (3u8, 98u8) };
 
-            // Helper function to download an HTTP resource using Range Chunking (8 MB chunks)
-            // This bypasses YouTube CDN's aggressive bandwidth throttling (400 KB/s -> 4-10 MB/s)
-            // and provides resilient resume capabilities if a chunk drops.
+            // Downloads a stream with small ranged requests and streams the
+            // body straight to disk. This keeps the UI informed from the first
+            // received bytes and lets us recover from stalled CDN connections.
             let download_stream_chunked = |stream_url: String,
                                            part_path: PathBuf,
                                            dest_path: PathBuf,
@@ -1086,44 +1092,9 @@ fn start_full_buffer_task(
                                            vid_id: String| {
                 let http_client = client.clone();
                 async move {
-                    use iced::futures::SinkExt;
+                    use iced::futures::StreamExt;
                     use tokio::io::AsyncWriteExt;
 
-                    // 1. Determine total stream size via HEAD or initial byte probe
-                    let mut total_size: u64 = 0;
-                    if let Ok(head_resp) = http_client
-                        .head(&stream_url)
-                        .header(reqwest::header::REFERER, "https://www.youtube.com/")
-                        .header(reqwest::header::ORIGIN, "https://www.youtube.com")
-                        .send()
-                        .await
-                    {
-                        if head_resp.status().is_success() {
-                            total_size = head_resp.content_length().unwrap_or(0);
-                        }
-                    }
-
-                    if total_size == 0 {
-                        // Fallback: request byte 0-0 to extract Content-Range total length
-                        if let Ok(probe_resp) = http_client
-                            .get(&stream_url)
-                            .header(reqwest::header::REFERER, "https://www.youtube.com/")
-                            .header(reqwest::header::ORIGIN, "https://www.youtube.com")
-                            .header(reqwest::header::RANGE, "bytes=0-0")
-                            .send()
-                            .await
-                        {
-                            if let Some(range_header) = probe_resp.headers().get(reqwest::header::CONTENT_RANGE) {
-                                if let Ok(s) = range_header.to_str() {
-                                    if let Some((_, total_str)) = s.split_once('/') {
-                                        total_size = total_str.trim().parse::<u64>().unwrap_or(0);
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    // Open file in append/create mode so we can resume chunks cleanly
                     let mut file = tokio::fs::OpenOptions::new()
                         .create(true)
                         .write(true)
@@ -1132,127 +1103,240 @@ fn start_full_buffer_task(
                         .await
                         .map_err(|e| e.to_string())?;
 
-                    let existing_len = file.metadata().await.map(|m| m.len()).unwrap_or(0);
-                    let mut downloaded = existing_len;
+                    let mut downloaded = file.metadata().await.map(|m| m.len()).unwrap_or(0);
+                    let mut total_size: u64 = 0;
 
-                    let mut last_pct = pct_start;
                     let mut last_speed_time = std::time::Instant::now();
                     let mut last_speed_bytes: u64 = downloaded;
                     let mut current_speed_bps: u64 = 0;
                     let mut last_emit_time = std::time::Instant::now();
+                    let mut failed_attempts: u32 = 0;
 
-                    const CHUNK_SIZE: u64 = 8 * 1024 * 1024; // 8 MB chunks for peak CDN throughput
+                    // Smaller chunks start producing progress almost
+                    // immediately even when YouTube throttles the CDN.
+                    const CHUNK_SIZE: u64 = 2 * 1024 * 1024;
 
-                    if total_size > 0 && downloaded < total_size {
-                        while downloaded < total_size {
-                            let chunk_end = (downloaded + CHUNK_SIZE - 1).min(total_size - 1);
-                            let range_header = format!("bytes={downloaded}-{chunk_end}");
-
-                            let mut chunk_success = false;
-                            for retry in 0..3 {
-                                match http_client
-                                    .get(&stream_url)
-                                    .header(reqwest::header::REFERER, "https://www.youtube.com/")
-                                    .header(reqwest::header::ORIGIN, "https://www.youtube.com")
-                                    .header(reqwest::header::RANGE, &range_header)
-                                    .send()
-                                    .await
-                                {
-                                    Ok(resp) if resp.status().is_success() || resp.status() == reqwest::StatusCode::PARTIAL_CONTENT => {
-                                        match resp.bytes().await {
-                                            Ok(bytes) => {
-                                                file.write_all(&bytes).await.map_err(|e| e.to_string())?;
-                                                downloaded += bytes.len() as u64;
-                                                chunk_success = true;
-                                                break;
-                                            }
-                                            Err(e) => {
-                                                eprintln!("[Mitub Download] Retry {retry} read chunk error: {e}");
-                                            }
-                                        }
-                                    }
-                                    Ok(resp) => {
-                                        eprintln!("[Mitub Download] Retry {retry} chunk status error: {}", resp.status());
-                                    }
-                                    Err(e) => {
-                                        eprintln!("[Mitub Download] Retry {retry} network error: {e}");
-                                    }
-                                }
-                                tokio::time::sleep(tokio::time::Duration::from_millis(500 * (retry + 1))).await;
-                            }
-
-                            if !chunk_success {
-                                return Err(format!("Fallo persistente de descarga en bloque {range_header}"));
-                            }
-
-                            let now = std::time::Instant::now();
-                            let elapsed_speed = now.duration_since(last_speed_time).as_secs_f64();
-                            if elapsed_speed >= 0.3 {
-                                let diff = downloaded.saturating_sub(last_speed_bytes);
-                                current_speed_bps = (diff as f64 / elapsed_speed) as u64;
-                                last_speed_bytes = downloaded;
-                                last_speed_time = now;
-                            }
-
-                            let p = pct_start as f32
-                                + (downloaded as f32 / total_size as f32) * (pct_end - pct_start) as f32;
-                            let p_u8 = p.clamp(pct_start as f32, pct_end as f32) as u8;
-                            if p_u8 > last_pct || now.duration_since(last_emit_time).as_millis() >= 300 {
-                                last_pct = p_u8;
-                                last_emit_time = now;
-                                let _ = out_sender.send(Message::FullBufferProgress(
-                                    vid_id.clone(),
-                                    p_u8,
-                                    base_downloaded + downloaded,
-                                    total_file_offset + total_size,
-                                    current_speed_bps,
-                                )).await;
-                            }
+                    loop {
+                        if total_size > 0 && downloaded >= total_size {
+                            break;
                         }
-                    } else if total_size == 0 {
-                        // Fallback stream when server does not provide content-range / content-length
-                        use iced::futures::StreamExt;
-                        let resp = http_client
+                        if failed_attempts >= 6 {
+                            return Err(format!(
+                                "No se pudo continuar la descarga desde el byte {downloaded}"
+                            ));
+                        }
+
+                        let range_end = if total_size > 0 {
+                            (downloaded + CHUNK_SIZE - 1).min(total_size - 1)
+                        } else {
+                            downloaded + CHUNK_SIZE - 1
+                        };
+                        let range_header = format!("bytes={downloaded}-{range_end}");
+                        let chunk_start = downloaded;
+                        let requested_len = range_end - chunk_start + 1;
+
+                        let response = http_client
                             .get(&stream_url)
                             .header(reqwest::header::REFERER, "https://www.youtube.com/")
                             .header(reqwest::header::ORIGIN, "https://www.youtube.com")
+                            .header(reqwest::header::RANGE, &range_header)
                             .send()
-                            .await
-                            .map_err(|e| e.to_string())?;
+                            .await;
 
-                        if !resp.status().is_success() {
-                            return Err(format!("HTTP {}", resp.status()));
+                        let resp = match response {
+                            Ok(resp)
+                                if resp.status().is_success()
+                                    || resp.status() == reqwest::StatusCode::PARTIAL_CONTENT =>
+                            {
+                                resp
+                            }
+                            Ok(resp)
+                                if resp.status() == reqwest::StatusCode::RANGE_NOT_SATISFIABLE =>
+                            {
+                                total_size = downloaded;
+                                break;
+                            }
+                            Ok(resp) => {
+                                failed_attempts += 1;
+                                eprintln!(
+                                    "[Mitub Download] HTTP {} para {vid_id}; reintentando",
+                                    resp.status()
+                                );
+                                tokio::time::sleep(tokio::time::Duration::from_millis(
+                                    300 * failed_attempts as u64,
+                                ))
+                                .await;
+                                continue;
+                            }
+                            Err(e) => {
+                                failed_attempts += 1;
+                                eprintln!(
+                                    "[Mitub Download] Error de red para {vid_id}: {e}; reintentando"
+                                );
+                                tokio::time::sleep(tokio::time::Duration::from_millis(
+                                    300 * failed_attempts as u64,
+                                ))
+                                .await;
+                                continue;
+                            }
+                        };
+
+                        let response_status = resp.status();
+
+                        // Learn the total size from the first ranged response
+                        // instead of paying for a separate HEAD request.
+                        if total_size == 0 {
+                            if let Some(content_range) = resp
+                                .headers()
+                                .get(reqwest::header::CONTENT_RANGE)
+                                .and_then(|v| v.to_str().ok())
+                            {
+                                if let Some((_, total_str)) = content_range.split_once('/') {
+                                    total_size = total_str.trim().parse::<u64>().unwrap_or(0);
+                                }
+                            }
+                            if total_size == 0 && response_status == reqwest::StatusCode::OK {
+                                if let Some(len) = resp.content_length() {
+                                    total_size = chunk_start + len;
+                                }
+                            }
                         }
+
                         let mut stream = resp.bytes_stream();
-                        while let Some(chunk_res) = stream.next().await {
-                            let chunk = chunk_res.map_err(|e| e.to_string())?;
-                            file.write_all(&chunk).await.map_err(|e| e.to_string())?;
-                            downloaded += chunk.len() as u64;
+                        let mut wrote_any = false;
+                        let mut read_error: Option<String> = None;
 
-                            let now = std::time::Instant::now();
-                            let elapsed_speed = now.duration_since(last_speed_time).as_secs_f64();
-                            if elapsed_speed >= 0.3 {
-                                let diff = downloaded.saturating_sub(last_speed_bytes);
-                                current_speed_bps = (diff as f64 / elapsed_speed) as u64;
-                                last_speed_bytes = downloaded;
-                                last_speed_time = now;
-                            }
+                        loop {
+                            let next = tokio::time::timeout(
+                                std::time::Duration::from_secs(10),
+                                stream.next(),
+                            )
+                            .await;
 
-                            if now.duration_since(last_emit_time).as_millis() >= 300 {
-                                last_emit_time = now;
-                                let _ = out_sender.send(Message::FullBufferProgress(
-                                    vid_id.clone(),
-                                    pct_end,
-                                    base_downloaded + downloaded,
-                                    base_downloaded + downloaded,
-                                    current_speed_bps,
-                                )).await;
+                            match next {
+                                Err(_) => {
+                                    read_error = Some("timeout leyendo datos".to_string());
+                                    break;
+                                }
+                                Ok(None) => break,
+                                Ok(Some(Err(e))) => {
+                                    read_error = Some(e.to_string());
+                                    break;
+                                }
+                                Ok(Some(Ok(bytes))) => {
+                                    if bytes.is_empty() {
+                                        continue;
+                                    }
+                                    file.write_all(&bytes).await.map_err(|e| e.to_string())?;
+                                    downloaded += bytes.len() as u64;
+                                    wrote_any = true;
+
+                                    let now = std::time::Instant::now();
+                                    let elapsed_speed =
+                                        now.duration_since(last_speed_time).as_secs_f64();
+                                    if elapsed_speed >= 0.3 {
+                                        let diff = downloaded.saturating_sub(last_speed_bytes);
+                                        current_speed_bps =
+                                            (diff as f64 / elapsed_speed) as u64;
+                                        last_speed_bytes = downloaded;
+                                        last_speed_time = now;
+                                    }
+
+                                    if now.duration_since(last_emit_time).as_millis() >= 200 {
+                                        last_emit_time = now;
+                                        let p = if total_size > 0 {
+                                            pct_start as f32
+                                                + (downloaded as f32 / total_size as f32)
+                                                    * (pct_end - pct_start) as f32
+                                        } else {
+                                            pct_start as f32
+                                        };
+                                        let p_u8 = p
+                                            .clamp(pct_start as f32, pct_end as f32)
+                                            as u8;
+                                        let total_display = if total_size > 0 {
+                                            total_file_offset + total_size
+                                        } else {
+                                            0
+                                        };
+                                        let _ = out_sender
+                                            .send(Message::FullBufferProgress(
+                                                vid_id.clone(),
+                                                p_u8,
+                                                base_downloaded + downloaded,
+                                                total_display,
+                                                current_speed_bps,
+                                            ))
+                                            .await;
+                                    }
+
+                                    if total_size > 0 && downloaded >= total_size {
+                                        break;
+                                    }
+                                }
                             }
                         }
+
+                        if let Some(err) = read_error {
+                            if wrote_any {
+                                failed_attempts = 0;
+                            } else {
+                                failed_attempts += 1;
+                            }
+                            eprintln!(
+                                "[Mitub Download] {vid_id}: {err}; continuando desde {downloaded}"
+                            );
+                            tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
+                            continue;
+                        }
+
+                        if total_size > 0 && downloaded >= total_size {
+                            break;
+                        }
+
+                        if total_size == 0 {
+                            // No Content-Range: a 200 response means the full
+                            // remaining file was delivered. A 206 response is
+                            // followed by another ranged request if this chunk
+                            // was complete.
+                            if response_status != reqwest::StatusCode::PARTIAL_CONTENT {
+                                break;
+                            }
+                            if downloaded.saturating_sub(chunk_start) < requested_len {
+                                break;
+                            }
+                        }
+
+                        if !wrote_any {
+                            failed_attempts += 1;
+                            tokio::time::sleep(tokio::time::Duration::from_millis(400)).await;
+                            continue;
+                        }
+
+                        failed_attempts = 0;
                     }
 
                     file.flush().await.map_err(|e| e.to_string())?;
-                    tokio::fs::rename(&part_path, &dest_path).await.map_err(|e| e.to_string())?;
+
+                    let p = pct_end as f32;
+                    let total_display = if total_size > 0 {
+                        total_file_offset + total_size
+                    } else {
+                        base_downloaded + downloaded
+                    };
+                    let _ = out_sender
+                        .send(Message::FullBufferProgress(
+                            vid_id.clone(),
+                            p as u8,
+                            base_downloaded + downloaded,
+                            total_display,
+                            current_speed_bps,
+                        ))
+                        .await;
+
+                    tokio::fs::rename(&part_path, &dest_path)
+                        .await
+                        .map_err(|e| e.to_string())?;
                     Ok::<u64, String>(downloaded)
                 }
             };
@@ -1502,6 +1586,7 @@ impl MitubApp {
             live_chat_poll_tick: 0,
             playing_video_id: None,
             video_started_at: None,
+            playback_retry_count: 0,
             recently_autoplayed: Vec::new(),
             description_content: iced::widget::text_editor::Content::new(),
             last_snapshot_frame_ids: HashMap::new(),
@@ -1690,6 +1775,7 @@ impl MitubApp {
                 live_chat_continuation: None,
                 recommended_videos: Vec::new(),
                 comments: Vec::new(),
+                comments_continuation: None,
                 video_streams: Vec::new(),
                 audio_streams: Vec::new(),
                 caption_tracks: Vec::new(),
@@ -2425,6 +2511,7 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                                         }
                                         self.playing_video_id = Some(details.video_id.clone());
                                         self.video_started_at = Some(std::time::Instant::now());
+                                        self.playback_retry_count = 0;
                                         self.osd_state.is_playing = true;
                                         let _ = p_arc.play_stream_with_seek(&v_uri, a_uri.as_deref(), seek_target);
                                         self.sync_player_viewport();
@@ -2707,11 +2794,41 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                         if let Some(started_at) = self.video_started_at {
                             let elapsed = started_at.elapsed();
                             let has_err = player.has_error();
-                            let is_stalled = elapsed > Duration::from_secs(8)
+                            let is_stalled = elapsed > Duration::from_secs(5)
                                 && (!player.is_buffering() || player.buffering_percent() == 0);
 
                             if (has_err || is_stalled) && !self.osd_state.has_playback_error {
-                                if let Some(details) = &self.watch_details {
+                                // First attempt: reload the same stream once. This
+                                // recovers from a stalled CDN connection without
+                                // changing codec quality unnecessarily.
+                                if self.playback_retry_count == 0 {
+                                    if let Some(details) = &self.watch_details {
+                                        let cur_itag = self.osd_state.selected_quality_itag;
+                                        let current_stream = details
+                                            .video_streams
+                                            .iter()
+                                            .find(|s| s.itag == cur_itag)
+                                            .or_else(|| select_best_stream(&details.video_streams, &self.config));
+                                        if let Some(stream) = current_stream {
+                                            let v_uri = stream.playback_uri("v");
+                                            let a_uri = select_best_audio_stream(&details.audio_streams, self.config.preferred_audio_lang)
+                                                .map(|s| s.playback_uri("a"));
+                                            self.playback_retry_count = 1;
+                                            self.video_started_at = Some(std::time::Instant::now());
+                                            let seek_pos = if self.osd_state.current_pos_secs >= 1 {
+                                                Some(self.osd_state.current_pos_secs * 1000)
+                                            } else {
+                                                None
+                                            };
+                                            eprintln!("[Watchdog] Reiniciando stream por posible conexión CDN colgada");
+                                            if let Err(e) = player.play_stream_with_seek(&v_uri, a_uri.as_deref(), seek_pos) {
+                                                eprintln!("[Watchdog] Falló el reintento: {e}");
+                                            }
+                                        }
+                                    }
+                                } else if let Some(details) = &self.watch_details {
+                                    // Second attempt: switch to H.264 if the
+                                    // selected stream was AV1/VP9.
                                     let cur_itag = self.osd_state.selected_quality_itag;
                                     let is_av1_or_vp9 = details.video_streams.iter().any(|s| {
                                         s.itag == cur_itag
@@ -2730,6 +2847,7 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                                         let v_uri = stream.playback_uri("v");
                                         let a_uri = select_best_audio_stream(&details.audio_streams, self.config.preferred_audio_lang).map(|s| s.playback_uri("a"));
                                         self.video_started_at = Some(std::time::Instant::now());
+                                        self.playback_retry_count = 2;
                                         let seek_pos = if self.osd_state.current_pos_secs >= 1 {
                                             Some(self.osd_state.current_pos_secs * 1000)
                                         } else {
@@ -3030,6 +3148,7 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                 self.live_messages.clear();
                 self.playing_video_id = None;
                 self.video_started_at = None;
+                self.playback_retry_count = 0;
                 self.last_progress_pos_sec = 0;
 
                 self.previous_view = self.current_view.clone();
@@ -3102,6 +3221,7 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                     live_chat_continuation: None,
                     recommended_videos: existing_recs,
                     comments: Vec::new(),
+                comments_continuation: None,
                     video_streams: Vec::new(),
                     audio_streams: Vec::new(),
                     caption_tracks: Vec::new(),
@@ -3425,6 +3545,7 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                                         self.osd_state.is_playing = false;
                                         self.playing_video_id = Some(details.video_id.clone());
                                         self.video_started_at = None;
+                                        self.playback_retry_count = 0;
                                         if let Err(e) = player.play_stream_with_seek_paused(&video_uri, audio_uri.as_deref(), initial_seek_ms) {
                                             eprintln!("[Playback Error] failed to launch stream paused: {e}");
                                             self.osd_state.has_playback_error = true;
@@ -3433,6 +3554,7 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                                         self.osd_state.is_playing = true;
                                         self.playing_video_id = Some(details.video_id.clone());
                                         self.video_started_at = Some(std::time::Instant::now());
+                                        self.playback_retry_count = 0;
                                         if let Err(e) = player.play_stream_with_seek(&video_uri, audio_uri.as_deref(), initial_seek_ms) {
                                             eprintln!("[Playback Error] failed to launch stream: {e}");
                                             self.osd_state.has_playback_error = true;
@@ -3483,6 +3605,36 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                             if let Some(t) = self.queue_thumbnail_download(&details.channel_avatar) {
                                 tasks.push(t);
                             }
+                        }
+
+                        // Metadata enrichment runs after playback has already
+                        // been requested; it must never delay stream startup.
+                        if let Some(token) = details.comments_continuation.clone() {
+                            let it_comments = self.innertube.clone();
+                            let comments_vid = details.video_id.clone();
+                            let comments_request = req_id;
+                            tasks.push(Task::perform(
+                                async move {
+                                    let res = it_comments
+                                        .get_comments_by_continuation(&token)
+                                        .await
+                                        .map_err(|e| e.to_string());
+                                    (comments_vid, res)
+                                },
+                                move |(vid, res)| Message::CommentsLoaded(comments_request, vid, res),
+                            ));
+                        }
+                        {
+                            let it_ryd = self.innertube.clone();
+                            let ryd_vid = details.video_id.clone();
+                            let ryd_vid_task = ryd_vid.clone();
+                            tasks.push(Task::perform(
+                                async move {
+                                    let (dislikes, likes) = it_ryd.get_ryd_counts(&ryd_vid_task).await;
+                                    (ryd_vid, dislikes, likes)
+                                },
+                                |(vid, dislikes, likes)| Message::RydCountsLoaded(vid, dislikes, likes),
+                            ));
                         }
                         for (idx, video) in details.recommended_videos.iter().enumerate() {
                             let delay = if idx < 4 { 0 } else { 450 + (idx as u64) * 30 };
@@ -4265,6 +4417,7 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                 }
                 self.playing_video_id = None;
                 self.video_started_at = None;
+                self.playback_retry_count = 0;
                 self.osd_state.is_playing = false;
                 self.power_manager.set_screensaver_inhibit(false);
                 crate::power_manager::purge_working_set_on_idle();
@@ -4551,6 +4704,54 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                     Err(e) => {
                         eprintln!("[Captions] Error loading captions: {e}");
                         self.osd_state.selected_caption_lang = None;
+                    }
+                }
+                Task::none()
+            }
+
+            Message::CommentsLoaded(req_id, vid, res) => {
+                if req_id != self.current_request_id {
+                    return Task::none();
+                }
+                let mut avatar_urls = Vec::new();
+                if let Ok(comments) = res {
+                    if let Some(details) = &mut self.watch_details {
+                        if details.video_id == vid {
+                            Arc::make_mut(details).comments = comments;
+                            avatar_urls = details
+                                .comments
+                                .iter()
+                                .map(|c| c.author_avatar.clone())
+                                .filter(|u| !u.is_empty())
+                                .collect();
+                        }
+                    }
+                }
+                let mut tasks = Vec::new();
+                for url in avatar_urls {
+                    if let Some(t) = self.queue_thumbnail_download(&url) {
+                        tasks.push(t);
+                    }
+                }
+                if tasks.is_empty() {
+                    Task::none()
+                } else {
+                    Task::batch(tasks)
+                }
+            }
+
+            Message::RydCountsLoaded(vid, dislikes, likes) => {
+                if let Some(details) = &mut self.watch_details {
+                    if details.video_id == vid {
+                        let details = Arc::make_mut(details);
+                        if !dislikes.is_empty() {
+                            details.dislikes_str = dislikes;
+                        }
+                        if !likes.is_empty()
+                            && (details.likes_str.is_empty() || details.likes_str == "Me gusta")
+                        {
+                            details.likes_str = likes;
+                        }
                     }
                 }
                 Task::none()
@@ -5979,6 +6180,7 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                                 live_chat_continuation: None,
                                 recommended_videos: existing_recs,
                                 comments: Vec::new(),
+                comments_continuation: None,
                                 video_streams: Vec::new(),
                                 audio_streams: Vec::new(),
                                 caption_tracks: Vec::new(),
@@ -7072,14 +7274,15 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                     },
                 );
 
-                let known_streams = if let Some(details) = &self.watch_details {
-                    if details.video_id == video_id {
-                        let best = select_best_stream(&details.video_streams, &self.config);
-                        let audio = select_best_audio_stream(&details.audio_streams, self.config.preferred_audio_lang);
-                        best.map(|v| (v.url.clone(), audio.map(|a| a.url.clone())))
-                    } else {
-                        None
-                    }
+                let details_opt = self
+                    .watch_details
+                    .as_ref()
+                    .filter(|d| d.video_id == video_id)
+                    .or_else(|| self.tab_details_cache.get(&video_id));
+                let known_streams = if let Some(details) = details_opt {
+                    let best = select_best_stream(&details.video_streams, &self.config);
+                    let audio = select_best_audio_stream(&details.audio_streams, self.config.preferred_audio_lang);
+                    best.map(|v| (v.url.clone(), audio.map(|a| a.url.clone())))
                 } else {
                     None
                 };
