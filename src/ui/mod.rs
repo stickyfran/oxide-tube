@@ -902,7 +902,7 @@ pub fn view_header_bar<'a, Message: Clone + 'static>(
             .height(Length::Fixed(arrow_height))
             .padding(0)
             .style(scroll_btn_style)
-            .on_press(on_scroll_tabs_left);
+            .on_press(on_scroll_tabs_left.clone());
 
             layers.push(
                 container(left_btn)
@@ -932,7 +932,7 @@ pub fn view_header_bar<'a, Message: Clone + 'static>(
             .height(Length::Fixed(arrow_height))
             .padding(0)
             .style(scroll_btn_style)
-            .on_press(on_scroll_tabs_right);
+            .on_press(on_scroll_tabs_right.clone());
 
             layers.push(
                 container(right_btn)
@@ -1011,7 +1011,7 @@ pub fn view_header_bar<'a, Message: Clone + 'static>(
                     .height(Length::Fixed(arrow_height))
                     .padding(0)
                     .style(scroll_btn_style)
-                    .on_press(on_scroll_tabs_left);
+                    .on_press(on_scroll_tabs_left.clone());
 
                     row1_layers.push(
                         container(left_btn)
@@ -1035,7 +1035,7 @@ pub fn view_header_bar<'a, Message: Clone + 'static>(
                     .height(Length::Fixed(arrow_height))
                     .padding(0)
                     .style(scroll_btn_style)
-                    .on_press(on_scroll_tabs_right);
+                    .on_press(on_scroll_tabs_right.clone());
 
                     row1_layers.push(
                         container(right_btn)
