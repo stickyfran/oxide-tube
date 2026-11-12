@@ -215,6 +215,7 @@ pub enum Message {
     CloseMainWindow,
     StartMainWindowResize(PipResizeEdge),
     ToggleCustomTitlebar,
+    ToggleTabTwoRows,
 }
 
 #[derive(Debug, Clone)]
@@ -365,6 +366,7 @@ pub struct MitubApp {
     closed_tabs_history: std::collections::VecDeque<ui::VideoTab>,
     tabs_scroll_x: f32,
     tabs_max_scroll_x: f32,
+    tabs_viewport_width: f32,
     last_memory_trim: std::time::Instant,
     inactive_tab_osd_state: OsdState,
     auto_pip_triggered_by_unfocus: bool,
@@ -1509,6 +1511,7 @@ impl MitubApp {
             closed_tabs_history: std::collections::VecDeque::with_capacity(5),
             tabs_scroll_x: 0.0,
             tabs_max_scroll_x: 0.0,
+            tabs_viewport_width: 0.0,
             last_memory_trim: std::time::Instant::now(),
             inactive_tab_osd_state: OsdState::default(),
             auto_pip_triggered_by_unfocus: false,
@@ -2111,6 +2114,63 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
             }
         }
         16.0 / 9.0
+    }
+
+    fn header_height(&self) -> f32 {
+        let two_rows = self.config.tab_two_rows && !self.tabs.is_empty();
+        ui::header_height(self.config.custom_titlebar, self.is_maximized, two_rows)
+    }
+
+    /// Approximate horizontal scroll offset that keeps the tab at `idx`
+    /// visible, taking the optional two-row layout into account.
+    fn tab_scroll_target(&self, idx: usize) -> f32 {
+        if self.tabs.is_empty() || idx >= self.tabs.len() {
+            return 0.0;
+        }
+        if !self.config.tab_two_rows {
+            return (idx as f32 * 190.0).max(0.0);
+        }
+
+        let is_authed = self.auth_status.starts_with("[OK]");
+        let available = ui::tabs_available_width(
+            self.window_size.0,
+            self.current_search_bar_width(),
+            is_authed,
+            self.user_display_name.is_some(),
+            self.config.custom_titlebar,
+        );
+        let (row0, row1) = ui::split_tabs_into_rows(
+            &self.tabs,
+            available,
+            self.playing_video_id.as_deref(),
+            self.osd_state.is_playing,
+        );
+        let (indices, pos) = if let Some(p) = row0.iter().position(|i| *i == idx) {
+            (&row0, p)
+        } else if let Some(p) = row1.iter().position(|i| *i == idx) {
+            (&row1, p)
+        } else {
+            return 0.0;
+        };
+
+        let mut before = 0.0;
+        for (n, tab_idx) in indices.iter().enumerate() {
+            if n >= pos {
+                break;
+            }
+            let tab = &self.tabs[*tab_idx];
+            let playing = self.osd_state.is_playing
+                && !tab.video_id.is_empty()
+                && self.playing_video_id.as_deref() == Some(tab.video_id.as_str());
+            before += ui::estimate_tab_width(&tab.title, playing) + 6.0;
+        }
+
+        let tab = &self.tabs[idx];
+        let playing = self.osd_state.is_playing
+            && !tab.video_id.is_empty()
+            && self.playing_video_id.as_deref() == Some(tab.video_id.as_str());
+        let width = ui::estimate_tab_width(&tab.title, playing);
+        (before + width * 0.5 - available * 0.5).max(0.0)
     }
 
     fn current_search_bar_width(&self) -> f32 {
@@ -3926,6 +3986,7 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
 
             Message::TabsScrolled(viewport) => {
                 self.tabs_scroll_x = viewport.absolute_offset().x;
+                self.tabs_viewport_width = viewport.bounds().width;
                 let max_offset = (viewport.content_bounds().width - viewport.bounds().width).max(0.0);
                 self.tabs_max_scroll_x = max_offset;
                 Task::none()
@@ -5234,6 +5295,19 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                 Task::none()
             }
 
+            Message::ToggleTabTwoRows => {
+                self.config.tab_two_rows = !self.config.tab_two_rows;
+                self.config.save_async();
+                // Measurements from the single-row layout are no longer valid.
+                self.tabs_scroll_x = 0.0;
+                self.tabs_max_scroll_x = 0.0;
+                self.sync_player_viewport();
+                iced::widget::scrollable::scroll_to(
+                    iced::widget::scrollable::Id::new("tabs_scrollable"),
+                    iced::widget::scrollable::AbsoluteOffset { x: 0.0, y: 0.0 },
+                )
+            }
+
             Message::ToggleIncognito => {
                 self.config.incognito_mode = !self.config.incognito_mode;
                 self.innertube.set_incognito(self.config.incognito_mode);
@@ -5607,8 +5681,7 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
             Message::OpenVideoInNewTab(video_id) => {
                 if let Some(pos) = self.tabs.iter().position(|t| t.video_id == video_id) {
                     self.tab_shake_anim = Some((pos, std::time::Instant::now()));
-                    let tab_x = pos as f32 * 190.0;
-                    let target_scroll = (tab_x - 100.0).max(0.0);
+                    let target_scroll = self.tab_scroll_target(pos);
                     self.tabs_scroll_x = target_scroll;
                     return iced::widget::scrollable::scroll_to(
                         iced::widget::scrollable::Id::new("tabs_scrollable"),
@@ -5652,7 +5725,7 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                 });
                 self.tab_opened_anim = Some((new_idx, std::time::Instant::now()));
                 self.save_session();
-                let target_x = (new_idx as f32 * 145.0).max(0.0);
+                let target_x = self.tab_scroll_target(new_idx);
                 self.tabs_scroll_x = target_x;
                 let scroll_task = iced::widget::scrollable::scroll_to(
                     iced::widget::scrollable::Id::new("tabs_scrollable"),
@@ -5871,19 +5944,32 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
             }
 
             Message::ScrollTabsLeft => {
-                self.tabs_scroll_x = (self.tabs_scroll_x - 200.0).max(0.0);
-                iced::widget::scrollable::scroll_to(
+                let step = if self.tabs_viewport_width > 1.0 {
+                    (self.tabs_viewport_width * 0.78).clamp(180.0, 520.0)
+                } else {
+                    260.0
+                };
+                let delta = step.min(self.tabs_scroll_x.max(0.0));
+                if delta <= 0.0 {
+                    return Task::none();
+                }
+                self.tabs_scroll_x = (self.tabs_scroll_x - delta).max(0.0);
+                iced::widget::scrollable::scroll_by(
                     iced::widget::scrollable::Id::new("tabs_scrollable"),
-                    iced::widget::scrollable::AbsoluteOffset { x: self.tabs_scroll_x, y: 0.0 },
+                    iced::widget::scrollable::AbsoluteOffset { x: -delta, y: 0.0 },
                 )
             }
 
             Message::ScrollTabsRight => {
-                let max_scroll = self.tabs_max_scroll_x.max(self.tabs.len() as f32 * 190.0);
-                self.tabs_scroll_x = (self.tabs_scroll_x + 200.0).min(max_scroll);
-                iced::widget::scrollable::scroll_to(
+                let step = if self.tabs_viewport_width > 1.0 {
+                    (self.tabs_viewport_width * 0.78).clamp(180.0, 520.0)
+                } else {
+                    260.0
+                };
+                self.tabs_scroll_x += step;
+                iced::widget::scrollable::scroll_by(
                     iced::widget::scrollable::Id::new("tabs_scrollable"),
-                    iced::widget::scrollable::AbsoluteOffset { x: self.tabs_scroll_x, y: 0.0 },
+                    iced::widget::scrollable::AbsoluteOffset { x: step, y: 0.0 },
                 )
             }
 
@@ -5896,7 +5982,7 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                     self.tab_opened_anim = Some((new_idx, std::time::Instant::now()));
                     self.save_session();
 
-                    let target_x = (new_idx as f32 * 190.0).max(0.0);
+                    let target_x = self.tab_scroll_target(new_idx);
                     self.tabs_scroll_x = target_x;
                     let scroll_task = iced::widget::scrollable::scroll_to(
                         iced::widget::scrollable::Id::new("tabs_scrollable"),
@@ -5935,7 +6021,7 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                 self.sync_player_viewport();
 
                 let focus_task = iced::widget::text_input::focus(iced::widget::text_input::Id::new("main_search_input"));
-                let target_x = (new_idx as f32 * 190.0).max(0.0);
+                let target_x = self.tab_scroll_target(new_idx);
                 self.tabs_scroll_x = target_x;
                 let scroll_task = iced::widget::scrollable::scroll_to(
                     iced::widget::scrollable::Id::new("tabs_scrollable"),
@@ -6498,7 +6584,7 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                         if let Some(pos) = self.last_cursor_pos {
                             let cur_search_w = self.current_search_bar_width();
                             let in_suggestions = self.show_suggestions
-                                && pos.y >= 52.0
+                                && pos.y >= self.header_height()
                                 && pos.y <= 280.0
                                 && pos.x >= 168.0
                                 && pos.x <= 168.0 + cur_search_w.max(260.0);
@@ -6794,6 +6880,9 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                             return Task::none();
                         } else if Some(win_id) == self.main_window_id || self.main_window_id.is_none() {
                             self.window_size = (size.width, size.height);
+                            // Tab measurements are relative to the previous width.
+                            self.tabs_max_scroll_x = 0.0;
+                            self.tabs_viewport_width = 0.0;
                             if self.pip_window_id.is_none() {
                                 self.sync_player_viewport();
                             }
@@ -7149,24 +7238,24 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
         }
     }
 
-pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scroll_y: f32) -> (f32, f32, f32, f32) {
+pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scroll_y: f32, header_h: f32) -> (f32, f32, f32, f32) {
     if theater_mode {
         let h = ((win_w * 9.0 / 16.0).min(win_h * 0.7)).round();
-        let initial_y = 56.0;
+        let initial_y = header_h;
         let y = initial_y - scroll_y;
         (0.0, y, win_w, h)
     } else {
         let col_w = (((win_w - 56.0) * 0.75).max(480.0)).round();
         let max_h = (win_h - 140.0).max(360.0);
         let col_h = (((col_w * 9.0 / 16.0).min(max_h))).round();
-        let initial_y = 56.0 + 12.0;
+        let initial_y = header_h + 12.0;
         let y = initial_y - scroll_y;
         (24.0, y, col_w, col_h)
     }
 }
 
     fn get_windowed_player_rect(&self) -> (f32, f32, f32, f32) {
-        Self::calculate_player_geometry(self.window_size.0, self.window_size.1, self.theater_mode, self.watch_scroll_y)
+        Self::calculate_player_geometry(self.window_size.0, self.window_size.1, self.theater_mode, self.watch_scroll_y, self.header_height())
     }
 
     fn sync_player_viewport(&self) {
@@ -7888,6 +7977,7 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
             self.window_size.0,
             self.tabs_scroll_x,
             self.tabs_max_scroll_x,
+            self.config.tab_two_rows,
             self.config.custom_titlebar,
             self.is_maximized,
             Message::SearchInputChanged,
@@ -8022,7 +8112,7 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
                 let (_, _, col_w, col_h) = if self.is_fullscreen {
                     (0.0, 0.0, self.window_size.0, self.window_size.1)
                 } else {
-                    Self::calculate_player_geometry(self.window_size.0, self.window_size.1, self.theater_mode, 0.0)
+                    Self::calculate_player_geometry(self.window_size.0, self.window_size.1, self.theater_mode, 0.0, self.header_height())
                 };
                 let viewport_w = col_w as u16;
                 let viewport_h = col_h as u16;
@@ -8216,7 +8306,7 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
                 container(
                     stack![
                         iced::widget::column![
-                            iced::widget::Space::with_height(Length::Fixed(56.0)),
+                            iced::widget::Space::with_height(Length::Fixed(self.header_height())),
                             clipped_content
                         ]
                         .width(Length::Fill)
@@ -8242,7 +8332,7 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
                 container(
                     stack![
                         iced::widget::column![
-                            iced::widget::Space::with_height(Length::Fixed(56.0)),
+                            iced::widget::Space::with_height(Length::Fixed(self.header_height())),
                             clipped_content
                         ]
                         .width(Length::Fill)
@@ -8405,7 +8495,7 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
 
                 let tooltip_overlay = container(
                     column![
-                        Space::with_height(Length::Fixed(52.0)),
+                        Space::with_height(Length::Fixed(self.header_height())),
                         row![
                             Space::with_width(Length::Fixed(clamp_x)),
                             tooltip_box,
@@ -8424,6 +8514,7 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
             layers.push(view_suggestions_overlay(
                 &self.suggestions,
                 search_bar_w,
+                self.header_height(),
                 Message::SelectSuggestion,
             ));
         }
@@ -8443,6 +8534,7 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
                 self.config.home_columns,
                 self.config.theme,
                 self.config.custom_titlebar,
+                self.config.tab_two_rows,
                 self.config.incognito_mode,
                 self.config.auto_pip_on_unfocus,
                 self.config.full_buffer_tabs,
@@ -8466,6 +8558,7 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
                 Message::SetHomeColumns,
                 Message::SetAppTheme,
                 Message::ToggleCustomTitlebar,
+                Message::ToggleTabTwoRows,
                 Message::ToggleIncognito,
                 Message::ToggleAutoPipOnUnfocus,
                 Message::ToggleFullBufferTabs,

@@ -176,6 +176,10 @@ pub struct AppConfig {
     pub incognito_mode: bool,
     #[serde(default = "default_true")]
     pub custom_titlebar: bool,
+    /// When enabled, the tab strip may grow to two rows instead of forcing
+    /// every tab into a single horizontally scrolled line.
+    #[serde(default)]
+    pub tab_two_rows: bool,
 }
 
 fn default_true() -> bool {
@@ -211,6 +215,7 @@ impl Default for AppConfig {
             theme: AppTheme::Dark,
             incognito_mode: false,
             custom_titlebar: true,
+            tab_two_rows: false,
         }
     }
 }

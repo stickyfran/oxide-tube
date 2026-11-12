@@ -465,8 +465,8 @@ impl WaylandZeroCopyPlayer {
                 (c"network-timeout", c"15"),
                 (c"demuxer-max-bytes", c"25165824"),       // 24 MB forward buffer (<=1080p default; scales up dynamically for 1440p/4K/8K)
                 (c"demuxer-max-back-bytes", c"8388608"),   // 8 MB backward cache for instant reverse seek
-                (c"demuxer-readahead-secs", c"20"),        // 20 seconds readahead
-                (c"cache-pause-wait", c"2"),               // Resume after 2s buffered
+                (c"demuxer-readahead-secs", c"30"),        // 30 seconds readahead to absorb network jitter
+                (c"cache-pause-wait", c"4"),               // Resume after 4s buffered to avoid rebuffer thrash
                 (c"demuxer-seekable-cache", c"yes"),       // Seek directly in RAM cache without HTTP reconnect
                 (c"force-seekable", c"yes"),               // Force HTTP range-request seekability
                 (c"hr-seek", c"default"),                  // Accurate seek with fast hardware keyframe decode
@@ -782,6 +782,8 @@ impl WaylandZeroCopyPlayer {
                             MPV_EVENT_PLAYBACK_RESTART => {
                                 awaiting_playback_restart.store(false, Ordering::SeqCst);
                                 first_frame_rendered.store(true, Ordering::SeqCst);
+                                is_buffering.store(false, Ordering::SeqCst);
+                                buffering_percent.store(100, Ordering::SeqCst);
                                 has_error.store(false, Ordering::SeqCst);
                                 *last_error.safe_lock() = None;
                                 let mut is_paused: i32 = 0;
@@ -814,6 +816,7 @@ impl WaylandZeroCopyPlayer {
                                     eos_detected.store(true, Ordering::SeqCst);
                                 }
                                 is_playing.store(false, Ordering::SeqCst);
+                                is_buffering.store(false, Ordering::SeqCst);
                             }
                             MPV_EVENT_PROPERTY_CHANGE => {
                                 if !ev.data.is_null() {
@@ -850,7 +853,9 @@ impl WaylandZeroCopyPlayer {
                                             }
                                             5 => { // paused-for-cache
                                                 let flag = unsafe { *(prop.data as *const i32) };
-                                                is_buffering.store(flag != 0, Ordering::SeqCst);
+                                                let awaiting = awaiting_playback_restart.load(Ordering::SeqCst);
+                                                let loading_first = awaiting && !first_frame_rendered.load(Ordering::SeqCst);
+                                                is_buffering.store(flag != 0 || loading_first, Ordering::SeqCst);
                                             }
                                             6 => { // pause
                                                 let flag = unsafe { *(prop.data as *const i32) };
@@ -1220,6 +1225,10 @@ impl WaylandZeroCopyPlayer {
         self.eos_detected.store(false, Ordering::SeqCst);
         self.has_error.store(false, Ordering::SeqCst);
         *self.last_error.safe_lock() = None;
+        // Show the buffering spinner immediately while mpv resolves the
+        // manifest and fetches the first segments.
+        self.is_buffering.store(true, Ordering::SeqCst);
+        self.buffering_percent.store(0, Ordering::SeqCst);
 
         let ctx_opt = *self.mpv.safe_lock();
         let ctx = match ctx_opt {
@@ -1349,6 +1358,7 @@ impl WaylandZeroCopyPlayer {
             }
             self.is_playing.store(false, Ordering::SeqCst);
             self.first_frame_rendered.store(false, Ordering::SeqCst);
+            self.is_buffering.store(false, Ordering::SeqCst);
             *self.current_frame.safe_lock() = None;
             self.trigger_worker_wakeup();
             crate::power_manager::trim_process_memory();
@@ -1410,8 +1420,8 @@ impl WaylandZeroCopyPlayer {
 
     pub fn set_power_profile(&self, profile: PowerProfile) {
         let (max_bytes, back_bytes, readahead) = match profile {
-            PowerProfile::Battery => ("16777216\0", "6291456\0", "12\0"),
-            PowerProfile::Ac => ("25165824\0", "8388608\0", "20\0"),
+            PowerProfile::Battery => ("16777216\0", "6291456\0", "20\0"),
+            PowerProfile::Ac => ("25165824\0", "8388608\0", "30\0"),
         };
         if let Some(addr) = *self.mpv.safe_lock() {
             unsafe {
@@ -1431,22 +1441,22 @@ impl WaylandZeroCopyPlayer {
     pub fn set_stream_buffer_profile(&self, height: u32, profile: PowerProfile) {
         let (max_bytes, back_bytes, readahead) = if profile == PowerProfile::Battery {
             if height >= 4000 {
-                (c"67108864", c"16777216", c"20")  // 64 MB / 16 MB on Battery 8K
+                (c"67108864", c"16777216", c"30")  // 64 MB / 16 MB on Battery 8K
             } else if height >= 2000 {
-                (c"41943040", c"10485760", c"18") // 40 MB / 10 MB on Battery 4K
+                (c"41943040", c"10485760", c"28") // 40 MB / 10 MB on Battery 4K
             } else if height >= 1300 {
-                (c"25165824", c"8388608", c"15")  // 24 MB / 8 MB on Battery 1440p
+                (c"25165824", c"8388608", c"22")  // 24 MB / 8 MB on Battery 1440p
             } else {
-                (c"16777216", c"6291456", c"12")  // 16 MB / 6 MB on Battery <=1080p
+                (c"16777216", c"6291456", c"20")  // 16 MB / 6 MB on Battery <=1080p
             }
         } else if height >= 4000 {
-            (c"100663296", c"33554432", c"30")     // 96 MB / 32 MB on AC 8K
+            (c"100663296", c"33554432", c"45")     // 96 MB / 32 MB on AC 8K
         } else if height >= 2000 {
-            (c"58720256", c"16777216", c"25")     // 56 MB / 16 MB on AC 4K
+            (c"58720256", c"16777216", c"40")     // 56 MB / 16 MB on AC 4K
         } else if height >= 1300 {
-            (c"37748736", c"12582912", c"22")     // 36 MB / 12 MB on AC 1440p
+            (c"37748736", c"12582912", c"35")     // 36 MB / 12 MB on AC 1440p
         } else {
-            (c"25165824", c"8388608", c"20")      // 24 MB / 8 MB on AC <=1080p
+            (c"25165824", c"8388608", c"30")      // 24 MB / 8 MB on AC <=1080p
         };
         if let Some(addr) = *self.mpv.safe_lock() {
             unsafe {

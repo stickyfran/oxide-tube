@@ -122,6 +122,94 @@ fn nav_tab_button<'a, Message: Clone + 'static>(
         .on_press(on_press)
 }
 
+/// Height of a single tab pill. Two-row mode uses slightly shorter pills so
+/// the header does not become excessively tall.
+pub fn tab_pill_height(custom_titlebar: bool, is_maximized: bool, two_rows: bool) -> f32 {
+    let fitts_top = custom_titlebar && is_maximized;
+    let base = if fitts_top { 44.0 } else { 38.0 };
+    if two_rows {
+        (base - 6.0).max(30.0)
+    } else {
+        base
+    }
+}
+
+/// Total height reserved for the top header, including the tab strip.
+pub fn header_height(custom_titlebar: bool, is_maximized: bool, two_rows: bool) -> f32 {
+    if two_rows {
+        tab_pill_height(custom_titlebar, is_maximized, true) * 2.0 + 6.0 + 16.0
+    } else {
+        56.0
+    }
+}
+
+/// Width estimate for a tab pill based on its displayed title. Keeping this
+/// in one place lets both the view and the scroll logic agree on overflow.
+pub fn tab_display_title(title: &str) -> String {
+    if title.chars().count() > 30 {
+        let mut t: String = title.chars().take(28).collect();
+        t.push_str("..");
+        t
+    } else if title.is_empty() {
+        "Nueva pestaña".to_string()
+    } else {
+        title.to_string()
+    }
+}
+
+pub fn estimate_tab_width(title: &str, is_playing: bool) -> f32 {
+    let char_count = tab_display_title(title).chars().count() as f32;
+    (char_count * 7.2 + if is_playing { 62.0 } else { 46.0 }).clamp(132.0, 248.0)
+}
+
+/// Horizontal space available to the tab strip, excluding navigation, search,
+/// account and CSD window controls.
+pub fn tabs_available_width(
+    window_width: f32,
+    search_bar_width: f32,
+    is_authenticated: bool,
+    has_user_name: bool,
+    custom_titlebar: bool,
+) -> f32 {
+    let right_account_width = if is_authenticated && has_user_name { 160.0 } else { 125.0 };
+    let csd_controls_width = if custom_titlebar { 136.0 + 32.0 } else { 0.0 };
+    let non_tabs_width = 240.0 + search_bar_width + right_account_width + csd_controls_width;
+    (window_width - non_tabs_width).max(80.0)
+}
+
+/// Distributes tab indices over at most two rows. The first row is filled up
+/// to the available width and the remainder flows into the second row.
+pub fn split_tabs_into_rows(
+    tabs: &[VideoTab],
+    available_width: f32,
+    playing_video_id: Option<&str>,
+    is_video_playing: bool,
+) -> (Vec<usize>, Vec<usize>) {
+    let mut row0 = Vec::new();
+    let mut row1 = Vec::new();
+    let mut row0_width = 0.0_f32;
+
+    for (idx, tab) in tabs.iter().enumerate() {
+        let is_playing = is_video_playing
+            && !tab.video_id.is_empty()
+            && playing_video_id == Some(tab.video_id.as_str());
+        let width = estimate_tab_width(&tab.title, is_playing);
+        let add = width + if row0.is_empty() { 0.0 } else { 6.0 };
+
+        if row1.is_empty() && !row0.is_empty() && row0_width + add > available_width {
+            row1.push(idx);
+        } else if row1.is_empty() {
+            row0.push(idx);
+            row0_width += add;
+        } else {
+            row1.push(idx);
+        }
+    }
+
+    (row0, row1)
+}
+
+
 pub fn view_header_bar<'a, Message: Clone + 'static>(
     search_query: &'a str,
     search_bar_width: f32,
@@ -150,6 +238,7 @@ pub fn view_header_bar<'a, Message: Clone + 'static>(
     window_width: f32,
     tabs_scroll_x: f32,
     tabs_max_scroll_x: f32,
+    tab_two_rows: bool,
     custom_titlebar: bool,
     is_maximized: bool,
     on_search_input: impl Fn(String) -> Message + 'static,
@@ -178,7 +267,8 @@ pub fn view_header_bar<'a, Message: Clone + 'static>(
     on_close_window: Message,
 ) -> Element<'a, Message> {
     let fitts_top = custom_titlebar && is_maximized;
-    let tab_height: f32 = if fitts_top { 44.0 } else { 38.0 };
+    let two_rows_active = tab_two_rows && !tabs.is_empty();
+    let tab_height = tab_pill_height(custom_titlebar, is_maximized, two_rows_active);
 
     // 1. Left section: Back, Home button (with uniform active styling)
     let back_btn = button(icon_back(18.0))
@@ -244,10 +334,8 @@ pub fn view_header_bar<'a, Message: Clone + 'static>(
         % 2200) as f32
         / 2200.0;
 
-    let mut tabs_row = row![]
-        .spacing(6)
-        .align_y(if fitts_top { Alignment::Start } else { Alignment::Center });
-    let mut sum_tabs_width: f32 = 0.0;
+    let mut tab_pills: Vec<Option<Element<'a, Message>>> = Vec::with_capacity(tabs.len());
+    let mut tab_widths: Vec<f32> = Vec::with_capacity(tabs.len());
 
     for (idx, tab) in tabs.iter().enumerate() {
         let is_active = active_tab_idx == Some(idx);
@@ -259,19 +347,9 @@ pub fn view_header_bar<'a, Message: Clone + 'static>(
         let is_newly_opened = open_elapsed.is_some();
         let shake_elapsed = shaking_tab.and_then(|(s_idx, el)| if s_idx == idx { Some(el) } else { None });
 
-        let tab_title = if tab.title.chars().count() > 30 {
-            let mut t: String = tab.title.chars().take(28).collect();
-            t.push_str("..");
-            t
-        } else if tab.title.is_empty() {
-            "Nueva pestaña".to_string()
-        } else {
-            tab.title.clone()
-        };
-
-        let char_count = tab_title.chars().count() as f32;
-        let est_this_tab_w = (char_count * 7.2 + if is_playing_this_tab { 62.0 } else { 46.0 }).clamp(132.0, 248.0);
-        sum_tabs_width += est_this_tab_w + if idx > 0 { 6.0 } else { 0.0 };
+        let tab_title = tab_display_title(&tab.title);
+        let est_this_tab_w = estimate_tab_width(&tab.title, is_playing_this_tab);
+        tab_widths.push(est_this_tab_w);
 
         let text_color = if is_active || is_hovered || is_playing_this_tab || is_dragging_this {
             iced::Color::WHITE
@@ -452,15 +530,44 @@ pub fn view_header_bar<'a, Message: Clone + 'static>(
             .on_release(on_select_tab(idx))
             .on_middle_press(on_close_tab(idx));
 
-        tabs_row = tabs_row.push(tab_pill);
+        tab_pills.push(Some(tab_pill.into()));
     }
 
-    // Chrome/Firefox overflow detection accounting for CSD window buttons
-    let right_account_width = if is_authenticated && user_name.is_some() { 160.0 } else { 125.0 };
-    let csd_controls_width = if custom_titlebar { 136.0 + 32.0 } else { 0.0 };
-    let non_tabs_width = 240.0 + search_bar_width + right_account_width + csd_controls_width;
-    let available_tabs_width = (window_width - non_tabs_width).max(80.0);
-    let heuristic_max_scroll = (sum_tabs_width - available_tabs_width).max(0.0);
+    // Chrome/Firefox overflow detection accounting for CSD window buttons.
+    let available_tabs_width = tabs_available_width(
+        window_width,
+        search_bar_width,
+        is_authenticated,
+        user_name.is_some(),
+        custom_titlebar,
+    );
+
+    let (row0_indices, row1_indices) = if two_rows_active {
+        split_tabs_into_rows(tabs, available_tabs_width, playing_video_id, is_video_playing)
+    } else {
+        ((0..tabs.len()).collect::<Vec<_>>(), Vec::new())
+    };
+
+    let row_width = |indices: &[usize]| -> f32 {
+        indices
+            .iter()
+            .enumerate()
+            .map(|(n, idx)| {
+                tab_widths.get(*idx).copied().unwrap_or(0.0) + if n > 0 { 6.0 } else { 0.0 }
+            })
+            .sum()
+    };
+    let row0_width = row_width(&row0_indices);
+    let row1_width = row_width(&row1_indices);
+    let content_width = row0_width.max(row1_width);
+    let use_two_rows = !row1_indices.is_empty();
+    let tabs_rows_height =
+        tab_height * if use_two_rows { 2.0 } else { 1.0 } + if use_two_rows { 6.0 } else { 0.0 };
+
+    let heuristic_max_scroll = (content_width - available_tabs_width).max(0.0);
+    // Use the larger of the measured offset and the estimate so new tabs
+    // immediately make the overflow arrow appear, while scroll_by() keeps the
+    // actual scrolling clamped to the real content bounds.
     let effective_max_scroll = tabs_max_scroll_x.max(heuristic_max_scroll);
     let clamped_scroll_x = tabs_scroll_x.clamp(0.0, effective_max_scroll);
 
@@ -469,7 +576,36 @@ pub fn view_header_bar<'a, Message: Clone + 'static>(
     let can_scroll_left = has_overflow && clamped_scroll_x > 4.0;
     let can_scroll_right = has_overflow && (clamped_scroll_x + 6.0) < effective_max_scroll;
 
-    let tabs_scrollable = iced::widget::scrollable(tabs_row)
+    let tabs_align_y = if fitts_top {
+        iced::alignment::Vertical::Top
+    } else {
+        iced::alignment::Vertical::Center
+    };
+
+    let mut row0 = row![].spacing(6).align_y(tabs_align_y);
+    for idx in &row0_indices {
+        if let Some(pill) = tab_pills.get_mut(*idx).and_then(|p| p.take()) {
+            row0 = row0.push(pill);
+        }
+    }
+
+    let mut row1 = row![].spacing(6).align_y(tabs_align_y);
+    for idx in &row1_indices {
+        if let Some(pill) = tab_pills.get_mut(*idx).and_then(|p| p.take()) {
+            row1 = row1.push(pill);
+        }
+    }
+
+    let tabs_content: Element<'a, Message> = if use_two_rows {
+        column![row0, row1]
+            .spacing(6)
+            .align_x(iced::alignment::Horizontal::Left)
+            .into()
+    } else {
+        row0.into()
+    };
+
+    let tabs_scrollable = iced::widget::scrollable(tabs_content)
         .width(Length::Fill)
         .direction(iced::widget::scrollable::Direction::Horizontal(
             iced::widget::scrollable::Scrollbar::new()
@@ -500,12 +636,6 @@ pub fn view_header_bar<'a, Message: Clone + 'static>(
         .on_scroll(on_scroll_tabs);
 
     let tabs_section: Element<'a, Message> = {
-        let tabs_align_y = if fitts_top {
-            iced::alignment::Vertical::Top
-        } else {
-            iced::alignment::Vertical::Center
-        };
-
         let free_drag_space: Element<'a, Message> = mouse_area(
             Space::new(Length::Fill, Length::Fill),
         )
@@ -522,7 +652,7 @@ pub fn view_header_bar<'a, Message: Clone + 'static>(
         } else {
             row![
                 container(tabs_scrollable)
-                    .width(Length::Fixed(sum_tabs_width))
+                    .width(Length::Fixed(content_width.max(1.0)))
                     .height(Length::Fill)
                     .align_y(tabs_align_y),
                 free_drag_space,
@@ -534,74 +664,88 @@ pub fn view_header_bar<'a, Message: Clone + 'static>(
 
         let mut layers: Vec<Element<'a, Message>> = vec![base_row];
 
+        let arrow_height = (tabs_rows_height - 4.0).clamp(30.0, 54.0);
+        let scroll_btn_style = |_t: &Theme, status: button::Status| match status {
+            button::Status::Hovered | button::Status::Pressed => button::Style {
+                background: Some(iced::Color::from_rgba(0.30, 0.09, 0.09, 0.98).into()),
+                border: iced::border::rounded(9)
+                    .color(iced::Color::from_rgb8(0xd9, 0x2a, 0x2a))
+                    .width(1.2),
+                text_color: iced::Color::WHITE,
+                shadow: iced::Shadow {
+                    color: iced::Color::from_rgba(0.0, 0.0, 0.0, 0.55),
+                    offset: iced::Vector::new(0.0, 2.0),
+                    blur_radius: 8.0,
+                },
+                ..button::Style::default()
+            },
+            _ => button::Style {
+                background: Some(iced::Color::from_rgba(0.07, 0.07, 0.08, 0.96).into()),
+                border: iced::border::rounded(9).color(COLOR_BORDER).width(1.0),
+                text_color: iced::Color::WHITE,
+                shadow: iced::Shadow {
+                    color: iced::Color::from_rgba(0.0, 0.0, 0.0, 0.40),
+                    offset: iced::Vector::new(0.0, 2.0),
+                    blur_radius: 6.0,
+                },
+                ..button::Style::default()
+            },
+        };
+
         if can_scroll_left {
             let left_btn = button(
-                container(icon_chevron_left(13.0))
+                container(icon_chevron_left(16.0))
                     .width(Length::Fill)
                     .height(Length::Fill)
                     .align_x(iced::alignment::Horizontal::Center)
                     .align_y(iced::alignment::Vertical::Center),
             )
-            .width(Length::Fixed(26.0))
-            .height(Length::Fixed(26.0))
+            .width(Length::Fixed(30.0))
+            .height(Length::Fixed(arrow_height))
             .padding(0)
-            .style(|_t, status| match status {
-                button::Status::Hovered | button::Status::Pressed => button::Style {
-                    background: Some(iced::Color::from_rgba(0.24, 0.24, 0.24, 0.95).into()),
-                    border: iced::border::rounded(13)
-                        .color(iced::Color::from_rgb8(0x80, 0x80, 0x80))
-                        .width(1.0),
-                    ..button::Style::default()
-                },
-                _ => button::Style {
-                    background: Some(iced::Color::from_rgba(0.12, 0.12, 0.12, 0.90).into()),
-                    border: iced::border::rounded(13).color(COLOR_BORDER).width(1.0),
-                    ..button::Style::default()
-                },
-            })
+            .style(scroll_btn_style)
             .on_press(on_scroll_tabs_left);
 
             let overlay_left = container(left_btn)
                 .width(Length::Fill)
                 .height(Length::Fill)
+                .padding(iced::Padding {
+                    top: 0.0,
+                    bottom: 0.0,
+                    left: 3.0,
+                    right: 0.0,
+                })
                 .align_x(iced::alignment::Horizontal::Left)
-                .align_y(iced::alignment::Vertical::Center);
+                .align_y(tabs_align_y);
 
             layers.push(overlay_left.into());
         }
 
         if can_scroll_right {
             let right_btn = button(
-                container(icon_chevron_right(13.0))
+                container(icon_chevron_right(16.0))
                     .width(Length::Fill)
                     .height(Length::Fill)
                     .align_x(iced::alignment::Horizontal::Center)
                     .align_y(iced::alignment::Vertical::Center),
             )
-            .width(Length::Fixed(26.0))
-            .height(Length::Fixed(26.0))
+            .width(Length::Fixed(30.0))
+            .height(Length::Fixed(arrow_height))
             .padding(0)
-            .style(|_t, status| match status {
-                button::Status::Hovered | button::Status::Pressed => button::Style {
-                    background: Some(iced::Color::from_rgba(0.24, 0.24, 0.24, 0.95).into()),
-                    border: iced::border::rounded(13)
-                        .color(iced::Color::from_rgb8(0x80, 0x80, 0x80))
-                        .width(1.0),
-                    ..button::Style::default()
-                },
-                _ => button::Style {
-                    background: Some(iced::Color::from_rgba(0.12, 0.12, 0.12, 0.90).into()),
-                    border: iced::border::rounded(13).color(COLOR_BORDER).width(1.0),
-                    ..button::Style::default()
-                },
-            })
+            .style(scroll_btn_style)
             .on_press(on_scroll_tabs_right);
 
             let overlay_right = container(right_btn)
                 .width(Length::Fill)
                 .height(Length::Fill)
+                .padding(iced::Padding {
+                    top: 0.0,
+                    bottom: 0.0,
+                    left: 0.0,
+                    right: 3.0,
+                })
                 .align_x(iced::alignment::Horizontal::Right)
-                .align_y(iced::alignment::Vertical::Center);
+                .align_y(tabs_align_y);
 
             layers.push(overlay_right.into());
         }
@@ -811,7 +955,11 @@ pub fn view_header_bar<'a, Message: Clone + 'static>(
             border: iced::border::color(color_border()).width(1.0),
             ..container::Style::default()
         })
-        .height(Length::Fixed(56.0))
+        .height(Length::Fixed(header_height(
+            custom_titlebar,
+            is_maximized,
+            two_rows_active,
+        )))
         .width(Length::Fill);
 
     if custom_titlebar {
@@ -827,6 +975,7 @@ pub fn view_header_bar<'a, Message: Clone + 'static>(
 pub fn view_suggestions_overlay<'a, Message: Clone + 'static>(
     suggestions: &'a [String],
     search_bar_width: f32,
+    header_height: f32,
     on_select_suggestion: impl Fn(String) -> Message + 'static,
 ) -> Element<'a, Message> {
     let mut sugg_list = column![].spacing(4);
@@ -850,7 +999,7 @@ pub fn view_suggestions_overlay<'a, Message: Clone + 'static>(
 
     container(
         column![
-            Space::with_height(Length::Fixed(52.0)),
+            Space::with_height(Length::Fixed(header_height)),
             row![
                 Space::with_width(Length::Fixed(168.0)),
                 dropdown,
@@ -951,6 +1100,7 @@ pub fn view_auth_modal<'a, Message: Clone + 'static>(
     current_columns: crate::config::GridColumnsConfig,
     current_theme: crate::config::AppTheme,
     custom_titlebar: bool,
+    tab_two_rows: bool,
     incognito_mode: bool,
     auto_pip_on_unfocus: bool,
     full_buffer_tabs: bool,
@@ -974,6 +1124,7 @@ pub fn view_auth_modal<'a, Message: Clone + 'static>(
     on_select_home_columns: impl Fn(crate::config::GridColumnsConfig) -> Message + Copy + 'static,
     on_select_theme: impl Fn(crate::config::AppTheme) -> Message + Copy + 'static,
     on_toggle_custom_titlebar: Message,
+    on_toggle_tab_two_rows: Message,
     on_toggle_incognito: Message,
     on_toggle_auto_pip: Message,
     on_toggle_full_buffer_tabs: Message,
@@ -1229,11 +1380,26 @@ pub fn view_auth_modal<'a, Message: Clone + 'static>(
             .spacing(12)
             .align_y(Alignment::Center);
 
+            let row_tab_two_rows = row![
+                column![
+                    text("Mostrar Pestañas en Dos Filas").size(13).color(COLOR_TEXT_PRIMARY),
+                    text("Cuando las pestañas no caben en una fila, se reparten en dos filas para mantenerlas visibles sin desplazamiento horizontal.")
+                        .size(11)
+                        .color(COLOR_TEXT_SECONDARY),
+                ]
+                .spacing(2)
+                .width(Length::Fill),
+                render_toggle_switch(tab_two_rows, on_toggle_tab_two_rows),
+            ]
+            .spacing(12)
+            .align_y(Alignment::Center);
+
             column![
                 text("Apariencia y Diseño").size(15).color(COLOR_TEXT_PRIMARY),
                 section_card(
                     column![
                         row_custom_titlebar,
+                        row_tab_two_rows,
                         column![
                             text("Tema de la Interfaz").size(12).color(COLOR_TEXT_SECONDARY),
                             theme_row,
