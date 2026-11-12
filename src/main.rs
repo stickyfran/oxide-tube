@@ -184,6 +184,7 @@ pub enum Message {
     HomeScrolled(iced::widget::scrollable::Viewport),
     MoreFeedLoaded(Result<Vec<VideoCard>, String>),
     TabsScrolled(iced::widget::scrollable::Viewport),
+    TabsFirstRowScrolled(iced::widget::scrollable::Viewport),
     TriggerFullBuffer(String),
     FullBufferTitle(String, String),
     DeleteDownloadedVideo(String),
@@ -367,6 +368,7 @@ pub struct MitubApp {
     tabs_scroll_x: f32,
     tabs_max_scroll_x: f32,
     tabs_viewport_width: f32,
+    tabs_first_row_width: f32,
     tab_two_rows_progress: f32,
     tab_second_row_target: bool,
     tabs_scroll_reset_pending: bool,
@@ -1515,6 +1517,7 @@ impl MitubApp {
             tabs_scroll_x: 0.0,
             tabs_max_scroll_x: 0.0,
             tabs_viewport_width: 0.0,
+            tabs_first_row_width: 0.0,
             tab_two_rows_progress: 0.0,
             tab_second_row_target: false,
             tabs_scroll_reset_pending: false,
@@ -2133,20 +2136,19 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
         ui::header_height(self.config.custom_titlebar, self.is_maximized, progress)
     }
 
-    /// Actual horizontal space available to the tab strip. In two-row mode the
-    /// scrollable reports the real width, which avoids mismatches between the
-    /// estimated header widths and the rendered layout.
+    /// Horizontal space available to the first tab row.
     fn tabs_layout_available_width(&self) -> f32 {
         let two_rows = self.config.tab_two_rows || self.tab_two_rows_progress > 0.001;
-        if two_rows && self.tabs_viewport_width > 1.0 {
-            return self.tabs_viewport_width;
+        if two_rows && self.tabs_first_row_width > 1.0 {
+            return self.tabs_first_row_width;
         }
         let is_authed = self.auth_status.starts_with("[OK]");
         ui::tabs_available_width(
             self.window_size.0,
             self.current_search_bar_width(),
             is_authed,
-            self.user_display_name.is_some(),
+            self.user_display_name.as_deref(),
+            self.config.incognito_mode,
             self.config.custom_titlebar,
         )
     }
@@ -2188,30 +2190,17 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
         if row1.is_empty() || row0.contains(&idx) {
             return 0.0;
         }
-        let (indices, pos) = if let Some(p) = row1.iter().position(|i| *i == idx) {
-            (&row1, p)
-        } else {
+        let count = row0.len();
+        if count == 0 {
             return 0.0;
-        };
-
-        let mut before = 0.0;
-        for (n, tab_idx) in indices.iter().enumerate() {
-            if n >= pos {
-                break;
-            }
-            let tab = &self.tabs[*tab_idx];
-            let playing = self.osd_state.is_playing
-                && !tab.video_id.is_empty()
-                && self.playing_video_id.as_deref() == Some(tab.video_id.as_str());
-            before += ui::estimate_tab_width(&tab.title, playing) + 6.0;
         }
-
-        let tab = &self.tabs[idx];
-        let playing = self.osd_state.is_playing
-            && !tab.video_id.is_empty()
-            && self.playing_video_id.as_deref() == Some(tab.video_id.as_str());
-        let width = ui::estimate_tab_width(&tab.title, playing);
-        (before + width * 0.5 - available * 0.5).max(0.0)
+        let uniform = ((available - 6.0 * count.saturating_sub(1) as f32).max(0.0)
+            / count as f32)
+            .max(ui::MIN_TAB_WIDTH);
+        let pos = row1.iter().position(|i| *i == idx).unwrap_or(0);
+        let before = pos as f32 * (uniform + 6.0);
+        let second_row_available = (self.window_size.0 - 24.0).max(80.0);
+        (before + uniform * 0.5 - second_row_available * 0.5).max(0.0)
     }
 
     fn current_search_bar_width(&self) -> f32 {
@@ -2565,6 +2554,7 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                     self.tabs_scroll_x = 0.0;
                     self.tabs_max_scroll_x = 0.0;
                     self.tabs_viewport_width = 0.0;
+                    self.tabs_first_row_width = 0.0;
                     self.tabs_scroll_reset_pending = true;
                 }
                 let progress_target = if row_target { 1.0 } else { 0.0 };
@@ -4065,6 +4055,12 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                 Task::none()
             }
 
+            Message::TabsFirstRowScrolled(viewport) => {
+                // Measurement only: the first row never scrolls by itself.
+                self.tabs_first_row_width = viewport.bounds().width;
+                Task::none()
+            }
+
             Message::VideoHitboxClicked => {
                 if self.osd_state.close_all_menus() {
                     if self.is_fullscreen {
@@ -5377,6 +5373,7 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                 self.tabs_scroll_x = 0.0;
                 self.tabs_max_scroll_x = 0.0;
                 self.tabs_viewport_width = 0.0;
+                self.tabs_first_row_width = 0.0;
                 self.sync_player_viewport();
                 iced::widget::scrollable::scroll_to(
                     iced::widget::scrollable::Id::new("tabs_scrollable"),
@@ -6959,6 +6956,7 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                             // Tab measurements are relative to the previous width.
                             self.tabs_max_scroll_x = 0.0;
                             self.tabs_viewport_width = 0.0;
+                            self.tabs_first_row_width = 0.0;
                             if self.pip_window_id.is_none() {
                                 self.sync_player_viewport();
                             }
@@ -8053,7 +8051,7 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
             self.window_size.0,
             self.tabs_scroll_x,
             self.tabs_max_scroll_x,
-            self.tabs_viewport_width,
+            self.tabs_first_row_width,
             self.config.tab_two_rows,
             self.tab_two_rows_progress,
             self.config.custom_titlebar,
@@ -8075,6 +8073,7 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
             Message::CloseTab,
             Message::TabHoverChanged,
             Message::TabsScrolled,
+            Message::TabsFirstRowScrolled,
             Message::ScrollTabsLeft,
             Message::ScrollTabsRight,
             Message::HeaderDragPressed,
