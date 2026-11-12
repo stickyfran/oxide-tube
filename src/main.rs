@@ -2123,14 +2123,31 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
     }
 
     fn header_height(&self) -> f32 {
-        ui::header_height(
+        let progress = if !self.tabs.is_empty()
+            && (self.config.tab_two_rows || self.tab_two_rows_progress > 0.001)
+        {
+            self.tab_two_rows_progress
+        } else {
+            0.0
+        };
+        ui::header_height(self.config.custom_titlebar, self.is_maximized, progress)
+    }
+
+    /// Actual horizontal space available to the tab strip. In two-row mode the
+    /// scrollable reports the real width, which avoids mismatches between the
+    /// estimated header widths and the rendered layout.
+    fn tabs_layout_available_width(&self) -> f32 {
+        let two_rows = self.config.tab_two_rows || self.tab_two_rows_progress > 0.001;
+        if two_rows && self.tabs_viewport_width > 1.0 {
+            return self.tabs_viewport_width;
+        }
+        let is_authed = self.auth_status.starts_with("[OK]");
+        ui::tabs_available_width(
+            self.window_size.0,
+            self.current_search_bar_width(),
+            is_authed,
+            self.user_display_name.is_some(),
             self.config.custom_titlebar,
-            self.is_maximized,
-            if self.config.tab_two_rows || self.tab_two_rows_progress > 0.001 {
-                self.tab_two_rows_progress
-            } else {
-                0.0
-            },
         )
     }
 
@@ -2140,14 +2157,7 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
         if !self.config.tab_two_rows || self.tabs.is_empty() {
             return false;
         }
-        let is_authed = self.auth_status.starts_with("[OK]");
-        let available = ui::tabs_available_width(
-            self.window_size.0,
-            self.current_search_bar_width(),
-            is_authed,
-            self.user_display_name.is_some(),
-            self.config.custom_titlebar,
-        );
+        let available = self.tabs_layout_available_width();
         let (_, row1) = ui::split_tabs_into_rows(
             &self.tabs,
             available,
@@ -2167,14 +2177,7 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
             return (idx as f32 * 190.0).max(0.0);
         }
 
-        let is_authed = self.auth_status.starts_with("[OK]");
-        let available = ui::tabs_available_width(
-            self.window_size.0,
-            self.current_search_bar_width(),
-            is_authed,
-            self.user_display_name.is_some(),
-            self.config.custom_titlebar,
-        );
+        let available = self.tabs_layout_available_width();
         let (row0, row1) = ui::split_tabs_into_rows(
             &self.tabs,
             available,
@@ -2561,6 +2564,7 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                     self.tab_second_row_target = row_target;
                     self.tabs_scroll_x = 0.0;
                     self.tabs_max_scroll_x = 0.0;
+                    self.tabs_viewport_width = 0.0;
                     self.tabs_scroll_reset_pending = true;
                 }
                 let progress_target = if row_target { 1.0 } else { 0.0 };
@@ -5372,6 +5376,7 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                 // Measurements from the single-row layout are no longer valid.
                 self.tabs_scroll_x = 0.0;
                 self.tabs_max_scroll_x = 0.0;
+                self.tabs_viewport_width = 0.0;
                 self.sync_player_viewport();
                 iced::widget::scrollable::scroll_to(
                     iced::widget::scrollable::Id::new("tabs_scrollable"),
@@ -8048,6 +8053,7 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
             self.window_size.0,
             self.tabs_scroll_x,
             self.tabs_max_scroll_x,
+            self.tabs_viewport_width,
             self.config.tab_two_rows,
             self.tab_two_rows_progress,
             self.config.custom_titlebar,

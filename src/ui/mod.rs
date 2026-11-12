@@ -174,6 +174,107 @@ pub fn tabs_available_width(
     (window_width - non_tabs_width).max(80.0)
 }
 
+/// Minimum width a tab can shrink to when packing the first row.
+pub const MIN_TAB_WIDTH: f32 = 108.0;
+
+/// Distributes tab indices over at most two rows using the real rendered
+/// widths. Tabs are first packed at their natural width, then the row is
+/// allowed to shrink its tabs down to `MIN_TAB_WIDTH` so it can hold as many
+/// tabs as possible without wasting horizontal space.
+pub fn split_tabs_into_rows_with_widths(
+    widths: &[f32],
+    available_width: f32,
+) -> (Vec<usize>, Vec<usize>) {
+    if widths.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+
+    let n = widths.len();
+    let mut k = 0usize;
+    let mut natural_sum = 0.0_f32;
+
+    // First pass: fit at natural width.
+    for (idx, width) in widths.iter().enumerate() {
+        let add = *width + if k > 0 { 6.0 } else { 0.0 };
+        if k == 0 || natural_sum + add <= available_width {
+            natural_sum += add;
+            k = idx + 1;
+        } else {
+            break;
+        }
+    }
+
+    // Second pass: try to squeeze more tabs into the first row.
+    while k < n {
+        let candidate = k + 1;
+        let min_total: f32 = widths[..candidate]
+            .iter()
+            .enumerate()
+            .map(|(idx, width)| width.min(MIN_TAB_WIDTH) + if idx > 0 { 6.0 } else { 0.0 })
+            .sum();
+        if min_total <= available_width {
+            k = candidate;
+        } else {
+            break;
+        }
+    }
+
+    ((0..k).collect(), (k..n).collect())
+}
+
+/// Distributes the available row width among the given tabs. If the tabs fit,
+/// they grow to use all the space; if they don't, they shrink towards the
+/// minimum before the overflow row takes over.
+pub fn distribute_row_widths(
+    indices: &[usize],
+    base_widths: &[f32],
+    available_width: f32,
+) -> Vec<f32> {
+    let count = indices.len();
+    if count == 0 {
+        return Vec::new();
+    }
+
+    let gaps = 6.0 * (count.saturating_sub(1)) as f32;
+    let target = (available_width - gaps).max(0.0);
+    let bases: Vec<f32> = indices
+        .iter()
+        .map(|idx| base_widths.get(*idx).copied().unwrap_or(MIN_TAB_WIDTH))
+        .collect();
+    let mins: Vec<f32> = bases.iter().map(|w| (*w).min(MIN_TAB_WIDTH)).collect();
+    let sum_base: f32 = bases.iter().sum();
+
+    if sum_base <= target {
+        // Grow proportionally so the row reaches the full available width.
+        let extra = target - sum_base;
+        let denom = sum_base.max(1.0);
+        bases
+            .iter()
+            .map(|width| *width + extra * (*width / denom))
+            .collect()
+    } else {
+        // Shrink proportionally to each tab's available headroom.
+        let headroom: Vec<f32> = bases
+            .iter()
+            .zip(mins.iter())
+            .map(|(base, min)| (*base - *min).max(0.0))
+            .collect();
+        let sum_headroom: f32 = headroom.iter().sum();
+        let reduction = sum_base - target;
+
+        if sum_headroom <= 0.0 || reduction >= sum_headroom {
+            mins
+        } else {
+            let factor = reduction / sum_headroom;
+            bases
+                .iter()
+                .zip(headroom.iter())
+                .map(|(base, room)| *base - *room * factor)
+                .collect()
+        }
+    }
+}
+
 /// Distributes tab indices over at most two rows. The first row is filled up
 /// to the available width and the remainder flows into the second row.
 pub fn split_tabs_into_rows(
@@ -182,28 +283,16 @@ pub fn split_tabs_into_rows(
     playing_video_id: Option<&str>,
     is_video_playing: bool,
 ) -> (Vec<usize>, Vec<usize>) {
-    let mut row0 = Vec::new();
-    let mut row1 = Vec::new();
-    let mut row0_width = 0.0_f32;
-
-    for (idx, tab) in tabs.iter().enumerate() {
-        let is_playing = is_video_playing
-            && !tab.video_id.is_empty()
-            && playing_video_id == Some(tab.video_id.as_str());
-        let width = estimate_tab_width(&tab.title, is_playing);
-        let add = width + if row0.is_empty() { 0.0 } else { 6.0 };
-
-        if row1.is_empty() && !row0.is_empty() && row0_width + add > available_width {
-            row1.push(idx);
-        } else if row1.is_empty() {
-            row0.push(idx);
-            row0_width += add;
-        } else {
-            row1.push(idx);
-        }
-    }
-
-    (row0, row1)
+    let widths: Vec<f32> = tabs
+        .iter()
+        .map(|tab| {
+            let is_playing = is_video_playing
+                && !tab.video_id.is_empty()
+                && playing_video_id == Some(tab.video_id.as_str());
+            estimate_tab_width(&tab.title, is_playing)
+        })
+        .collect();
+    split_tabs_into_rows_with_widths(&widths, available_width)
 }
 
 
@@ -235,6 +324,7 @@ pub fn view_header_bar<'a, Message: Clone + 'static>(
     window_width: f32,
     tabs_scroll_x: f32,
     tabs_max_scroll_x: f32,
+    tabs_viewport_width: f32,
     tab_two_rows: bool,
     tab_two_rows_progress: f32,
     custom_titlebar: bool,
@@ -268,6 +358,12 @@ pub fn view_header_bar<'a, Message: Clone + 'static>(
     let two_rows_active =
         (tab_two_rows || tab_two_rows_progress > 0.001) && !tabs.is_empty();
     let tab_height = tab_pill_height(custom_titlebar, is_maximized);
+    let animated_progress = if two_rows_active {
+        tab_two_rows_progress.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let header_total_height = header_height(custom_titlebar, is_maximized, animated_progress);
 
     // 1. Left section: Back, Home button (with uniform active styling)
     let back_btn = button(icon_back(18.0))
@@ -282,7 +378,7 @@ pub fn view_header_bar<'a, Message: Clone + 'static>(
             .spacing(6)
             .align_y(Alignment::Center),
     )
-    .height(Length::Fill)
+    .height(Length::Fixed(56.0))
     .align_y(iced::alignment::Vertical::Center);
 
     // 2. Suscripciones (icon-only) + Historial + Descargas + Search Bar
@@ -322,7 +418,7 @@ pub fn view_header_bar<'a, Message: Clone + 'static>(
             .spacing(4)
             .align_y(Alignment::Center),
     )
-    .height(Length::Fill)
+    .height(Length::Fixed(56.0))
     .align_y(iced::alignment::Vertical::Center);
 
     // 3. Center/Horizontal Tabs section: Pestañas ergonómicas estilo Firefox (38-44px alto, clic completo)
@@ -334,7 +430,65 @@ pub fn view_header_bar<'a, Message: Clone + 'static>(
         / 2200.0;
 
     let mut tab_pills: Vec<Option<Element<'a, Message>>> = Vec::with_capacity(tabs.len());
-    let mut tab_widths: Vec<f32> = Vec::with_capacity(tabs.len());
+
+    let available_tabs_width = if two_rows_active && tabs_viewport_width > 1.0 {
+        tabs_viewport_width
+    } else {
+        tabs_available_width(
+            window_width,
+            search_bar_width,
+            is_authenticated,
+            user_name.is_some(),
+            custom_titlebar,
+        )
+    };
+
+    let base_tab_widths: Vec<f32> = tabs
+        .iter()
+        .map(|tab| {
+            let is_playing = is_video_playing
+                && !tab.video_id.is_empty()
+                && playing_video_id == Some(tab.video_id.as_str());
+            estimate_tab_width(&tab.title, is_playing)
+        })
+        .collect();
+
+    let (row0_indices, row1_indices) = if two_rows_active {
+        split_tabs_into_rows_with_widths(&base_tab_widths, available_tabs_width)
+    } else {
+        ((0..tabs.len()).collect::<Vec<_>>(), Vec::new())
+    };
+
+    let row_total_width = |indices: &[usize], widths: &[f32]| -> f32 {
+        indices
+            .iter()
+            .enumerate()
+            .map(|(n, idx)| widths.get(*idx).copied().unwrap_or(0.0) + if n > 0 { 6.0 } else { 0.0 })
+            .sum()
+    };
+
+    // In two-row mode the visible row is stretched/shrunk to use the whole
+    // available width, so the first row never ends with a dead gap.
+    let mut render_widths = base_tab_widths.clone();
+    if two_rows_active {
+        let row0_widths = distribute_row_widths(&row0_indices, &base_tab_widths, available_tabs_width);
+        for (n, idx) in row0_indices.iter().enumerate() {
+            if let Some(width) = row0_widths.get(n) {
+                render_widths[*idx] = *width;
+            }
+        }
+
+        if !row1_indices.is_empty()
+            && row_total_width(&row1_indices, &base_tab_widths) <= available_tabs_width
+        {
+            let row1_widths = distribute_row_widths(&row1_indices, &base_tab_widths, available_tabs_width);
+            for (n, idx) in row1_indices.iter().enumerate() {
+                if let Some(width) = row1_widths.get(n) {
+                    render_widths[*idx] = *width;
+                }
+            }
+        }
+    }
 
     for (idx, tab) in tabs.iter().enumerate() {
         let is_active = active_tab_idx == Some(idx);
@@ -347,8 +501,10 @@ pub fn view_header_bar<'a, Message: Clone + 'static>(
         let shake_elapsed = shaking_tab.and_then(|(s_idx, el)| if s_idx == idx { Some(el) } else { None });
 
         let tab_title = tab_display_title(&tab.title);
-        let est_this_tab_w = estimate_tab_width(&tab.title, is_playing_this_tab);
-        tab_widths.push(est_this_tab_w);
+        let est_this_tab_w = render_widths
+            .get(idx)
+            .copied()
+            .unwrap_or_else(|| estimate_tab_width(&tab.title, is_playing_this_tab));
 
         let text_color = if is_active || is_hovered || is_playing_this_tab || is_dragging_this {
             iced::Color::WHITE
@@ -532,38 +688,12 @@ pub fn view_header_bar<'a, Message: Clone + 'static>(
         tab_pills.push(Some(tab_pill.into()));
     }
 
-    // Chrome/Firefox overflow detection accounting for CSD window buttons.
-    let available_tabs_width = tabs_available_width(
-        window_width,
-        search_bar_width,
-        is_authenticated,
-        user_name.is_some(),
-        custom_titlebar,
-    );
-
-    let (row0_indices, row1_indices) = if two_rows_active {
-        split_tabs_into_rows(tabs, available_tabs_width, playing_video_id, is_video_playing)
-    } else {
-        ((0..tabs.len()).collect::<Vec<_>>(), Vec::new())
-    };
-
     let row_width = |indices: &[usize]| -> f32 {
-        indices
-            .iter()
-            .enumerate()
-            .map(|(n, idx)| {
-                tab_widths.get(*idx).copied().unwrap_or(0.0) + if n > 0 { 6.0 } else { 0.0 }
-            })
-            .sum()
+        row_total_width(indices, &render_widths)
     };
     let row0_width = row_width(&row0_indices);
     let row1_width = row_width(&row1_indices);
     let second_row_target = !row1_indices.is_empty();
-    let animated_progress = if two_rows_active {
-        tab_two_rows_progress.clamp(0.0, 1.0)
-    } else {
-        0.0
-    };
     let second_row_visible = two_rows_active && (second_row_target || animated_progress > 0.001);
     // Smoothstep keeps the second row expanding/contracting softly.
     let eased = animated_progress * animated_progress * (3.0 - 2.0 * animated_progress);
@@ -706,7 +836,7 @@ pub fn view_header_bar<'a, Message: Clone + 'static>(
         .on_right_press(on_header_menu.clone())
         .into();
 
-        let base_row: Element<'a, Message> = if second_row_visible || has_overflow {
+        let base_row: Element<'a, Message> = if two_rows_active || second_row_visible || has_overflow {
             container(tabs_visual)
                 .width(Length::Fill)
                 .height(Length::Fill)
@@ -936,7 +1066,7 @@ pub fn view_header_bar<'a, Message: Clone + 'static>(
     right_row = right_row.push(auth_btn).push(reload_btn);
 
     let right_tools = container(right_row)
-        .height(Length::Fill)
+        .height(Length::Fixed(56.0))
         .align_y(iced::alignment::Vertical::Center);
 
     let mut main_header_row = row![
@@ -949,8 +1079,8 @@ pub fn view_header_bar<'a, Message: Clone + 'static>(
         Space::with_width(Length::Fixed(8.0)),
         right_tools,
     ]
-    .height(Length::Fill)
-    .align_y(Alignment::Center);
+    .height(Length::Fixed(header_total_height))
+    .align_y(Alignment::Start);
 
     if custom_titlebar {
         let win_btn_h = if fitts_top { 44.0 } else { 36.0 };
@@ -1006,7 +1136,7 @@ pub fn view_header_bar<'a, Message: Clone + 'static>(
                 .spacing(if fitts_top { 0 } else { 2 })
                 .align_y(Alignment::Center),
         )
-        .height(Length::Fill)
+        .height(Length::Fixed(56.0))
         .padding(iced::Padding {
             top: 0.0,
             bottom: 0.0,
@@ -1030,11 +1160,7 @@ pub fn view_header_bar<'a, Message: Clone + 'static>(
             border: iced::border::color(color_border()).width(1.0),
             ..container::Style::default()
         })
-        .height(Length::Fixed(header_height(
-            custom_titlebar,
-            is_maximized,
-            if two_rows_active { animated_progress } else { 0.0 },
-        )))
+        .height(Length::Fixed(header_total_height))
         .width(Length::Fill);
 
     if custom_titlebar {
@@ -2157,6 +2283,7 @@ mod tests {
             None,
             None,
             1280.0,
+            0.0,
             0.0,
             0.0,
             false,
