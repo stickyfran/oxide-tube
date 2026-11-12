@@ -338,6 +338,7 @@ pub struct WaylandZeroCopyPlayer {
     duration_ms: Arc<AtomicU64>,
     is_playing: Arc<AtomicBool>,
     is_buffering: Arc<AtomicBool>,
+    is_seeking: Arc<AtomicBool>,
     buffering_percent: Arc<AtomicU8>,
     first_frame_rendered: Arc<AtomicBool>,
     awaiting_playback_restart: Arc<AtomicBool>,
@@ -403,6 +404,7 @@ impl WaylandZeroCopyPlayer {
             duration_ms: Arc::new(AtomicU64::new(0)),
             is_playing: Arc::new(AtomicBool::new(false)),
             is_buffering: Arc::new(AtomicBool::new(false)),
+            is_seeking: Arc::new(AtomicBool::new(false)),
             buffering_percent: Arc::new(AtomicU8::new(100)),
             first_frame_rendered: Arc::new(AtomicBool::new(false)),
             awaiting_playback_restart: Arc::new(AtomicBool::new(false)),
@@ -520,6 +522,7 @@ impl WaylandZeroCopyPlayer {
         let duration_ms = self.duration_ms.clone();
         let is_playing = self.is_playing.clone();
         let is_buffering = self.is_buffering.clone();
+        let is_seeking = self.is_seeking.clone();
         let buffering_percent = self.buffering_percent.clone();
         let first_frame_rendered = self.first_frame_rendered.clone();
         let awaiting_playback_restart = self.awaiting_playback_restart.clone();
@@ -782,6 +785,7 @@ impl WaylandZeroCopyPlayer {
                             MPV_EVENT_PLAYBACK_RESTART => {
                                 awaiting_playback_restart.store(false, Ordering::SeqCst);
                                 first_frame_rendered.store(true, Ordering::SeqCst);
+                                is_seeking.store(false, Ordering::SeqCst);
                                 is_buffering.store(false, Ordering::SeqCst);
                                 buffering_percent.store(100, Ordering::SeqCst);
                                 has_error.store(false, Ordering::SeqCst);
@@ -855,7 +859,8 @@ impl WaylandZeroCopyPlayer {
                                                 let flag = unsafe { *(prop.data as *const i32) };
                                                 let awaiting = awaiting_playback_restart.load(Ordering::SeqCst);
                                                 let loading_first = awaiting && !first_frame_rendered.load(Ordering::SeqCst);
-                                                is_buffering.store(flag != 0 || loading_first, Ordering::SeqCst);
+                                                let seeking = is_seeking.load(Ordering::SeqCst);
+                                                is_buffering.store(flag != 0 || loading_first || seeking, Ordering::SeqCst);
                                             }
                                             6 => { // pause
                                                 let flag = unsafe { *(prop.data as *const i32) };
@@ -1228,6 +1233,7 @@ impl WaylandZeroCopyPlayer {
         // Show the buffering spinner immediately while mpv resolves the
         // manifest and fetches the first segments.
         self.is_buffering.store(true, Ordering::SeqCst);
+        self.is_seeking.store(false, Ordering::SeqCst);
         self.buffering_percent.store(0, Ordering::SeqCst);
 
         let ctx_opt = *self.mpv.safe_lock();
@@ -1359,6 +1365,7 @@ impl WaylandZeroCopyPlayer {
             self.is_playing.store(false, Ordering::SeqCst);
             self.first_frame_rendered.store(false, Ordering::SeqCst);
             self.is_buffering.store(false, Ordering::SeqCst);
+            self.is_seeking.store(false, Ordering::SeqCst);
             *self.current_frame.safe_lock() = None;
             self.trigger_worker_wakeup();
             crate::power_manager::trim_process_memory();
@@ -1373,6 +1380,10 @@ impl WaylandZeroCopyPlayer {
         let cur_ms = self.get_position_ms();
         crate::diagnostics::session_seek_start(cur_ms, target_ms);
         let sec_str = format!("{:.3}", target_ms as f64 / 1000.0);
+        // Keep the buffering overlay visible from the moment the seek starts
+        // until mpv reports playback-restart for the new position.
+        self.is_seeking.store(true, Ordering::SeqCst);
+        self.is_buffering.store(true, Ordering::SeqCst);
         if let Some(addr) = *self.mpv.safe_lock() {
             let c_seek = CString::new("seek").unwrap();
             let c_pos = CString::new(sec_str).unwrap();

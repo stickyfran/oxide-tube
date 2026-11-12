@@ -367,6 +367,9 @@ pub struct MitubApp {
     tabs_scroll_x: f32,
     tabs_max_scroll_x: f32,
     tabs_viewport_width: f32,
+    tab_two_rows_progress: f32,
+    tab_second_row_target: bool,
+    tabs_scroll_reset_pending: bool,
     last_memory_trim: std::time::Instant,
     inactive_tab_osd_state: OsdState,
     auto_pip_triggered_by_unfocus: bool,
@@ -1512,6 +1515,9 @@ impl MitubApp {
             tabs_scroll_x: 0.0,
             tabs_max_scroll_x: 0.0,
             tabs_viewport_width: 0.0,
+            tab_two_rows_progress: 0.0,
+            tab_second_row_target: false,
+            tabs_scroll_reset_pending: false,
             last_memory_trim: std::time::Instant::now(),
             inactive_tab_osd_state: OsdState::default(),
             auto_pip_triggered_by_unfocus: false,
@@ -2117,8 +2123,38 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
     }
 
     fn header_height(&self) -> f32 {
-        let two_rows = self.config.tab_two_rows && !self.tabs.is_empty();
-        ui::header_height(self.config.custom_titlebar, self.is_maximized, two_rows)
+        ui::header_height(
+            self.config.custom_titlebar,
+            self.is_maximized,
+            if self.config.tab_two_rows || self.tab_two_rows_progress > 0.001 {
+                self.tab_two_rows_progress
+            } else {
+                0.0
+            },
+        )
+    }
+
+    /// True when the current tab set no longer fits in a single row and the
+    /// optional second row must be shown.
+    fn tab_second_row_wanted(&self) -> bool {
+        if !self.config.tab_two_rows || self.tabs.is_empty() {
+            return false;
+        }
+        let is_authed = self.auth_status.starts_with("[OK]");
+        let available = ui::tabs_available_width(
+            self.window_size.0,
+            self.current_search_bar_width(),
+            is_authed,
+            self.user_display_name.is_some(),
+            self.config.custom_titlebar,
+        );
+        let (_, row1) = ui::split_tabs_into_rows(
+            &self.tabs,
+            available,
+            self.playing_video_id.as_deref(),
+            self.osd_state.is_playing,
+        );
+        !row1.is_empty()
     }
 
     /// Approximate horizontal scroll offset that keeps the tab at `idx`
@@ -2145,9 +2181,11 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
             self.playing_video_id.as_deref(),
             self.osd_state.is_playing,
         );
-        let (indices, pos) = if let Some(p) = row0.iter().position(|i| *i == idx) {
-            (&row0, p)
-        } else if let Some(p) = row1.iter().position(|i| *i == idx) {
+        // The first row never scrolls; only the overflow row does.
+        if row1.is_empty() || row0.contains(&idx) {
+            return 0.0;
+        }
+        let (indices, pos) = if let Some(p) = row1.iter().position(|i| *i == idx) {
             (&row1, p)
         } else {
             return 0.0;
@@ -2517,6 +2555,25 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
             }
 
             Message::Tick => {
+                // Animate the optional second tab row (expand/contract).
+                let row_target = self.tab_second_row_wanted();
+                if row_target != self.tab_second_row_target {
+                    self.tab_second_row_target = row_target;
+                    self.tabs_scroll_x = 0.0;
+                    self.tabs_max_scroll_x = 0.0;
+                    self.tabs_scroll_reset_pending = true;
+                }
+                let progress_target = if row_target { 1.0 } else { 0.0 };
+                if (self.tab_two_rows_progress - progress_target).abs() > 0.001 {
+                    let delta = progress_target - self.tab_two_rows_progress;
+                    let step = 0.16_f32.min(delta.abs());
+                    self.tab_two_rows_progress += delta.signum() * step;
+                    if (self.tab_two_rows_progress - progress_target).abs() <= 0.001 {
+                        self.tab_two_rows_progress = progress_target;
+                    }
+                    self.sync_player_viewport();
+                }
+
 
                 if let Some((start, _)) = self.osd_state.play_pause_anim {
                     if start.elapsed().as_secs_f32() >= 0.50 {
@@ -2875,7 +2932,19 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                         }
                     }
                 }
-                self.update_fullscreen_cursor_visibility()
+                let base_task = self.update_fullscreen_cursor_visibility();
+                if self.tabs_scroll_reset_pending {
+                    self.tabs_scroll_reset_pending = false;
+                    Task::batch([
+                        base_task,
+                        iced::widget::scrollable::scroll_to(
+                            iced::widget::scrollable::Id::new("tabs_scrollable"),
+                            iced::widget::scrollable::AbsoluteOffset { x: 0.0, y: 0.0 },
+                        ),
+                    ])
+                } else {
+                    base_task
+                }
             }
 
             Message::ChatMessagesBatch(msgs) => {
@@ -4231,6 +4300,7 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
 
                     player.seek_ms(target_secs * 1000);
                     self.osd_state.current_pos_secs = target_secs;
+                    self.osd_state.is_buffering = true;
                     self.seek_suppress_until = Some(std::time::Instant::now() + Duration::from_millis(800));
                 }
                 Task::none()
@@ -4240,6 +4310,7 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                 if let Some(player) = &self.player {
                     let target_ms = player.seek_relative_secs(delta);
                     self.osd_state.current_pos_secs = target_ms / 1000;
+                    self.osd_state.is_buffering = true;
                     self.seek_suppress_until = Some(std::time::Instant::now() + Duration::from_millis(800));
                     self.osd_state.trigger_seek_feedback(delta);
                 }
@@ -7978,6 +8049,7 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
             self.tabs_scroll_x,
             self.tabs_max_scroll_x,
             self.config.tab_two_rows,
+            self.tab_two_rows_progress,
             self.config.custom_titlebar,
             self.is_maximized,
             Message::SearchInputChanged,
@@ -8797,6 +8869,9 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
         let target_glow = if self.search_input_focused { 1.0 } else { 0.0 };
         let is_search_glow_animating = (self.search_focus_glow - target_glow).abs() > 0.005;
 
+        let tab_rows_target = if self.tab_second_row_wanted() { 1.0 } else { 0.0 };
+        let is_tab_rows_animating = (self.tab_two_rows_progress - tab_rows_target).abs() > 0.001;
+
         let has_active_animation = is_transitioning
             || is_view_fading
             || has_ripple
@@ -8809,7 +8884,8 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
             || is_tab_hover_animating
             || is_search_animating
             || is_profile_animating
-            || is_search_glow_animating;
+            || is_search_glow_animating
+            || is_tab_rows_animating;
 
         let has_playing_tab_glow = self.osd_state.is_playing
             && self.playing_video_id.is_some()
