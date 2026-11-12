@@ -2084,6 +2084,7 @@ mod tests {
             1280.0,
             0.0,
             0.0,
+            false,
             true,
             false,
             TestMsg::Search,
