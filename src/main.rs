@@ -127,6 +127,8 @@ pub enum Message {
     ToggleCaptions,
     SelectCaptionTrack(Option<usize>),
     CaptionsLoaded(String, Result<Vec<innertube::SubtitleCue>, String>),
+    CommentsLoaded(u64, String, Result<Vec<innertube::CommentItem>, String>),
+    RydCountsLoaded(String, String, String),
     ToggleTheater,
     ToggleFullscreen,
     TogglePip,
@@ -185,6 +187,7 @@ pub enum Message {
     HomeScrolled(iced::widget::scrollable::Viewport),
     MoreFeedLoaded(Result<Vec<VideoCard>, String>),
     TabsScrolled(iced::widget::scrollable::Viewport),
+    TabsFirstRowScrolled(iced::widget::scrollable::Viewport),
     TriggerFullBuffer(String),
     FullBufferTitle(String, String),
     DeleteDownloadedVideo(String),
@@ -216,6 +219,7 @@ pub enum Message {
     CloseMainWindow,
     StartMainWindowResize(PipResizeEdge),
     ToggleCustomTitlebar,
+    ToggleTabTwoRows,
 }
 
 #[derive(Debug, Clone)]
@@ -353,6 +357,7 @@ pub struct MitubApp {
     live_chat_poll_tick: u32,
     playing_video_id: Option<String>,
     video_started_at: Option<std::time::Instant>,
+    playback_retry_count: u8,
     recently_autoplayed: Vec<String>,
     description_content: iced::widget::text_editor::Content,
     last_snapshot_frame_ids: HashMap<String, u64>,
@@ -366,6 +371,11 @@ pub struct MitubApp {
     closed_tabs_history: std::collections::VecDeque<ui::VideoTab>,
     tabs_scroll_x: f32,
     tabs_max_scroll_x: f32,
+    tabs_viewport_width: f32,
+    tabs_first_row_width: f32,
+    tab_two_rows_progress: f32,
+    tab_second_row_target: bool,
+    tabs_scroll_reset_pending: bool,
     last_memory_trim: std::time::Instant,
     inactive_tab_osd_state: OsdState,
     auto_pip_triggered_by_unfocus: bool,
@@ -991,9 +1001,12 @@ fn start_full_buffer_task(
     initial_title: String,
     known_streams: Option<(String, Option<String>)>,
 ) -> Task<Message> {
+    static FULL_BUFFER_SEM: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
     Task::run(
         iced::stream::channel(100, move |mut output: iced::futures::channel::mpsc::Sender<Message>| async move {
             use iced::futures::SinkExt;
+
+            let _download_permit = FULL_BUFFER_SEM.acquire().await;
 
             let cache_dir = crate::cache_manager::video_cache_dir();
             let _ = tokio::fs::create_dir_all(&cache_dir).await;
@@ -1066,9 +1079,9 @@ fn start_full_buffer_task(
             let has_separate_audio = a_url.is_some();
             let v_range = if has_separate_audio { (3u8, 75u8) } else { (3u8, 98u8) };
 
-            // Helper function to download an HTTP resource using Range Chunking (8 MB chunks)
-            // This bypasses YouTube CDN's aggressive bandwidth throttling (400 KB/s -> 4-10 MB/s)
-            // and provides resilient resume capabilities if a chunk drops.
+            // Downloads a stream with small ranged requests and streams the
+            // body straight to disk. This keeps the UI informed from the first
+            // received bytes and lets us recover from stalled CDN connections.
             let download_stream_chunked = |stream_url: String,
                                            part_path: PathBuf,
                                            dest_path: PathBuf,
@@ -1080,44 +1093,9 @@ fn start_full_buffer_task(
                                            vid_id: String| {
                 let http_client = client.clone();
                 async move {
-                    use iced::futures::SinkExt;
+                    use iced::futures::StreamExt;
                     use tokio::io::AsyncWriteExt;
 
-                    // 1. Determine total stream size via HEAD or initial byte probe
-                    let mut total_size: u64 = 0;
-                    if let Ok(head_resp) = http_client
-                        .head(&stream_url)
-                        .header(reqwest::header::REFERER, "https://www.youtube.com/")
-                        .header(reqwest::header::ORIGIN, "https://www.youtube.com")
-                        .send()
-                        .await
-                    {
-                        if head_resp.status().is_success() {
-                            total_size = head_resp.content_length().unwrap_or(0);
-                        }
-                    }
-
-                    if total_size == 0 {
-                        // Fallback: request byte 0-0 to extract Content-Range total length
-                        if let Ok(probe_resp) = http_client
-                            .get(&stream_url)
-                            .header(reqwest::header::REFERER, "https://www.youtube.com/")
-                            .header(reqwest::header::ORIGIN, "https://www.youtube.com")
-                            .header(reqwest::header::RANGE, "bytes=0-0")
-                            .send()
-                            .await
-                        {
-                            if let Some(range_header) = probe_resp.headers().get(reqwest::header::CONTENT_RANGE) {
-                                if let Ok(s) = range_header.to_str() {
-                                    if let Some((_, total_str)) = s.split_once('/') {
-                                        total_size = total_str.trim().parse::<u64>().unwrap_or(0);
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    // Open file in append/create mode so we can resume chunks cleanly
                     let mut file = tokio::fs::OpenOptions::new()
                         .create(true)
                         .write(true)
@@ -1126,127 +1104,240 @@ fn start_full_buffer_task(
                         .await
                         .map_err(|e| e.to_string())?;
 
-                    let existing_len = file.metadata().await.map(|m| m.len()).unwrap_or(0);
-                    let mut downloaded = existing_len;
+                    let mut downloaded = file.metadata().await.map(|m| m.len()).unwrap_or(0);
+                    let mut total_size: u64 = 0;
 
-                    let mut last_pct = pct_start;
                     let mut last_speed_time = std::time::Instant::now();
                     let mut last_speed_bytes: u64 = downloaded;
                     let mut current_speed_bps: u64 = 0;
                     let mut last_emit_time = std::time::Instant::now();
+                    let mut failed_attempts: u32 = 0;
 
-                    const CHUNK_SIZE: u64 = 8 * 1024 * 1024; // 8 MB chunks for peak CDN throughput
+                    // Smaller chunks start producing progress almost
+                    // immediately even when YouTube throttles the CDN.
+                    const CHUNK_SIZE: u64 = 2 * 1024 * 1024;
 
-                    if total_size > 0 && downloaded < total_size {
-                        while downloaded < total_size {
-                            let chunk_end = (downloaded + CHUNK_SIZE - 1).min(total_size - 1);
-                            let range_header = format!("bytes={downloaded}-{chunk_end}");
-
-                            let mut chunk_success = false;
-                            for retry in 0..3 {
-                                match http_client
-                                    .get(&stream_url)
-                                    .header(reqwest::header::REFERER, "https://www.youtube.com/")
-                                    .header(reqwest::header::ORIGIN, "https://www.youtube.com")
-                                    .header(reqwest::header::RANGE, &range_header)
-                                    .send()
-                                    .await
-                                {
-                                    Ok(resp) if resp.status().is_success() || resp.status() == reqwest::StatusCode::PARTIAL_CONTENT => {
-                                        match resp.bytes().await {
-                                            Ok(bytes) => {
-                                                file.write_all(&bytes).await.map_err(|e| e.to_string())?;
-                                                downloaded += bytes.len() as u64;
-                                                chunk_success = true;
-                                                break;
-                                            }
-                                            Err(e) => {
-                                                eprintln!("[Mitub Download] Retry {retry} read chunk error: {e}");
-                                            }
-                                        }
-                                    }
-                                    Ok(resp) => {
-                                        eprintln!("[Mitub Download] Retry {retry} chunk status error: {}", resp.status());
-                                    }
-                                    Err(e) => {
-                                        eprintln!("[Mitub Download] Retry {retry} network error: {e}");
-                                    }
-                                }
-                                tokio::time::sleep(tokio::time::Duration::from_millis(500 * (retry + 1))).await;
-                            }
-
-                            if !chunk_success {
-                                return Err(format!("Fallo persistente de descarga en bloque {range_header}"));
-                            }
-
-                            let now = std::time::Instant::now();
-                            let elapsed_speed = now.duration_since(last_speed_time).as_secs_f64();
-                            if elapsed_speed >= 0.3 {
-                                let diff = downloaded.saturating_sub(last_speed_bytes);
-                                current_speed_bps = (diff as f64 / elapsed_speed) as u64;
-                                last_speed_bytes = downloaded;
-                                last_speed_time = now;
-                            }
-
-                            let p = pct_start as f32
-                                + (downloaded as f32 / total_size as f32) * (pct_end - pct_start) as f32;
-                            let p_u8 = p.clamp(pct_start as f32, pct_end as f32) as u8;
-                            if p_u8 > last_pct || now.duration_since(last_emit_time).as_millis() >= 300 {
-                                last_pct = p_u8;
-                                last_emit_time = now;
-                                let _ = out_sender.send(Message::FullBufferProgress(
-                                    vid_id.clone(),
-                                    p_u8,
-                                    base_downloaded + downloaded,
-                                    total_file_offset + total_size,
-                                    current_speed_bps,
-                                )).await;
-                            }
+                    loop {
+                        if total_size > 0 && downloaded >= total_size {
+                            break;
                         }
-                    } else if total_size == 0 {
-                        // Fallback stream when server does not provide content-range / content-length
-                        use iced::futures::StreamExt;
-                        let resp = http_client
+                        if failed_attempts >= 6 {
+                            return Err(format!(
+                                "No se pudo continuar la descarga desde el byte {downloaded}"
+                            ));
+                        }
+
+                        let range_end = if total_size > 0 {
+                            (downloaded + CHUNK_SIZE - 1).min(total_size - 1)
+                        } else {
+                            downloaded + CHUNK_SIZE - 1
+                        };
+                        let range_header = format!("bytes={downloaded}-{range_end}");
+                        let chunk_start = downloaded;
+                        let requested_len = range_end - chunk_start + 1;
+
+                        let response = http_client
                             .get(&stream_url)
                             .header(reqwest::header::REFERER, "https://www.youtube.com/")
                             .header(reqwest::header::ORIGIN, "https://www.youtube.com")
+                            .header(reqwest::header::RANGE, &range_header)
                             .send()
-                            .await
-                            .map_err(|e| e.to_string())?;
+                            .await;
 
-                        if !resp.status().is_success() {
-                            return Err(format!("HTTP {}", resp.status()));
+                        let resp = match response {
+                            Ok(resp)
+                                if resp.status().is_success()
+                                    || resp.status() == reqwest::StatusCode::PARTIAL_CONTENT =>
+                            {
+                                resp
+                            }
+                            Ok(resp)
+                                if resp.status() == reqwest::StatusCode::RANGE_NOT_SATISFIABLE =>
+                            {
+                                total_size = downloaded;
+                                break;
+                            }
+                            Ok(resp) => {
+                                failed_attempts += 1;
+                                eprintln!(
+                                    "[Mitub Download] HTTP {} para {vid_id}; reintentando",
+                                    resp.status()
+                                );
+                                tokio::time::sleep(tokio::time::Duration::from_millis(
+                                    300 * failed_attempts as u64,
+                                ))
+                                .await;
+                                continue;
+                            }
+                            Err(e) => {
+                                failed_attempts += 1;
+                                eprintln!(
+                                    "[Mitub Download] Error de red para {vid_id}: {e}; reintentando"
+                                );
+                                tokio::time::sleep(tokio::time::Duration::from_millis(
+                                    300 * failed_attempts as u64,
+                                ))
+                                .await;
+                                continue;
+                            }
+                        };
+
+                        let response_status = resp.status();
+
+                        // Learn the total size from the first ranged response
+                        // instead of paying for a separate HEAD request.
+                        if total_size == 0 {
+                            if let Some(content_range) = resp
+                                .headers()
+                                .get(reqwest::header::CONTENT_RANGE)
+                                .and_then(|v| v.to_str().ok())
+                            {
+                                if let Some((_, total_str)) = content_range.split_once('/') {
+                                    total_size = total_str.trim().parse::<u64>().unwrap_or(0);
+                                }
+                            }
+                            if total_size == 0 && response_status == reqwest::StatusCode::OK {
+                                if let Some(len) = resp.content_length() {
+                                    total_size = chunk_start + len;
+                                }
+                            }
                         }
+
                         let mut stream = resp.bytes_stream();
-                        while let Some(chunk_res) = stream.next().await {
-                            let chunk = chunk_res.map_err(|e| e.to_string())?;
-                            file.write_all(&chunk).await.map_err(|e| e.to_string())?;
-                            downloaded += chunk.len() as u64;
+                        let mut wrote_any = false;
+                        let mut read_error: Option<String> = None;
 
-                            let now = std::time::Instant::now();
-                            let elapsed_speed = now.duration_since(last_speed_time).as_secs_f64();
-                            if elapsed_speed >= 0.3 {
-                                let diff = downloaded.saturating_sub(last_speed_bytes);
-                                current_speed_bps = (diff as f64 / elapsed_speed) as u64;
-                                last_speed_bytes = downloaded;
-                                last_speed_time = now;
-                            }
+                        loop {
+                            let next = tokio::time::timeout(
+                                std::time::Duration::from_secs(10),
+                                stream.next(),
+                            )
+                            .await;
 
-                            if now.duration_since(last_emit_time).as_millis() >= 300 {
-                                last_emit_time = now;
-                                let _ = out_sender.send(Message::FullBufferProgress(
-                                    vid_id.clone(),
-                                    pct_end,
-                                    base_downloaded + downloaded,
-                                    base_downloaded + downloaded,
-                                    current_speed_bps,
-                                )).await;
+                            match next {
+                                Err(_) => {
+                                    read_error = Some("timeout leyendo datos".to_string());
+                                    break;
+                                }
+                                Ok(None) => break,
+                                Ok(Some(Err(e))) => {
+                                    read_error = Some(e.to_string());
+                                    break;
+                                }
+                                Ok(Some(Ok(bytes))) => {
+                                    if bytes.is_empty() {
+                                        continue;
+                                    }
+                                    file.write_all(&bytes).await.map_err(|e| e.to_string())?;
+                                    downloaded += bytes.len() as u64;
+                                    wrote_any = true;
+
+                                    let now = std::time::Instant::now();
+                                    let elapsed_speed =
+                                        now.duration_since(last_speed_time).as_secs_f64();
+                                    if elapsed_speed >= 0.3 {
+                                        let diff = downloaded.saturating_sub(last_speed_bytes);
+                                        current_speed_bps =
+                                            (diff as f64 / elapsed_speed) as u64;
+                                        last_speed_bytes = downloaded;
+                                        last_speed_time = now;
+                                    }
+
+                                    if now.duration_since(last_emit_time).as_millis() >= 200 {
+                                        last_emit_time = now;
+                                        let p = if total_size > 0 {
+                                            pct_start as f32
+                                                + (downloaded as f32 / total_size as f32)
+                                                    * (pct_end - pct_start) as f32
+                                        } else {
+                                            pct_start as f32
+                                        };
+                                        let p_u8 = p
+                                            .clamp(pct_start as f32, pct_end as f32)
+                                            as u8;
+                                        let total_display = if total_size > 0 {
+                                            total_file_offset + total_size
+                                        } else {
+                                            0
+                                        };
+                                        let _ = out_sender
+                                            .send(Message::FullBufferProgress(
+                                                vid_id.clone(),
+                                                p_u8,
+                                                base_downloaded + downloaded,
+                                                total_display,
+                                                current_speed_bps,
+                                            ))
+                                            .await;
+                                    }
+
+                                    if total_size > 0 && downloaded >= total_size {
+                                        break;
+                                    }
+                                }
                             }
                         }
+
+                        if let Some(err) = read_error {
+                            if wrote_any {
+                                failed_attempts = 0;
+                            } else {
+                                failed_attempts += 1;
+                            }
+                            eprintln!(
+                                "[Mitub Download] {vid_id}: {err}; continuando desde {downloaded}"
+                            );
+                            tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
+                            continue;
+                        }
+
+                        if total_size > 0 && downloaded >= total_size {
+                            break;
+                        }
+
+                        if total_size == 0 {
+                            // No Content-Range: a 200 response means the full
+                            // remaining file was delivered. A 206 response is
+                            // followed by another ranged request if this chunk
+                            // was complete.
+                            if response_status != reqwest::StatusCode::PARTIAL_CONTENT {
+                                break;
+                            }
+                            if downloaded.saturating_sub(chunk_start) < requested_len {
+                                break;
+                            }
+                        }
+
+                        if !wrote_any {
+                            failed_attempts += 1;
+                            tokio::time::sleep(tokio::time::Duration::from_millis(400)).await;
+                            continue;
+                        }
+
+                        failed_attempts = 0;
                     }
 
                     file.flush().await.map_err(|e| e.to_string())?;
-                    tokio::fs::rename(&part_path, &dest_path).await.map_err(|e| e.to_string())?;
+
+                    let p = pct_end as f32;
+                    let total_display = if total_size > 0 {
+                        total_file_offset + total_size
+                    } else {
+                        base_downloaded + downloaded
+                    };
+                    let _ = out_sender
+                        .send(Message::FullBufferProgress(
+                            vid_id.clone(),
+                            p as u8,
+                            base_downloaded + downloaded,
+                            total_display,
+                            current_speed_bps,
+                        ))
+                        .await;
+
+                    tokio::fs::rename(&part_path, &dest_path)
+                        .await
+                        .map_err(|e| e.to_string())?;
                     Ok::<u64, String>(downloaded)
                 }
             };
@@ -1499,6 +1590,7 @@ impl MitubApp {
             live_chat_poll_tick: 0,
             playing_video_id: None,
             video_started_at: None,
+            playback_retry_count: 0,
             recently_autoplayed: Vec::new(),
             description_content: iced::widget::text_editor::Content::new(),
             last_snapshot_frame_ids: HashMap::new(),
@@ -1513,6 +1605,11 @@ impl MitubApp {
             closed_tabs_history: std::collections::VecDeque::with_capacity(5),
             tabs_scroll_x: 0.0,
             tabs_max_scroll_x: 0.0,
+            tabs_viewport_width: 0.0,
+            tabs_first_row_width: 0.0,
+            tab_two_rows_progress: 0.0,
+            tab_second_row_target: false,
+            tabs_scroll_reset_pending: false,
             last_memory_trim: std::time::Instant::now(),
             inactive_tab_osd_state: OsdState::default(),
             auto_pip_triggered_by_unfocus: false,
@@ -1682,6 +1779,7 @@ impl MitubApp {
                 live_chat_continuation: None,
                 recommended_videos: Vec::new(),
                 comments: Vec::new(),
+                comments_continuation: None,
                 video_streams: Vec::new(),
                 audio_streams: Vec::new(),
                 caption_tracks: Vec::new(),
@@ -2120,6 +2218,84 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
         16.0 / 9.0
     }
 
+    fn header_height(&self) -> f32 {
+        let progress = if !self.tabs.is_empty()
+            && (self.config.tab_two_rows || self.tab_two_rows_progress > 0.001)
+        {
+            self.tab_two_rows_progress
+        } else {
+            0.0
+        };
+        ui::header_height(self.config.custom_titlebar, self.is_maximized, progress)
+    }
+
+    /// Horizontal space available to the first tab row.
+    fn tabs_layout_available_width(&self) -> f32 {
+        let two_rows = self.config.tab_two_rows || self.tab_two_rows_progress > 0.001;
+        if two_rows && self.tabs_first_row_width > 1.0 {
+            return self.tabs_first_row_width;
+        }
+        let is_authed = self.auth_status.starts_with("[OK]");
+        ui::tabs_available_width(
+            self.window_size.0,
+            self.current_search_bar_width(),
+            is_authed,
+            self.user_display_name.as_deref(),
+            self.config.incognito_mode,
+            self.config.custom_titlebar,
+        )
+    }
+
+    /// True when the current tab set no longer fits in a single row and the
+    /// optional second row must be shown.
+    fn tab_second_row_wanted(&self) -> bool {
+        if !self.config.tab_two_rows || self.tabs.is_empty() {
+            return false;
+        }
+        let available = self.tabs_layout_available_width();
+        let (_, row1) = ui::split_tabs_into_rows(
+            &self.tabs,
+            available,
+            self.playing_video_id.as_deref(),
+            self.osd_state.is_playing,
+        );
+        !row1.is_empty()
+    }
+
+    /// Approximate horizontal scroll offset that keeps the tab at `idx`
+    /// visible, taking the optional two-row layout into account.
+    fn tab_scroll_target(&self, idx: usize) -> f32 {
+        if self.tabs.is_empty() || idx >= self.tabs.len() {
+            return 0.0;
+        }
+        if !self.config.tab_two_rows {
+            return (idx as f32 * 190.0).max(0.0);
+        }
+
+        let available = self.tabs_layout_available_width();
+        let (row0, row1) = ui::split_tabs_into_rows(
+            &self.tabs,
+            available,
+            self.playing_video_id.as_deref(),
+            self.osd_state.is_playing,
+        );
+        // The first row never scrolls; only the overflow row does.
+        if row1.is_empty() || row0.contains(&idx) {
+            return 0.0;
+        }
+        let count = row0.len();
+        if count == 0 {
+            return 0.0;
+        }
+        let uniform = ((available - 6.0 * count.saturating_sub(1) as f32).max(0.0)
+            / count as f32)
+            .max(ui::MIN_TAB_WIDTH);
+        let pos = row1.iter().position(|i| *i == idx).unwrap_or(0);
+        let before = pos as f32 * (uniform + 6.0);
+        let second_row_available = (self.window_size.0 - 24.0).max(80.0);
+        (before + uniform * 0.5 - second_row_available * 0.5).max(0.0)
+    }
+
     fn current_search_bar_width(&self) -> f32 {
         let is_expanded = self.search_hovered || self.search_input_focused || !self.search_query.is_empty();
         let target_w = if is_expanded { 300.0 } else { 145.0 };
@@ -2342,6 +2518,7 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                                         }
                                         self.playing_video_id = Some(details.video_id.clone());
                                         self.video_started_at = Some(std::time::Instant::now());
+                                        self.playback_retry_count = 0;
                                         self.osd_state.is_playing = true;
                                         let _ = p_arc.play_stream_with_seek(&v_uri, a_uri.as_deref(), seek_target);
                                         self.sync_player_viewport();
@@ -2464,6 +2641,27 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
             }
 
             Message::Tick => {
+                // Animate the optional second tab row (expand/contract).
+                let row_target = self.tab_second_row_wanted();
+                if row_target != self.tab_second_row_target {
+                    self.tab_second_row_target = row_target;
+                    self.tabs_scroll_x = 0.0;
+                    self.tabs_max_scroll_x = 0.0;
+                    self.tabs_viewport_width = 0.0;
+                    self.tabs_first_row_width = 0.0;
+                    self.tabs_scroll_reset_pending = true;
+                }
+                let progress_target = if row_target { 1.0 } else { 0.0 };
+                if (self.tab_two_rows_progress - progress_target).abs() > 0.001 {
+                    let delta = progress_target - self.tab_two_rows_progress;
+                    let step = 0.16_f32.min(delta.abs());
+                    self.tab_two_rows_progress += delta.signum() * step;
+                    if (self.tab_two_rows_progress - progress_target).abs() <= 0.001 {
+                        self.tab_two_rows_progress = progress_target;
+                    }
+                    self.sync_player_viewport();
+                }
+
 
                 if let Some((start, _)) = self.osd_state.play_pause_anim {
                     if start.elapsed().as_secs_f32() >= 0.50 {
@@ -2603,11 +2801,41 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                         if let Some(started_at) = self.video_started_at {
                             let elapsed = started_at.elapsed();
                             let has_err = player.has_error();
-                            let is_stalled = elapsed > Duration::from_secs(8)
+                            let is_stalled = elapsed > Duration::from_secs(5)
                                 && (!player.is_buffering() || player.buffering_percent() == 0);
 
                             if (has_err || is_stalled) && !self.osd_state.has_playback_error {
-                                if let Some(details) = &self.watch_details {
+                                // First attempt: reload the same stream once. This
+                                // recovers from a stalled CDN connection without
+                                // changing codec quality unnecessarily.
+                                if self.playback_retry_count == 0 {
+                                    if let Some(details) = &self.watch_details {
+                                        let cur_itag = self.osd_state.selected_quality_itag;
+                                        let current_stream = details
+                                            .video_streams
+                                            .iter()
+                                            .find(|s| s.itag == cur_itag)
+                                            .or_else(|| select_best_stream(&details.video_streams, &self.config));
+                                        if let Some(stream) = current_stream {
+                                            let v_uri = stream.playback_uri("v");
+                                            let a_uri = select_best_audio_stream(&details.audio_streams, self.config.preferred_audio_lang)
+                                                .map(|s| s.playback_uri("a"));
+                                            self.playback_retry_count = 1;
+                                            self.video_started_at = Some(std::time::Instant::now());
+                                            let seek_pos = if self.osd_state.current_pos_secs >= 1 {
+                                                Some(self.osd_state.current_pos_secs * 1000)
+                                            } else {
+                                                None
+                                            };
+                                            eprintln!("[Watchdog] Reiniciando stream por posible conexión CDN colgada");
+                                            if let Err(e) = player.play_stream_with_seek(&v_uri, a_uri.as_deref(), seek_pos) {
+                                                eprintln!("[Watchdog] Falló el reintento: {e}");
+                                            }
+                                        }
+                                    }
+                                } else if let Some(details) = &self.watch_details {
+                                    // Second attempt: switch to H.264 if the
+                                    // selected stream was AV1/VP9.
                                     let cur_itag = self.osd_state.selected_quality_itag;
                                     let is_av1_or_vp9 = details.video_streams.iter().any(|s| {
                                         s.itag == cur_itag
@@ -2626,6 +2854,7 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                                         let v_uri = stream.playback_uri("v");
                                         let a_uri = select_best_audio_stream(&details.audio_streams, self.config.preferred_audio_lang).map(|s| s.playback_uri("a"));
                                         self.video_started_at = Some(std::time::Instant::now());
+                                        self.playback_retry_count = 2;
                                         let seek_pos = if self.osd_state.current_pos_secs >= 1 {
                                             Some(self.osd_state.current_pos_secs * 1000)
                                         } else {
@@ -2822,7 +3051,19 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                         }
                     }
                 }
-                self.update_fullscreen_cursor_visibility()
+                let base_task = self.update_fullscreen_cursor_visibility();
+                if self.tabs_scroll_reset_pending {
+                    self.tabs_scroll_reset_pending = false;
+                    Task::batch([
+                        base_task,
+                        iced::widget::scrollable::scroll_to(
+                            iced::widget::scrollable::Id::new("tabs_scrollable"),
+                            iced::widget::scrollable::AbsoluteOffset { x: 0.0, y: 0.0 },
+                        ),
+                    ])
+                } else {
+                    base_task
+                }
             }
 
             Message::ChatMessagesBatch(msgs) => {
@@ -2914,6 +3155,7 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                 self.live_messages.clear();
                 self.playing_video_id = None;
                 self.video_started_at = None;
+                self.playback_retry_count = 0;
                 self.last_progress_pos_sec = 0;
 
                 self.previous_view = self.current_view.clone();
@@ -2986,6 +3228,7 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                     live_chat_continuation: None,
                     recommended_videos: existing_recs,
                     comments: Vec::new(),
+                comments_continuation: None,
                     video_streams: Vec::new(),
                     audio_streams: Vec::new(),
                     caption_tracks: Vec::new(),
@@ -3309,6 +3552,7 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                                         self.osd_state.is_playing = false;
                                         self.playing_video_id = Some(details.video_id.clone());
                                         self.video_started_at = None;
+                                        self.playback_retry_count = 0;
                                         if let Err(e) = player.play_stream_with_seek_paused(&video_uri, audio_uri.as_deref(), initial_seek_ms) {
                                             eprintln!("[Playback Error] failed to launch stream paused: {e}");
                                             self.osd_state.has_playback_error = true;
@@ -3317,6 +3561,7 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                                         self.osd_state.is_playing = true;
                                         self.playing_video_id = Some(details.video_id.clone());
                                         self.video_started_at = Some(std::time::Instant::now());
+                                        self.playback_retry_count = 0;
                                         if let Err(e) = player.play_stream_with_seek(&video_uri, audio_uri.as_deref(), initial_seek_ms) {
                                             eprintln!("[Playback Error] failed to launch stream: {e}");
                                             self.osd_state.has_playback_error = true;
@@ -3367,6 +3612,36 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                             if let Some(t) = self.queue_thumbnail_download(&details.channel_avatar) {
                                 tasks.push(t);
                             }
+                        }
+
+                        // Metadata enrichment runs after playback has already
+                        // been requested; it must never delay stream startup.
+                        if let Some(token) = details.comments_continuation.clone() {
+                            let it_comments = self.innertube.clone();
+                            let comments_vid = details.video_id.clone();
+                            let comments_request = req_id;
+                            tasks.push(Task::perform(
+                                async move {
+                                    let res = it_comments
+                                        .get_comments_by_continuation(&token)
+                                        .await
+                                        .map_err(|e| e.to_string());
+                                    (comments_vid, res)
+                                },
+                                move |(vid, res)| Message::CommentsLoaded(comments_request, vid, res),
+                            ));
+                        }
+                        {
+                            let it_ryd = self.innertube.clone();
+                            let ryd_vid = details.video_id.clone();
+                            let ryd_vid_task = ryd_vid.clone();
+                            tasks.push(Task::perform(
+                                async move {
+                                    let (dislikes, likes) = it_ryd.get_ryd_counts(&ryd_vid_task).await;
+                                    (ryd_vid, dislikes, likes)
+                                },
+                                |(vid, dislikes, likes)| Message::RydCountsLoaded(vid, dislikes, likes),
+                            ));
                         }
                         for (idx, video) in details.recommended_videos.iter().enumerate() {
                             let delay = if idx < 4 { 0 } else { 450 + (idx as u64) * 30 };
@@ -3933,8 +4208,15 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
 
             Message::TabsScrolled(viewport) => {
                 self.tabs_scroll_x = viewport.absolute_offset().x;
+                self.tabs_viewport_width = viewport.bounds().width;
                 let max_offset = (viewport.content_bounds().width - viewport.bounds().width).max(0.0);
                 self.tabs_max_scroll_x = max_offset;
+                Task::none()
+            }
+
+            Message::TabsFirstRowScrolled(viewport) => {
+                // Measurement only: the first row never scrolls by itself.
+                self.tabs_first_row_width = viewport.bounds().width;
                 Task::none()
             }
 
@@ -4142,6 +4424,7 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                 }
                 self.playing_video_id = None;
                 self.video_started_at = None;
+                self.playback_retry_count = 0;
                 self.osd_state.is_playing = false;
                 self.power_manager.set_screensaver_inhibit(false);
                 crate::power_manager::purge_working_set_on_idle();
@@ -4177,6 +4460,7 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
 
                     player.seek_ms(target_secs * 1000);
                     self.osd_state.current_pos_secs = target_secs;
+                    self.osd_state.is_buffering = true;
                     self.seek_suppress_until = Some(std::time::Instant::now() + Duration::from_millis(800));
                 }
                 Task::none()
@@ -4186,6 +4470,7 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                 if let Some(player) = &self.player {
                     let target_ms = player.seek_relative_secs(delta);
                     self.osd_state.current_pos_secs = target_ms / 1000;
+                    self.osd_state.is_buffering = true;
                     self.seek_suppress_until = Some(std::time::Instant::now() + Duration::from_millis(800));
                     self.osd_state.trigger_seek_feedback(delta);
                 }
@@ -4426,6 +4711,54 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                     Err(e) => {
                         eprintln!("[Captions] Error loading captions: {e}");
                         self.osd_state.selected_caption_lang = None;
+                    }
+                }
+                Task::none()
+            }
+
+            Message::CommentsLoaded(req_id, vid, res) => {
+                if req_id != self.current_request_id {
+                    return Task::none();
+                }
+                let mut avatar_urls = Vec::new();
+                if let Ok(comments) = res {
+                    if let Some(details) = &mut self.watch_details {
+                        if details.video_id == vid {
+                            Arc::make_mut(details).comments = comments;
+                            avatar_urls = details
+                                .comments
+                                .iter()
+                                .map(|c| c.author_avatar.clone())
+                                .filter(|u| !u.is_empty())
+                                .collect();
+                        }
+                    }
+                }
+                let mut tasks = Vec::new();
+                for url in avatar_urls {
+                    if let Some(t) = self.queue_thumbnail_download(&url) {
+                        tasks.push(t);
+                    }
+                }
+                if tasks.is_empty() {
+                    Task::none()
+                } else {
+                    Task::batch(tasks)
+                }
+            }
+
+            Message::RydCountsLoaded(vid, dislikes, likes) => {
+                if let Some(details) = &mut self.watch_details {
+                    if details.video_id == vid {
+                        let details = Arc::make_mut(details);
+                        if !dislikes.is_empty() {
+                            details.dislikes_str = dislikes;
+                        }
+                        if !likes.is_empty()
+                            && (details.likes_str.is_empty() || details.likes_str == "Me gusta")
+                        {
+                            details.likes_str = likes;
+                        }
                     }
                 }
                 Task::none()
@@ -5241,6 +5574,21 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                 Task::none()
             }
 
+            Message::ToggleTabTwoRows => {
+                self.config.tab_two_rows = !self.config.tab_two_rows;
+                self.config.save_async();
+                // Measurements from the single-row layout are no longer valid.
+                self.tabs_scroll_x = 0.0;
+                self.tabs_max_scroll_x = 0.0;
+                self.tabs_viewport_width = 0.0;
+                self.tabs_first_row_width = 0.0;
+                self.sync_player_viewport();
+                iced::widget::scrollable::scroll_to(
+                    iced::widget::scrollable::Id::new("tabs_scrollable"),
+                    iced::widget::scrollable::AbsoluteOffset { x: 0.0, y: 0.0 },
+                )
+            }
+
             Message::ToggleIncognito => {
                 self.config.incognito_mode = !self.config.incognito_mode;
                 self.innertube.set_incognito(self.config.incognito_mode);
@@ -5614,8 +5962,7 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
             Message::OpenVideoInNewTab(video_id) => {
                 if let Some(pos) = self.tabs.iter().position(|t| t.video_id == video_id) {
                     self.tab_shake_anim = Some((pos, std::time::Instant::now()));
-                    let tab_x = pos as f32 * 190.0;
-                    let target_scroll = (tab_x - 100.0).max(0.0);
+                    let target_scroll = self.tab_scroll_target(pos);
                     self.tabs_scroll_x = target_scroll;
                     return iced::widget::scrollable::scroll_to(
                         iced::widget::scrollable::Id::new("tabs_scrollable"),
@@ -5659,7 +6006,7 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                 });
                 self.tab_opened_anim = Some((new_idx, std::time::Instant::now()));
                 self.save_session();
-                let target_x = (new_idx as f32 * 145.0).max(0.0);
+                let target_x = self.tab_scroll_target(new_idx);
                 self.tabs_scroll_x = target_x;
                 let scroll_task = iced::widget::scrollable::scroll_to(
                     iced::widget::scrollable::Id::new("tabs_scrollable"),
@@ -5840,6 +6187,7 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                                 live_chat_continuation: None,
                                 recommended_videos: existing_recs,
                                 comments: Vec::new(),
+                comments_continuation: None,
                                 video_streams: Vec::new(),
                                 audio_streams: Vec::new(),
                                 caption_tracks: Vec::new(),
@@ -5878,19 +6226,32 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
             }
 
             Message::ScrollTabsLeft => {
-                self.tabs_scroll_x = (self.tabs_scroll_x - 200.0).max(0.0);
-                iced::widget::scrollable::scroll_to(
+                let step = if self.tabs_viewport_width > 1.0 {
+                    (self.tabs_viewport_width * 0.78).clamp(180.0, 520.0)
+                } else {
+                    260.0
+                };
+                let delta = step.min(self.tabs_scroll_x.max(0.0));
+                if delta <= 0.0 {
+                    return Task::none();
+                }
+                self.tabs_scroll_x = (self.tabs_scroll_x - delta).max(0.0);
+                iced::widget::scrollable::scroll_by(
                     iced::widget::scrollable::Id::new("tabs_scrollable"),
-                    iced::widget::scrollable::AbsoluteOffset { x: self.tabs_scroll_x, y: 0.0 },
+                    iced::widget::scrollable::AbsoluteOffset { x: -delta, y: 0.0 },
                 )
             }
 
             Message::ScrollTabsRight => {
-                let max_scroll = self.tabs_max_scroll_x.max(self.tabs.len() as f32 * 190.0);
-                self.tabs_scroll_x = (self.tabs_scroll_x + 200.0).min(max_scroll);
-                iced::widget::scrollable::scroll_to(
+                let step = if self.tabs_viewport_width > 1.0 {
+                    (self.tabs_viewport_width * 0.78).clamp(180.0, 520.0)
+                } else {
+                    260.0
+                };
+                self.tabs_scroll_x += step;
+                iced::widget::scrollable::scroll_by(
                     iced::widget::scrollable::Id::new("tabs_scrollable"),
-                    iced::widget::scrollable::AbsoluteOffset { x: self.tabs_scroll_x, y: 0.0 },
+                    iced::widget::scrollable::AbsoluteOffset { x: step, y: 0.0 },
                 )
             }
 
@@ -5903,7 +6264,7 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                     self.tab_opened_anim = Some((new_idx, std::time::Instant::now()));
                     self.save_session();
 
-                    let target_x = (new_idx as f32 * 190.0).max(0.0);
+                    let target_x = self.tab_scroll_target(new_idx);
                     self.tabs_scroll_x = target_x;
                     let scroll_task = iced::widget::scrollable::scroll_to(
                         iced::widget::scrollable::Id::new("tabs_scrollable"),
@@ -5942,7 +6303,7 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                 self.sync_player_viewport();
 
                 let focus_task = iced::widget::text_input::focus(iced::widget::text_input::Id::new("main_search_input"));
-                let target_x = (new_idx as f32 * 190.0).max(0.0);
+                let target_x = self.tab_scroll_target(new_idx);
                 self.tabs_scroll_x = target_x;
                 let scroll_task = iced::widget::scrollable::scroll_to(
                     iced::widget::scrollable::Id::new("tabs_scrollable"),
@@ -6505,7 +6866,7 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                         if let Some(pos) = self.last_cursor_pos {
                             let cur_search_w = self.current_search_bar_width();
                             let in_suggestions = self.show_suggestions
-                                && pos.y >= 52.0
+                                && pos.y >= self.header_height()
                                 && pos.y <= 280.0
                                 && pos.x >= 168.0
                                 && pos.x <= 168.0 + cur_search_w.max(260.0);
@@ -6801,6 +7162,10 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                             return Task::none();
                         } else if Some(win_id) == self.main_window_id || self.main_window_id.is_none() {
                             self.window_size = (size.width, size.height);
+                            // Tab measurements are relative to the previous width.
+                            self.tabs_max_scroll_x = 0.0;
+                            self.tabs_viewport_width = 0.0;
+                            self.tabs_first_row_width = 0.0;
                             if self.pip_window_id.is_none() {
                                 self.sync_player_viewport();
                             }
@@ -6916,14 +7281,15 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                     },
                 );
 
-                let known_streams = if let Some(details) = &self.watch_details {
-                    if details.video_id == video_id {
-                        let best = select_best_stream(&details.video_streams, &self.config);
-                        let audio = select_best_audio_stream(&details.audio_streams, self.config.preferred_audio_lang);
-                        best.map(|v| (v.url.clone(), audio.map(|a| a.url.clone())))
-                    } else {
-                        None
-                    }
+                let details_opt = self
+                    .watch_details
+                    .as_ref()
+                    .filter(|d| d.video_id == video_id)
+                    .or_else(|| self.tab_details_cache.get(&video_id));
+                let known_streams = if let Some(details) = details_opt {
+                    let best = select_best_stream(&details.video_streams, &self.config);
+                    let audio = select_best_audio_stream(&details.audio_streams, self.config.preferred_audio_lang);
+                    best.map(|v| (v.url.clone(), audio.map(|a| a.url.clone())))
                 } else {
                     None
                 };
@@ -7156,24 +7522,24 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
         }
     }
 
-pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scroll_y: f32) -> (f32, f32, f32, f32) {
+pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scroll_y: f32, header_h: f32) -> (f32, f32, f32, f32) {
     if theater_mode {
         let h = ((win_w * 9.0 / 16.0).min(win_h * 0.7)).round();
-        let initial_y = 56.0;
+        let initial_y = header_h;
         let y = initial_y - scroll_y;
         (0.0, y, win_w, h)
     } else {
         let col_w = (((win_w - 56.0) * 0.75).max(480.0)).round();
         let max_h = (win_h - 140.0).max(360.0);
         let col_h = (((col_w * 9.0 / 16.0).min(max_h))).round();
-        let initial_y = 56.0 + 12.0;
+        let initial_y = header_h + 12.0;
         let y = initial_y - scroll_y;
         (24.0, y, col_w, col_h)
     }
 }
 
     fn get_windowed_player_rect(&self) -> (f32, f32, f32, f32) {
-        Self::calculate_player_geometry(self.window_size.0, self.window_size.1, self.theater_mode, self.watch_scroll_y)
+        Self::calculate_player_geometry(self.window_size.0, self.window_size.1, self.theater_mode, self.watch_scroll_y, self.header_height())
     }
 
     fn sync_player_viewport(&self) {
@@ -7907,6 +8273,9 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
             self.window_size.0,
             self.tabs_scroll_x,
             self.tabs_max_scroll_x,
+            self.tabs_first_row_width,
+            self.config.tab_two_rows,
+            self.tab_two_rows_progress,
             self.config.custom_titlebar,
             self.is_maximized,
             Message::SearchInputChanged,
@@ -7926,6 +8295,7 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
             Message::CloseTab,
             Message::TabHoverChanged,
             Message::TabsScrolled,
+            Message::TabsFirstRowScrolled,
             Message::ScrollTabsLeft,
             Message::ScrollTabsRight,
             Message::HeaderDragPressed,
@@ -8041,7 +8411,7 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
                 let (_, _, col_w, col_h) = if self.is_fullscreen {
                     (0.0, 0.0, self.window_size.0, self.window_size.1)
                 } else {
-                    Self::calculate_player_geometry(self.window_size.0, self.window_size.1, self.theater_mode, 0.0)
+                    Self::calculate_player_geometry(self.window_size.0, self.window_size.1, self.theater_mode, 0.0, self.header_height())
                 };
                 let viewport_w = col_w as u16;
                 let viewport_h = col_h as u16;
@@ -8242,7 +8612,7 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
                 container(
                     stack![
                         iced::widget::column![
-                            iced::widget::Space::with_height(Length::Fixed(56.0)),
+                            iced::widget::Space::with_height(Length::Fixed(self.header_height())),
                             clipped_content
                         ]
                         .width(Length::Fill)
@@ -8276,7 +8646,7 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
                 container(
                     stack![
                         iced::widget::column![
-                            iced::widget::Space::with_height(Length::Fixed(56.0)),
+                            iced::widget::Space::with_height(Length::Fixed(self.header_height())),
                             clipped_content
                         ]
                         .width(Length::Fill)
@@ -8294,13 +8664,21 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
         };
 
         let mut layers: Vec<Element<'_, Message>> = Vec::new();
-        if plane_active {
-            // Full-screen opaque backdrop minus the player rect, so the
-            // transparent window only lets the video plane through there.
-            let hole = if matches!(self.current_view, ViewMode::VideoFullscreen) {
-                (0.0, 0.0, self.window_size.0, self.window_size.1)
+        // Keep this layer in the tree for every video view, even when the
+        // plane is inactive: inserting/removing stack children while the user
+        // scrolls can reset the scrollable state and jump back to the player.
+        if matches!(
+            self.current_view,
+            ViewMode::Watch(_) | ViewMode::VideoFullscreen
+        ) {
+            let hole = if plane_active {
+                if matches!(self.current_view, ViewMode::VideoFullscreen) {
+                    (0.0, 0.0, self.window_size.0, self.window_size.1)
+                } else {
+                    self.get_windowed_player_rect()
+                }
             } else {
-                self.get_windowed_player_rect()
+                (0.0, 0.0, 0.0, 0.0)
             };
             layers.push(ui::player_backdrop(hole));
         }
@@ -8450,7 +8828,7 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
 
                 let tooltip_overlay = container(
                     column![
-                        Space::with_height(Length::Fixed(52.0)),
+                        Space::with_height(Length::Fixed(self.header_height())),
                         row![
                             Space::with_width(Length::Fixed(clamp_x)),
                             tooltip_box,
@@ -8469,6 +8847,7 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
             layers.push(view_suggestions_overlay(
                 &self.suggestions,
                 search_bar_w,
+                self.header_height(),
                 Message::SelectSuggestion,
             ));
         }
@@ -8488,6 +8867,7 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
                 self.config.home_columns,
                 self.config.theme,
                 self.config.custom_titlebar,
+                self.config.tab_two_rows,
                 self.config.incognito_mode,
                 self.config.auto_pip_on_unfocus,
                 self.config.full_buffer_tabs,
@@ -8511,6 +8891,7 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
                 Message::SetHomeColumns,
                 Message::SetAppTheme,
                 Message::ToggleCustomTitlebar,
+                Message::ToggleTabTwoRows,
                 Message::ToggleIncognito,
                 Message::ToggleAutoPipOnUnfocus,
                 Message::ToggleFullBufferTabs,
@@ -8749,6 +9130,9 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
         let target_glow = if self.search_input_focused { 1.0 } else { 0.0 };
         let is_search_glow_animating = (self.search_focus_glow - target_glow).abs() > 0.005;
 
+        let tab_rows_target = if self.tab_second_row_wanted() { 1.0 } else { 0.0 };
+        let is_tab_rows_animating = (self.tab_two_rows_progress - tab_rows_target).abs() > 0.001;
+
         let has_active_animation = is_transitioning
             || is_view_fading
             || has_ripple
@@ -8761,7 +9145,8 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
             || is_tab_hover_animating
             || is_search_animating
             || is_profile_animating
-            || is_search_glow_animating;
+            || is_search_glow_animating
+            || is_tab_rows_animating;
 
         let has_playing_tab_glow = self.osd_state.is_playing
             && self.playing_video_id.is_some()

@@ -291,7 +291,9 @@ pub fn view_watch_page<'a, Message: Clone + 'static>(
                         )
                         .padding([12, 18])
                         .style(osd_container)
-                    } else if osd_state.is_buffering {
+                    } else if osd_state.is_buffering
+                        || (!osd_state.first_frame_rendered && osd_state.is_playing)
+                    {
                         container(
                             column![
                                 canvas(BufferSpinnerProgram {
@@ -538,7 +540,9 @@ pub fn view_watch_page<'a, Message: Clone + 'static>(
     };
 
     let make_buffering_spinner = || -> Option<Element<'a, Message>> {
-        if osd_state.is_buffering && !osd_state.has_playback_error {
+        // Initial loading is already covered by the poster/loading badge in
+        // player_content; this overlay is for mid-playback rebuffering.
+        if osd_state.first_frame_rendered && osd_state.is_buffering && !osd_state.has_playback_error {
             Some(
                 container(
                     column![

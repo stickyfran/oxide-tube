@@ -8,6 +8,9 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # Never use target-cpu=native on shared runners: rust-cache can restore
+  # artifacts built on a different CPU, which then crash with SIGILL.
+  RUSTFLAGS: "-C target-cpu=generic -C link-arg=-fuse-ld=mold"
 
 jobs:
   check-and-test:
