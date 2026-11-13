@@ -1958,9 +1958,14 @@ pub fn player_backdrop<'a, Message: 'static>(
 ) -> Element<'a, Message> {
     let (x, y, w, h) = hole;
     let x = x.max(0.0);
-    let y = y.max(0.0);
     let w = w.max(0.0);
-    let h = h.max(0.0);
+    // The player rect scrolls with the page. Clip the hole vertically so a
+    // partially scrolled video does not leave a transparent band below the
+    // content (which would show the desktop through the window).
+    let top = y.max(0.0);
+    let bottom = (y + h).max(0.0);
+    let h = (bottom - top).max(0.0);
+    let y = top;
     let opaque = |_t: &iced::Theme| container::Style {
         background: Some(color_bg().into()),
         ..container::Style::default()
