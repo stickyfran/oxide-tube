@@ -259,6 +259,7 @@ extern "C" {
         pixels: *mut GLvoid,
     );
     pub fn glGetError() -> GLenum;
+    pub fn glFinish();
 }
 
 #[cfg(target_os = "linux")]
@@ -838,11 +839,16 @@ impl WaylandZeroCopyPlayer {
                 let mut frame_seq: u64 = 0;
                 let mut plane: Option<WaylandPlane> = None;
                 let mut plane_surface: usize = 0;
-                // The native plane is opt-in until the compositor path is
-                // validated on every setup; the readback path is the default.
-                let mut plane_unavailable = std::env::var("MITUB_NATIVE_PLANE")
-                    .map(|value| value != "1")
-                    .unwrap_or(true);
+                // On Wayland the native plane is the default; the readback
+                // path remains as the automatic fallback and can be forced
+                // with MITUB_NATIVE_PLANE=0.
+                let mut plane_unavailable = {
+                    let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some();
+                    let enabled = std::env::var("MITUB_NATIVE_PLANE")
+                        .map(|value| value != "0")
+                        .unwrap_or(true);
+                    !wayland || !enabled
+                };
                 let mut plane_rect: (i32, i32, u32, u32) = (0, 0, 0, 0);
                 let mut hdr_applied = false;
                 let mut texture_is_10bit = false;
@@ -1057,14 +1063,15 @@ impl WaylandZeroCopyPlayer {
                         let (target_w, target_h) = if vid_w > 0 && vid_h > 0 {
                             let max_scale = (1920.0 / vid_w as f32).min(1080.0 / vid_h as f32).min(1.0);
                             if native_plane {
-                                // Fit the video inside the player rect; the
-                                // compositor scales the DMA-BUF for free.
-                                let fit = (vp_w as f32 / vid_w as f32)
-                                    .min(vp_h as f32 / vid_h as f32)
-                                    .min(max_scale)
-                                    .max(0.05);
-                                let tw = (((vid_w as f32 * fit).round() as u32) & !1).max(2);
-                                let th = (((vid_h as f32 * fit).round() as u32) & !1).max(2);
+                                // Render the whole player rect (capped at
+                                // 1080p). MPV letterboxes the video inside the
+                                // texture, so the plane covers the full rect
+                                // and there are no transparent bars.
+                                let area_scale = (1920.0 / vp_w as f32)
+                                    .min(1080.0 / vp_h as f32)
+                                    .min(1.0);
+                                let tw = (((vp_w as f32 * area_scale).round() as u32) & !1).max(2);
+                                let th = (((vp_h as f32 * area_scale).round() as u32) & !1).max(2);
                                 (tw, th)
                             } else {
                                 let min_scale = (240.0 / vid_w.max(vid_h) as f32).min(max_scale);
@@ -1083,14 +1090,8 @@ impl WaylandZeroCopyPlayer {
                         // player rect preserving the video aspect ratio. The
                         // render buffer may be smaller (source/1080p cap), the
                         // compositor upscales the DMA-BUF for free.
-                        let (display_w, display_h) = if native_plane && vid_w > 0 && vid_h > 0 {
-                            let fit = (vp_w as f32 / vid_w as f32)
-                                .min(vp_h as f32 / vid_h as f32)
-                                .max(0.01);
-                            (
-                                ((vid_w as f32 * fit).round() as u32).max(2),
-                                ((vid_h as f32 * fit).round() as u32).max(2),
-                            )
+                        let (display_w, display_h) = if native_plane {
+                            (vp_w as u32, vp_h as u32)
                         } else {
                             (target_w, target_h)
                         };
@@ -1118,6 +1119,9 @@ impl WaylandZeroCopyPlayer {
                                     }
                                     if let Some(fb_tex) = gl_fb_tex {
                                         fb_tex(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
+                                    }
+                                    if let Some(active_plane) = plane.as_mut() {
+                                        active_plane.invalidate_buffers();
                                     }
                                 }
                             }
@@ -1158,8 +1162,8 @@ impl WaylandZeroCopyPlayer {
                         }
 
                         if native_plane {
-                            let px = vp_x + ((vp_w - display_w as i32) / 2).max(0);
-                            let py = vp_y + ((vp_h - display_h as i32) / 2).max(0);
+                            let px = vp_x;
+                            let py = vp_y;
                             if (px, py, display_w, display_h) != plane_rect {
                                 if let Some(active_plane) = plane.as_mut() {
                                     active_plane.set_rect(px, py, display_w, display_h);
@@ -1201,6 +1205,10 @@ impl WaylandZeroCopyPlayer {
                                 #[cfg(target_os = "linux")]
                                 if native_plane {
                                     if let Some(active_plane) = plane.as_mut() {
+                                        // The compositor samples the exported DMA-BUF
+                                        // directly; make sure the GPU finished writing
+                                        // before handing it over.
+                                        unsafe { glFinish() };
                                         match active_plane.present(tex, current_buf_w, current_buf_h) {
                                             Ok(()) => {
                                                 presented = true;

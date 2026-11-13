@@ -51,7 +51,10 @@ Este documento describe los componentes fundamentales, el modelo de memoria, la 
 
 - **Zero-copy real**: MPV renderiza a una textura `RGB10_A2` en su contexto EGL; esa textura se exporta como DMA-BUF (`EGL_MESA_image_dma_buf_export`) y se adjunta a una `wl_subsurface` colocada debajo de la superficie de iced. El compositor escala y compone sin pasar por memoria del sistema (se elimina el `glReadPixels` del camino principal).
 - **HDR nativo**: si el compositor expone `wp_color_manager_v1`, la superficie del video se describe como PQ/BT.2020 cuando el contenido lo es (`video-params/gamma=pq|hlg`, primarias BT.2020). El resto de la UI sigue en SDR.
-- **Fallback automático**: si falta `wp_viewporter`, `zwp_linux_dmabuf_v1`, el export DMA-BUF o el formato no está soportado, el reproductor vuelve al camino RGBA por `glReadPixels`. `MITUB_NATIVE_PLANE=0` desactiva el plano explícitamente.
+- **Sincronización**: antes de entregar el DMA-BUF se llama `glFinish()`, porque el compositor muestrea la memoria del buffer directamente y sin esa barrera podía leerla antes de que la GPU terminara de escribir (pantalla negra).
+- **Caché de buffers**: cada `wl_buffer` se invalida cuando `glTexImage2D` reasigna la textura (resize o cambio de formato); un buffer viejo apunta a memoria liberada y se ve negro.
+- **Activo por defecto en Wayland**, con Vulkan como backend de wgpu (el swapchain OpenGL no expone alpha). `MITUB_NATIVE_PLANE=0` vuelve al camino RGBA.
+- **Fallback automático**: si falta `wp_viewporter`, `zwp_linux_dmabuf_v1`, el export DMA-BUF o el formato no está soportado, el reproductor vuelve al camino RGBA por `glReadPixels`.
 - **Ventana transparente**: en Wayland la ventana principal se crea con alpha; la vista de reproducción pinta un fondo opaco con un agujero rectangular (canvas `player_backdrop`) para que el plano se vea a través y el escritorio no aparezca alrededor.
 
 ### 2.2 Motor Multimedia (`src/player.rs`)

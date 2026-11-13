@@ -1655,7 +1655,7 @@ impl MitubApp {
         }
 
         if !saved_tabs.is_empty() {
-            app.suppress_autoplay_on_launch = true;
+            app.suppress_autoplay_on_launch = std::env::var_os("MITUB_AUTOPLAY").is_none();
             let active_idx = saved_active_idx.unwrap_or(0).min(saved_tabs.len().saturating_sub(1));
             app.active_tab_idx = Some(active_idx);
             let active_tab = &saved_tabs[active_idx];
@@ -8988,8 +8988,14 @@ fn main() -> iced::Result {
     power_manager::configure_allocator_low_memory();
 
     // 4. Default to OpenGL/GLES backend for wgpu if not explicitly overridden.
+    // The native Wayland video plane needs an alpha-capable swapchain, which
+    // the OpenGL backend does not provide; Vulkan does.
     if std::env::var_os("WGPU_BACKEND").is_none() {
-        std::env::set_var("WGPU_BACKEND", "gl");
+        let native_plane = std::env::var_os("WAYLAND_DISPLAY").is_some()
+            && std::env::var("MITUB_NATIVE_PLANE")
+                .map(|value| value != "0")
+                .unwrap_or(true);
+        std::env::set_var("WGPU_BACKEND", if native_plane { "vulkan" } else { "gl" });
     }
 
     println!("[Tube-oxide] Starting Native YouTube Client (100% Rust + libmpv + iced)");

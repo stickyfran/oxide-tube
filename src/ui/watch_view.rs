@@ -1521,7 +1521,11 @@ pub fn view_watch_page<'a, Message: Clone + 'static>(
             row![left_column, right_col_wrapped].spacing(0)
         )
         .width(Length::Fill)
-        .style(main_container);
+        .style(if native_plane_active {
+            transparent_player_container
+        } else {
+            main_container
+        });
 
         let content = column![
             content_row,

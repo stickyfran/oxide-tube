@@ -265,6 +265,19 @@ mod linux {
                 return Ok(());
             }
             let key = texture;
+            // `glTexImage2D` reallocates the texture storage on resize/format
+            // changes. A DMA-BUF exported from the previous storage keeps
+            // pointing at freed memory, which compositors sample as black, so
+            // a cached buffer is only reused when its dimensions still match.
+            let stale = self
+                .buffers
+                .get(&key)
+                .is_some_and(|buffer| buffer.width != width || buffer.height != height);
+            if stale {
+                if let Some(buffer) = self.buffers.remove(&key) {
+                    buffer.buffer.destroy();
+                }
+            }
             if !self.buffers.contains_key(&key) {
                 match self.export_buffer(texture, width, height) {
                     Ok(buffer) => {
@@ -291,6 +304,15 @@ mod linux {
             let _ = self.queue.dispatch_pending(&mut self.state);
             self.visible = true;
             Ok(())
+        }
+
+        /// Drops every cached DMA-BUF. Must be called whenever the render
+        /// texture storage is reallocated without changing its dimensions
+        /// (for example, switching between 8-bit and 10-bit formats).
+        pub fn invalidate_buffers(&mut self) {
+            for (_, buffer) in self.buffers.drain() {
+                buffer.buffer.destroy();
+            }
         }
 
         pub fn hide(&mut self) {
