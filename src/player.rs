@@ -1015,6 +1015,20 @@ impl WaylandZeroCopyPlayer {
                         }
                     }
 
+                    // Keep the plane glued to the player rect even when no new
+                    // frames arrive (paused playback while scrolling). Without
+                    // this, the last frame stays at its old position and looks
+                    // like it is being dragged behind the page.
+                    if !should_skip {
+                        if let Some(active_plane) = plane.as_mut() {
+                            let rect = (vp_x, vp_y, vp_w.max(1) as u32, vp_h.max(1) as u32);
+                            if rect != plane_rect {
+                                active_plane.set_rect(rect.0, rect.1, rect.2, rect.3);
+                                plane_rect = rect;
+                            }
+                        }
+                    }
+
                     // 3. Check for new video frame to render. When the video is
                     // hidden we still fall through to the reactive sleep below
                     // instead of busy-looping.
@@ -1096,16 +1110,6 @@ impl WaylandZeroCopyPlayer {
                             (1280, 720)
                         };
 
-                        // Size on screen (logical surface pixels): fill the
-                        // player rect preserving the video aspect ratio. The
-                        // render buffer may be smaller (source/1080p cap), the
-                        // compositor upscales the DMA-BUF for free.
-                        let (display_w, display_h) = if native_plane {
-                            (vp_w as u32, vp_h as u32)
-                        } else {
-                            (target_w, target_h)
-                        };
-
                         let want_10bit = plane.is_some();
                         if target_w != current_buf_w
                             || target_h != current_buf_h
@@ -1169,17 +1173,6 @@ impl WaylandZeroCopyPlayer {
                             plane_hdr.store(want_hdr, Ordering::SeqCst);
                         } else if plane.is_none() {
                             plane_hdr.store(false, Ordering::SeqCst);
-                        }
-
-                        if native_plane {
-                            let px = vp_x;
-                            let py = vp_y;
-                            if (px, py, display_w, display_h) != plane_rect {
-                                if let Some(active_plane) = plane.as_mut() {
-                                    active_plane.set_rect(px, py, display_w, display_h);
-                                }
-                                plane_rect = (px, py, display_w, display_h);
-                            }
                         }
 
                         #[cfg(target_os = "linux")]
