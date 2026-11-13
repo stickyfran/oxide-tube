@@ -838,9 +838,11 @@ impl WaylandZeroCopyPlayer {
                 let mut frame_seq: u64 = 0;
                 let mut plane: Option<WaylandPlane> = None;
                 let mut plane_surface: usize = 0;
+                // The native plane is opt-in until the compositor path is
+                // validated on every setup; the readback path is the default.
                 let mut plane_unavailable = std::env::var("MITUB_NATIVE_PLANE")
-                    .map(|value| value == "0")
-                    .unwrap_or(false);
+                    .map(|value| value != "1")
+                    .unwrap_or(true);
                 let mut plane_rect: (i32, i32, u32, u32) = (0, 0, 0, 0);
                 let mut hdr_applied = false;
                 let mut texture_is_10bit = false;
@@ -1051,7 +1053,7 @@ impl WaylandZeroCopyPlayer {
                         // never above the source, while strictly preserving the exact video aspect ratio so libmpv
                         // never bakes letterbox or pillarbox black bars into the FBO texture.
                         // Strict 1080p cap to guarantee glReadPixels / SW rasterizer never transfers >8.3MB per frame
-                        let native_plane = plane.is_some() && vp_w > 16 && vp_h > 16;
+                        let native_plane = plane.is_some() && vp_w > 16 && vp_h > 16 && vid_w > 0 && vid_h > 0;
                         let (target_w, target_h) = if vid_w > 0 && vid_h > 0 {
                             let max_scale = (1920.0 / vid_w as f32).min(1080.0 / vid_h as f32).min(1.0);
                             if native_plane {
@@ -1075,6 +1077,22 @@ impl WaylandZeroCopyPlayer {
                             }
                         } else {
                             (1280, 720)
+                        };
+
+                        // Size on screen (logical surface pixels): fill the
+                        // player rect preserving the video aspect ratio. The
+                        // render buffer may be smaller (source/1080p cap), the
+                        // compositor upscales the DMA-BUF for free.
+                        let (display_w, display_h) = if native_plane && vid_w > 0 && vid_h > 0 {
+                            let fit = (vp_w as f32 / vid_w as f32)
+                                .min(vp_h as f32 / vid_h as f32)
+                                .max(0.01);
+                            (
+                                ((vid_w as f32 * fit).round() as u32).max(2),
+                                ((vid_h as f32 * fit).round() as u32).max(2),
+                            )
+                        } else {
+                            (target_w, target_h)
                         };
 
                         let want_10bit = plane.is_some();
@@ -1140,13 +1158,13 @@ impl WaylandZeroCopyPlayer {
                         }
 
                         if native_plane {
-                            let px = vp_x + ((vp_w - current_buf_w as i32) / 2).max(0);
-                            let py = vp_y + ((vp_h - current_buf_h as i32) / 2).max(0);
-                            if (px, py, current_buf_w, current_buf_h) != plane_rect {
+                            let px = vp_x + ((vp_w - display_w as i32) / 2).max(0);
+                            let py = vp_y + ((vp_h - display_h as i32) / 2).max(0);
+                            if (px, py, display_w, display_h) != plane_rect {
                                 if let Some(active_plane) = plane.as_mut() {
-                                    active_plane.set_rect(px, py, current_buf_w, current_buf_h);
+                                    active_plane.set_rect(px, py, display_w, display_h);
                                 }
-                                plane_rect = (px, py, current_buf_w, current_buf_h);
+                                plane_rect = (px, py, display_w, display_h);
                             }
                         }
 
