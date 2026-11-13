@@ -995,14 +995,20 @@ impl WaylandZeroCopyPlayer {
                         unsafe {
                             mpv_render_context_render(r_ctx, render_params.as_ptr());
                         }
-                        continue;
                     }
 
-                    // 3. Check for new video frame to render
-                    let flags = unsafe { mpv_render_context_update(r_ctx) };
-                    let force_refresh = force_frame_refresh_atom.swap(false, Ordering::SeqCst)
+                    // 3. Check for new video frame to render. When the video is
+                    // hidden we still fall through to the reactive sleep below
+                    // instead of busy-looping.
+                    let flags = if should_skip {
+                        0
+                    } else {
+                        unsafe { mpv_render_context_update(r_ctx) }
+                    };
+                    let force_refresh = !should_skip
+                        && force_frame_refresh_atom.swap(false, Ordering::SeqCst)
                         && first_frame_rendered.load(Ordering::Relaxed);
-                    if (flags & MPV_RENDER_UPDATE_FRAME != 0) || force_refresh {
+                    if !should_skip && ((flags & MPV_RENDER_UPDATE_FRAME != 0) || force_refresh) {
                         // Lazily bind the native plane to the current window
                         // surface. When the window moves to another surface
                         // (main <-> PiP) the old plane is dropped and rebuilt.
