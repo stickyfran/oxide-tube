@@ -3,6 +3,7 @@ pub mod config;
 pub mod innertube;
 pub mod live_chat;
 pub mod player;
+pub mod wayland_plane;
 pub mod power_manager;
 pub mod ui;
 pub mod diagnostics;

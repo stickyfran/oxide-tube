@@ -47,6 +47,13 @@ Este documento describe los componentes fundamentales, el modelo de memoria, la 
 - **Canvas de Glow Dinámico (`PlayingTabGlowBorder`)**:
   Dibuja un trazo perimétrico suave con degradado que recorre la pestaña en reproducción. Se actualiza mediante un timer dedicado de ~31 FPS en la suscripción de la aplicación, manteniéndose fluido tanto con el cursor estático como con la ventana sin foco.
 
+### 2.2 Presentación Nativa Wayland (`src/wayland_plane.rs`)
+
+- **Zero-copy real**: MPV renderiza a una textura `RGB10_A2` en su contexto EGL; esa textura se exporta como DMA-BUF (`EGL_MESA_image_dma_buf_export`) y se adjunta a una `wl_subsurface` colocada debajo de la superficie de iced. El compositor escala y compone sin pasar por memoria del sistema (se elimina el `glReadPixels` del camino principal).
+- **HDR nativo**: si el compositor expone `wp_color_manager_v1`, la superficie del video se describe como PQ/BT.2020 cuando el contenido lo es (`video-params/gamma=pq|hlg`, primarias BT.2020). El resto de la UI sigue en SDR.
+- **Fallback automático**: si falta `wp_viewporter`, `zwp_linux_dmabuf_v1`, el export DMA-BUF o el formato no está soportado, el reproductor vuelve al camino RGBA por `glReadPixels`. `MITUB_NATIVE_PLANE=0` desactiva el plano explícitamente.
+- **Ventana transparente**: en Wayland la ventana principal se crea con alpha; la vista de reproducción pinta un fondo opaco con un agujero rectangular (canvas `player_backdrop`) para que el plano se vea a través y el escritorio no aparezca alrededor.
+
 ### 2.2 Motor Multimedia (`src/player.rs`)
 - **libmpv Nativo**: Integración directa mediante enlace FFI C a `libmpv.so.2`.
 - **Triple-Buffering sin Preasignación**: Utiliza exactamente 3 slots de textura RGBA compartidos para presentación continua sin bloqueos de sincronización vertical, evitando consumo estático innecesario.

@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU64, AtomicUsize,
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use crate::power_manager::PowerProfile;
+use crate::wayland_plane::WaylandPlane;
 
 #[derive(Clone, Debug)]
 pub struct VideoFrameBuffer {
@@ -301,6 +302,65 @@ extern "C" {
     pub fn mpv_get_wakeup_pipe(ctx: *mut MpvHandle) -> i32;
 }
 
+
+/// 10-bit render target used by the native plane.
+const GL_RGB10_A2_INTERNAL: u32 = 0x8059;
+const GL_UNSIGNED_INT_2_10_10_10_REV_TYPE: u32 = 0x8368;
+
+/// Reads a string MPV property, freeing the buffer MPV allocates for it.
+unsafe fn mpv_string_property(ctx: *mut MpvHandle, name: &[u8]) -> Option<String> {
+    let mut value: *mut c_char = std::ptr::null_mut();
+    let result = unsafe {
+        mpv_get_property(
+            ctx,
+            name.as_ptr() as _,
+            MPV_FORMAT_STRING,
+            &mut value as *mut _ as _,
+        )
+    };
+    if result < 0 || value.is_null() {
+        return None;
+    }
+    let text = unsafe { CStr::from_ptr(value) }.to_string_lossy().into_owned();
+    unsafe { mpv_free(value as *mut _) };
+    Some(text)
+}
+
+/// Switches MPV between SDR tone mapping and native PQ/BT.2020 passthrough.
+unsafe fn apply_hdr_output(ctx: *mut MpvHandle, hdr: bool) {
+    let options: &[(&[u8], &[u8])] = if hdr {
+        &[
+            (b"target-trc\0", b"pq\0"),
+            (b"target-prim\0", b"bt.2020\0"),
+            (b"target-peak\0", b"1000\0"),
+            (b"tone-mapping\0", b"clip\0"),
+            (b"hdr-compute-peak\0", b"no\0"),
+            (b"dither-depth\0", b"10\0"),
+        ]
+    } else {
+        &[
+            (b"target-trc\0", b"srgb\0"),
+            (b"target-prim\0", b"bt.709\0"),
+            (b"target-peak\0", b"auto\0"),
+            (b"tone-mapping\0", b"bt.2390\0"),
+            (b"hdr-compute-peak\0", b"yes\0"),
+            (b"dither-depth\0", b"8\0"),
+        ]
+    };
+    for (name, value) in options {
+        unsafe {
+            mpv_set_property_string(ctx, name.as_ptr() as _, value.as_ptr() as _);
+        }
+    }
+    unsafe {
+        mpv_set_property_string(
+            ctx,
+            b"target-colorspace-hint\0".as_ptr() as _,
+            b"no\0".as_ptr() as _,
+        );
+    }
+}
+
 extern "C" fn on_mpv_render_update(ctx: *mut std::ffi::c_void) {
     if ctx.is_null() {
         return;
@@ -357,6 +417,9 @@ pub struct WaylandZeroCopyPlayer {
     rendering_active: Arc<AtomicBool>,
     force_frame_refresh: Arc<AtomicBool>,
     underlay_mode: Arc<AtomicBool>,
+    plane_active: Arc<AtomicBool>,
+    plane_hdr: Arc<AtomicBool>,
+    hdr_content: Arc<AtomicBool>,
     wakeup_tx: Arc<AtomicI32>,
     is_running: Arc<AtomicBool>,
 }
@@ -422,6 +485,9 @@ impl WaylandZeroCopyPlayer {
             rendering_active: Arc::new(AtomicBool::new(true)),
             force_frame_refresh: Arc::new(AtomicBool::new(false)),
             underlay_mode: Arc::new(AtomicBool::new(true)),
+            plane_active: Arc::new(AtomicBool::new(false)),
+            plane_hdr: Arc::new(AtomicBool::new(false)),
+            hdr_content: Arc::new(AtomicBool::new(false)),
             wakeup_tx: Arc::new(AtomicI32::new(-1)),
             is_running: Arc::new(AtomicBool::new(true)),
         };
@@ -515,6 +581,10 @@ impl WaylandZeroCopyPlayer {
         let is_running = self.is_running.clone();
         let render_ctx = self.render_ctx.clone();
         let display_addr = self.display_addr.clone();
+        let surface_addr = self.surface_addr.clone();
+        let plane_active = self.plane_active.clone();
+        let plane_hdr = self.plane_hdr.clone();
+        let hdr_content = self.hdr_content.clone();
         let current_pos_ms = self.current_pos_ms.clone();
         let buffered_pos_ms = self.buffered_pos_ms.clone();
         let duration_ms = self.duration_ms.clone();
@@ -530,6 +600,7 @@ impl WaylandZeroCopyPlayer {
         let video_dims = self.video_dims.clone();
         let vp_w_atom = self.vp_w.clone();
         let vp_h_atom = self.vp_h.clone();
+        let vp_x_atom = self.vp_x.clone();
         let vp_y_atom = self.vp_y.clone();
         let rendering_active_atom = self.rendering_active.clone();
         let force_frame_refresh_atom = self.force_frame_refresh.clone();
@@ -765,6 +836,14 @@ impl WaylandZeroCopyPlayer {
                     let _ = pool_tx.send(Vec::new());
                 }
                 let mut frame_seq: u64 = 0;
+                let mut plane: Option<WaylandPlane> = None;
+                let mut plane_surface: usize = 0;
+                let mut plane_unavailable = std::env::var("MITUB_NATIVE_PLANE")
+                    .map(|value| value == "0")
+                    .unwrap_or(false);
+                let mut plane_rect: (i32, i32, u32, u32) = (0, 0, 0, 0);
+                let mut hdr_applied = false;
+                let mut texture_is_10bit = false;
 
                 while is_running.load(Ordering::Relaxed) {
                     // 1. Drain MPV events
@@ -782,6 +861,15 @@ impl WaylandZeroCopyPlayer {
                             MPV_EVENT_PLAYBACK_RESTART => {
                                 awaiting_playback_restart.store(false, Ordering::SeqCst);
                                 first_frame_rendered.store(true, Ordering::SeqCst);
+                                let primaries = unsafe {
+                                    mpv_string_property(ctx, b"video-params/primaries\0")
+                                };
+                                let gamma = unsafe {
+                                    mpv_string_property(ctx, b"video-params/gamma\0")
+                                };
+                                let hdr = matches!(gamma.as_deref(), Some("pq") | Some("hlg"))
+                                    || matches!(primaries.as_deref(), Some("bt.2020"));
+                                hdr_content.store(hdr, Ordering::SeqCst);
                                 has_error.store(false, Ordering::SeqCst);
                                 *last_error.safe_lock() = None;
                                 let mut is_paused: i32 = 0;
@@ -877,35 +965,79 @@ impl WaylandZeroCopyPlayer {
                         }
                     }
 
-                    // 2. Check for new video frame to render
+                    // 2. Skip GPU work entirely when the video is not visible.
+                    // This runs on every iteration, so a plane left over from
+                    // an inactive/minimized view cannot keep the window
+                    // transparent after playback stops producing frames.
+                    let active = rendering_active_atom.load(Ordering::Relaxed);
+                    let vp_w = vp_w_atom.load(Ordering::Relaxed);
+                    let vp_h = vp_h_atom.load(Ordering::Relaxed);
+                    let vp_x = vp_x_atom.load(Ordering::Relaxed);
+                    let vp_y = vp_y_atom.load(Ordering::Relaxed);
+                    let should_skip = !active || vp_w <= 16 || vp_h <= 16 || vp_y <= -5000;
+                    if should_skip {
+                        if let Some(active_plane) = plane.as_mut() {
+                            active_plane.hide();
+                        }
+                        plane_active.store(false, Ordering::SeqCst);
+                        plane_hdr.store(false, Ordering::SeqCst);
+                        let mut skip: i32 = 1;
+                        let render_params = [
+                            MpvRenderParam {
+                                type_: MPV_RENDER_PARAM_SKIP_RENDERING,
+                                data: &mut skip as *mut i32 as *mut std::ffi::c_void,
+                            },
+                            MpvRenderParam {
+                                type_: MPV_RENDER_PARAM_INVALID,
+                                data: std::ptr::null_mut(),
+                            },
+                        ];
+                        unsafe {
+                            mpv_render_context_render(r_ctx, render_params.as_ptr());
+                        }
+                        continue;
+                    }
+
+                    // 3. Check for new video frame to render
                     let flags = unsafe { mpv_render_context_update(r_ctx) };
                     let force_refresh = force_frame_refresh_atom.swap(false, Ordering::SeqCst)
                         && first_frame_rendered.load(Ordering::Relaxed);
                     if (flags & MPV_RENDER_UPDATE_FRAME != 0) || force_refresh {
-                        let active = rendering_active_atom.load(Ordering::Relaxed);
-                        let vp_w = vp_w_atom.load(Ordering::Relaxed);
-                        let vp_h = vp_h_atom.load(Ordering::Relaxed);
-                        let vp_y = vp_y_atom.load(Ordering::Relaxed);
-
-                        // If window is minimized/hidden, video scrolled away, or inactive, skip GPU rendering completely!
-                        // mpv updates playback clocks and keeps audio in perfect sync with ZERO GPU/RAM bandwidth.
-                        let should_skip = !active || vp_w <= 16 || vp_h <= 16 || vp_y <= -5000;
-                        if should_skip {
-                            let mut skip: i32 = 1;
-                            let render_params = [
-                                MpvRenderParam {
-                                    type_: MPV_RENDER_PARAM_SKIP_RENDERING,
-                                    data: &mut skip as *mut i32 as *mut std::ffi::c_void,
-                                },
-                                MpvRenderParam {
-                                    type_: MPV_RENDER_PARAM_INVALID,
-                                    data: std::ptr::null_mut(),
-                                },
-                            ];
-                            unsafe {
-                                mpv_render_context_render(r_ctx, render_params.as_ptr());
+                        // Lazily bind the native plane to the current window
+                        // surface. When the window moves to another surface
+                        // (main <-> PiP) the old plane is dropped and rebuilt.
+                        #[cfg(target_os = "linux")]
+                        if is_opengl && !plane_unavailable {
+                            let target_surface = surface_addr.load(Ordering::SeqCst);
+                            let target_display = display_addr.load(Ordering::SeqCst);
+                            if target_surface == 0 {
+                                if plane.take().is_some() {
+                                    plane_active.store(false, Ordering::SeqCst);
+                                }
+                                plane_surface = 0;
+                            } else if target_surface != plane_surface && target_display != 0 {
+                                plane = None;
+                                plane_active.store(false, Ordering::SeqCst);
+                                plane_rect = (0, 0, 0, 0);
+                                match WaylandPlane::new(
+                                    target_display as *mut std::ffi::c_void,
+                                    target_surface as *mut std::ffi::c_void,
+                                    1.0,
+                                ) {
+                                    Ok(created) => {
+                                        println!(
+                                            "[mitub-plane] native video plane attached to surface 0x{target_surface:x} hdr={}",
+                                            created.supports_hdr()
+                                        );
+                                        plane = Some(created);
+                                        plane_surface = target_surface;
+                                    }
+                                    Err(error) => {
+                                        eprintln!("[mitub-plane] unavailable, keeping readback path: {error}");
+                                        plane_unavailable = true;
+                                    }
+                                }
                             }
-                            continue;
                         }
 
                         let (vid_w, vid_h) = *video_dims.safe_lock();
@@ -913,32 +1045,50 @@ impl WaylandZeroCopyPlayer {
                         // never above the source, while strictly preserving the exact video aspect ratio so libmpv
                         // never bakes letterbox or pillarbox black bars into the FBO texture.
                         // Strict 1080p cap to guarantee glReadPixels / SW rasterizer never transfers >8.3MB per frame
+                        let native_plane = plane.is_some() && vp_w > 16 && vp_h > 16;
                         let (target_w, target_h) = if vid_w > 0 && vid_h > 0 {
                             let max_scale = (1920.0 / vid_w as f32).min(1080.0 / vid_h as f32).min(1.0);
-                            let min_scale = (240.0 / vid_w.max(vid_h) as f32).min(max_scale);
-                            let vp_scale = if vp_w > 16 && vp_h > 16 {
+                            if native_plane {
+                                // Fit the video inside the player rect; the
+                                // compositor scales the DMA-BUF for free.
+                                let fit = (vp_w as f32 / vid_w as f32)
+                                    .min(vp_h as f32 / vid_h as f32)
+                                    .min(max_scale)
+                                    .max(0.05);
+                                let tw = (((vid_w as f32 * fit).round() as u32) & !1).max(2);
+                                let th = (((vid_h as f32 * fit).round() as u32) & !1).max(2);
+                                (tw, th)
+                            } else {
+                                let min_scale = (240.0 / vid_w.max(vid_h) as f32).min(max_scale);
                                 let sx = (vp_w as f32 * 1.15) / vid_w as f32;
                                 let sy = (vp_h as f32 * 1.15) / vid_h as f32;
-                                sx.max(sy).clamp(min_scale, max_scale)
-                            } else {
-                                max_scale
-                            };
-                            let tw = (((vid_w as f32 * vp_scale).round() as u32) & !1).max(2);
-                            let th = (((vid_h as f32 * vp_scale).round() as u32) & !1).max(2);
-                            (tw, th)
+                                let vp_scale = sx.max(sy).clamp(min_scale, max_scale);
+                                let tw = (((vid_w as f32 * vp_scale).round() as u32) & !1).max(2);
+                                let th = (((vid_h as f32 * vp_scale).round() as u32) & !1).max(2);
+                                (tw, th)
+                            }
                         } else {
                             (1280, 720)
                         };
 
-                        if target_w != current_buf_w || target_h != current_buf_h {
+                        let want_10bit = plane.is_some();
+                        if target_w != current_buf_w
+                            || target_h != current_buf_h
+                            || want_10bit != texture_is_10bit
+                        {
                             current_buf_w = target_w;
                             current_buf_h = target_h;
+                            texture_is_10bit = want_10bit;
 
                             #[cfg(target_os = "linux")]
                             if is_opengl {
                                 unsafe {
                                     glBindTexture(GL_TEXTURE_2D, tex);
-                                    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8 as i32, current_buf_w as i32, current_buf_h as i32, 0, GL_RGBA, GL_UNSIGNED_BYTE, std::ptr::null());
+                                    if want_10bit {
+                                        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB10_A2_INTERNAL as i32, current_buf_w as i32, current_buf_h as i32, 0, GL_RGBA, GL_UNSIGNED_INT_2_10_10_10_REV_TYPE, std::ptr::null());
+                                    } else {
+                                        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8 as i32, current_buf_w as i32, current_buf_h as i32, 0, GL_RGBA, GL_UNSIGNED_BYTE, std::ptr::null());
+                                    }
                                     if let Some(bind_fb) = gl_bind_fb {
                                         bind_fb(GL_FRAMEBUFFER, fbo);
                                     }
@@ -951,16 +1101,48 @@ impl WaylandZeroCopyPlayer {
 
                         let byte_size = (current_buf_w * current_buf_h * 4) as usize;
 
-                        // 1. Get a recycled vector from the pool (Zero Heap Allocations in RAM)
-                        let mut target_vec = match pool_rx.try_recv() {
-                            Ok(mut v) => {
-                                if v.len() != byte_size {
-                                    v.resize(byte_size, 0);
+                        // 1. Get a recycled vector from the pool (Zero Heap Allocations in RAM).
+                        // The native plane path never touches system memory.
+                        let mut target_vec = if native_plane {
+                            Vec::new()
+                        } else {
+                            match pool_rx.try_recv() {
+                                Ok(mut v) => {
+                                    if v.len() != byte_size {
+                                        v.resize(byte_size, 0);
+                                    }
+                                    v
                                 }
-                                v
+                                Err(_) => vec![0u8; byte_size],
                             }
-                            Err(_) => vec![0u8; byte_size],
                         };
+
+                        // Switch MPV output between SDR tone mapping and
+                        // native PQ/BT.2020 whenever the content or the plane
+                        // availability changes.
+                        let want_hdr = hdr_content.load(Ordering::SeqCst)
+                            && plane.as_ref().is_some_and(WaylandPlane::supports_hdr);
+                        if want_hdr != hdr_applied {
+                            unsafe { apply_hdr_output(ctx, want_hdr) };
+                            if let Some(active_plane) = plane.as_mut() {
+                                active_plane.set_hdr(want_hdr);
+                            }
+                            hdr_applied = want_hdr;
+                            plane_hdr.store(want_hdr, Ordering::SeqCst);
+                        } else if plane.is_none() {
+                            plane_hdr.store(false, Ordering::SeqCst);
+                        }
+
+                        if native_plane {
+                            let px = vp_x + ((vp_w - current_buf_w as i32) / 2).max(0);
+                            let py = vp_y + ((vp_h - current_buf_h as i32) / 2).max(0);
+                            if (px, py, current_buf_w, current_buf_h) != plane_rect {
+                                if let Some(active_plane) = plane.as_mut() {
+                                    active_plane.set_rect(px, py, current_buf_w, current_buf_h);
+                                }
+                                plane_rect = (px, py, current_buf_w, current_buf_h);
+                            }
+                        }
 
                         #[cfg(target_os = "linux")]
                         let mut gl_success = false;
@@ -970,7 +1152,11 @@ impl WaylandZeroCopyPlayer {
                                 fbo: fbo as i32,
                                 w: current_buf_w as i32,
                                 h: current_buf_h as i32,
-                                internal_format: GL_RGBA8 as i32,
+                                internal_format: if texture_is_10bit {
+                                    GL_RGB10_A2_INTERNAL as i32
+                                } else {
+                                    GL_RGBA8 as i32
+                                },
                             };
                             let render_params = [
                                 MpvRenderParam {
@@ -987,25 +1173,53 @@ impl WaylandZeroCopyPlayer {
                             let err = unsafe { mpv_render_context_render(r_ctx, render_params.as_ptr()) };
                             STAT_RENDER_NS.fetch_add(t_render.elapsed().as_nanos() as u64, Ordering::Relaxed);
                             if err >= 0 {
-                                let t_read = std::time::Instant::now();
-                                unsafe {
-                                    if let Some(bind_fb) = gl_bind_fb {
-                                        bind_fb(GL_FRAMEBUFFER, fbo);
+                                let mut presented = false;
+                                #[cfg(target_os = "linux")]
+                                if native_plane {
+                                    if let Some(active_plane) = plane.as_mut() {
+                                        match active_plane.present(tex, current_buf_w, current_buf_h) {
+                                            Ok(()) => {
+                                                presented = true;
+                                                plane_active.store(true, Ordering::SeqCst);
+                                            }
+                                            Err(error) => {
+                                                eprintln!("[mitub-plane] present failed, falling back: {error}");
+                                                plane.take();
+                                                plane_unavailable = true;
+                                                plane_active.store(false, Ordering::SeqCst);
+                                                plane_hdr.store(false, Ordering::SeqCst);
+                                            }
+                                        }
                                     }
-                                    glReadPixels(
-                                        0,
-                                        0,
-                                        current_buf_w as i32,
-                                        current_buf_h as i32,
-                                        GL_RGBA,
-                                        GL_UNSIGNED_BYTE,
-                                        target_vec.as_mut_ptr() as _,
-                                    );
                                 }
-                                STAT_READ_NS.fetch_add(t_read.elapsed().as_nanos() as u64, Ordering::Relaxed);
-                                STAT_BYTES.fetch_add(byte_size as u64, Ordering::Relaxed);
-                                STAT_FRAMES.fetch_add(1, Ordering::Relaxed);
-                                gl_success = true;
+
+                                if !presented {
+                                    let byte_size = (current_buf_w * current_buf_h * 4) as usize;
+                                    if target_vec.len() != byte_size {
+                                        target_vec.resize(byte_size, 0);
+                                    }
+                                    let t_read = std::time::Instant::now();
+                                    unsafe {
+                                        if let Some(bind_fb) = gl_bind_fb {
+                                            bind_fb(GL_FRAMEBUFFER, fbo);
+                                        }
+                                        glReadPixels(
+                                            0,
+                                            0,
+                                            current_buf_w as i32,
+                                            current_buf_h as i32,
+                                            GL_RGBA,
+                                            GL_UNSIGNED_BYTE,
+                                            target_vec.as_mut_ptr() as _,
+                                        );
+                                    }
+                                    STAT_READ_NS.fetch_add(t_read.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                                    STAT_BYTES.fetch_add(byte_size as u64, Ordering::Relaxed);
+                                    gl_success = true;
+                                } else {
+                                    // No system-memory copy at all on the plane path.
+                                    STAT_FRAMES.fetch_add(1, Ordering::Relaxed);
+                                }
                             }
                         }
 
@@ -1055,24 +1269,30 @@ impl WaylandZeroCopyPlayer {
 
                         if render_ok {
                             frame_seq += 1;
-                            let owner = RecycledBuf {
-                                buf: target_vec,
-                                pool_tx: pool_tx.clone(),
-                            };
-                            let byte_buf = Bytes::from_owner(owner);
-                            let v_frame = VideoFrameBuffer {
-                                frame_id: frame_seq,
-                                width: current_buf_w,
-                                height: current_buf_h,
-                                data: byte_buf,
-                            };
-                            *current_frame.safe_lock() = Some(v_frame);
+                            if plane_active.load(Ordering::SeqCst) && target_vec.is_empty() {
+                                // Presented natively: tell the UI a frame is
+                                // ready without copying pixels into iced.
+                                *current_frame.safe_lock() = None;
+                            } else {
+                                let owner = RecycledBuf {
+                                    buf: target_vec,
+                                    pool_tx: pool_tx.clone(),
+                                };
+                                let byte_buf = Bytes::from_owner(owner);
+                                let v_frame = VideoFrameBuffer {
+                                    frame_id: frame_seq,
+                                    width: current_buf_w,
+                                    height: current_buf_h,
+                                    data: byte_buf,
+                                };
+                                *current_frame.safe_lock() = Some(v_frame);
+                            }
                             FRAME_NOTIFY.notify_one();
                             first_frame_rendered.store(true, Ordering::SeqCst);
                         }
                     }
 
-                    // 3. Reactive sleep: wakes immediately on MPV core events or new render frame notification
+                    // 4. Reactive sleep: wakes immediately on MPV core events or new render frame notification
                     let timeout_ms = if is_playing.load(Ordering::Relaxed) { 30 } else { 80 };
                     #[cfg(unix)]
                     {
@@ -1123,6 +1343,9 @@ impl WaylandZeroCopyPlayer {
                 }
 
                 // Cleanup OpenGL & EGL resources on thread exit
+                plane_active.store(false, Ordering::SeqCst);
+                plane_hdr.store(false, Ordering::SeqCst);
+                drop(plane);
                 wakeup_tx_atomic.store(-1, Ordering::SeqCst);
                 *render_ctx.safe_lock() = None;
                 #[cfg(unix)]
@@ -1526,9 +1749,12 @@ impl WaylandZeroCopyPlayer {
         *self.video_dims.safe_lock()
     }
 
-    pub fn switch_surface(&self, _surf_ptr: usize, _explicit_pos_ms: Option<u64>) {
-        // With MPV rendering directly into Iced's texture plane, surface swapping
-        // is completely safe and requires zero pipeline teardown or recreation!
+    pub fn switch_surface(&self, surf_ptr: usize, _explicit_pos_ms: Option<u64>) {
+        // The render worker watches `surface_addr` and rebuilds the native
+        // subsurface when the video moves between the main and PiP windows.
+        if surf_ptr != 0 {
+            self.surface_addr.store(surf_ptr, Ordering::SeqCst);
+        }
     }
 
     pub fn update_handles(&self, disp_ptr: usize, surf_ptr: usize) {
@@ -1542,6 +1768,17 @@ impl WaylandZeroCopyPlayer {
 
     pub fn set_underlay(&self, underlay: bool) {
         self.underlay_mode.store(underlay, Ordering::SeqCst);
+    }
+
+    /// True while the video is presented through the native Wayland plane
+    /// (zero-copy DMA-BUF) instead of an RGBA frame copied into iced.
+    pub fn is_plane_active(&self) -> bool {
+        self.plane_active.load(Ordering::SeqCst)
+    }
+
+    /// True when the plane is currently describing PQ/BT.2020 output.
+    pub fn is_plane_hdr(&self) -> bool {
+        self.plane_hdr.load(Ordering::SeqCst)
     }
 
     pub fn set_viewport(&self, x: i32, y: i32, w: i32, h: i32) {

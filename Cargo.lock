@@ -4794,6 +4794,8 @@ dependencies = [
  "simd-json",
  "tokio",
  "url",
+ "wayland-client",
+ "wayland-protocols",
  "windows-sys 0.52.0",
  "zbus 5.19.0",
 ]

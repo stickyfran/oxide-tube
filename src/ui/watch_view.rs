@@ -152,6 +152,7 @@ pub fn view_watch_page<'a, Message: Clone + 'static>(
     theater_mode: bool,
     is_fullscreen: bool,
     is_pip_active: bool,
+    native_plane_active: bool,
     description_expanded: bool,
     chat_collapsed: bool,
     description_content: &'a iced::widget::text_editor::Content,
@@ -245,6 +246,7 @@ pub fn view_watch_page<'a, Message: Clone + 'static>(
     );
 
     let show_poster = video_frame.is_none() || !osd_state.first_frame_rendered;
+    let native_plane_active = native_plane_active && !is_pip_active;
     let thumb_key = format!("https://i.ytimg.com/vi/{}/hqdefault.jpg", &details.video_id);
     // Prioritize crisp thumbnail/cached frame first when displaying inactive tabs or initial poster,
     // falling back to blurred poster only when no sharp image is in memory yet.
@@ -418,6 +420,19 @@ pub fn view_watch_page<'a, Message: Clone + 'static>(
             ..container::Style::default()
         });
         pip_card.into()
+    } else if native_plane_active {
+        // Transparent hole: the video is a wl_subsurface below this surface.
+        let mut plane_layers: Vec<Element<'a, Message>> = vec![
+            container(video_hitbox)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .style(transparent_player_container)
+                .into(),
+        ];
+        if osd_state.has_playback_error {
+            plane_layers.push(loading_badge.into());
+        }
+        stack(plane_layers).into()
     } else if let Some(frame) = video_frame {
         let mut frame_layers: Vec<Element<'a, Message>> = vec![
             container(Space::new(Length::Fill, Length::Fill))
@@ -1495,7 +1510,11 @@ pub fn view_watch_page<'a, Message: Clone + 'static>(
         )
         .width(Length::Fill)
         .height(Length::Fill)
-        .style(main_container)
+        .style(if native_plane_active {
+            transparent_player_container
+        } else {
+            main_container
+        })
         .into()
     } else {
         let content_row = container(
@@ -1520,7 +1539,11 @@ pub fn view_watch_page<'a, Message: Clone + 'static>(
         )
         .width(Length::Fill)
         .height(Length::Fill)
-        .style(main_container)
+        .style(if native_plane_active {
+            transparent_player_container
+        } else {
+            main_container
+        })
         .into()
     }
 }

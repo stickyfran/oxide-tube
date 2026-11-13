@@ -12,7 +12,7 @@ use crate::power_manager::PowerProfile;
 use crate::ui::icons::*;
 use crate::ui::theme::*;
 use iced::widget::{button, canvas, column, container, image, mouse_area, row, scrollable, slider, stack, text, text_input, Column, Space};
-use iced::{Alignment, Color, Element, Length, Point, Rectangle, Renderer, Theme};
+use iced::{Alignment, Color, Element, Length, Point, Rectangle, Renderer, Size, Theme};
 
 pub use crate::config::VideoTab;
 
@@ -1946,4 +1946,40 @@ mod tests {
             TestMsg::NoOp,
         );
     }
+}
+
+
+/// Opaque backdrop that covers the whole window except the rectangular hole
+/// where the native Wayland video plane is presented. Built from plain
+/// containers (no canvas) so the compositor always receives fully opaque
+/// pixels around the video.
+pub fn player_backdrop<'a, Message: 'static>(
+    hole: (f32, f32, f32, f32),
+) -> Element<'a, Message> {
+    let (x, y, w, h) = hole;
+    let x = x.max(0.0);
+    let y = y.max(0.0);
+    let w = w.max(0.0);
+    let h = h.max(0.0);
+    let opaque = |_t: &iced::Theme| container::Style {
+        background: Some(color_bg().into()),
+        ..container::Style::default()
+    };
+    let bar = |width: Length, height: Length| -> Element<'a, Message> {
+        container(Space::new(width, height)).style(opaque).into()
+    };
+    column![
+        bar(Length::Fill, Length::Fixed(y)),
+        row![
+            bar(Length::Fixed(x), Length::Fixed(h)),
+            Space::new(Length::Fixed(w), Length::Fixed(h)),
+            bar(Length::Fill, Length::Fixed(h)),
+        ]
+        .width(Length::Fill)
+        .height(Length::Fixed(h)),
+        bar(Length::Fill, Length::Fill),
+    ]
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .into()
 }

@@ -4,6 +4,7 @@ mod config;
 mod innertube;
 mod live_chat;
 mod player;
+mod wayland_plane;
 mod power_manager;
 mod ui;
 mod diagnostics;
@@ -1360,6 +1361,9 @@ impl MitubApp {
         let window_settings = Settings {
             size: Size::new(saved_w, saved_h),
             min_size: Some(Size::new(800.0, 600.0)),
+            #[cfg(target_os = "linux")]
+            transparent: true,
+            #[cfg(not(target_os = "linux"))]
             transparent: false,
             decorations: !config.custom_titlebar,
             icon: load_app_icon(),
@@ -1751,6 +1755,9 @@ impl MitubApp {
         let window_settings = Settings {
             size: Size::new(saved_w, saved_h),
             min_size: Some(Size::new(800.0, 600.0)),
+            #[cfg(target_os = "linux")]
+            transparent: true,
+            #[cfg(not(target_os = "linux"))]
             transparent: false,
             decorations: !self.config.custom_titlebar,
             icon: load_app_icon(),
@@ -7562,8 +7569,19 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
             None
         };
         let mut layers: Vec<Element<'_, Message>> = Vec::new();
+        let pip_plane_active = self.player.as_ref().is_some_and(|p| p.is_plane_active());
 
-        if let Some(frame) = video_frame {
+        if pip_plane_active {
+            // The PiP surface is transparent and the native plane presents the
+            // video below it; keep the window a clean hole for the DMA-BUF.
+            layers.push(
+                container(Space::new(Length::Fill, Length::Fill))
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .style(ui::theme::transparent_player_container)
+                    .into(),
+            );
+        } else if let Some(frame) = video_frame {
             layers.push(
                 crate::ui::video_widget::video_shader_pip(frame),
             );
@@ -7782,6 +7800,7 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
                     self.theater_mode,
                     self.is_fullscreen,
                     is_this_video_in_pip,
+                    self.player.as_ref().is_some_and(|p| p.is_plane_active()) && !is_this_video_in_pip,
                     self.description_expanded,
                     self.chat_collapsed,
                     &self.description_content,
@@ -8071,6 +8090,7 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
                         self.theater_mode,
                         self.is_fullscreen,
                         is_this_video_in_pip,
+                        self.player.as_ref().is_some_and(|p| p.is_plane_active()) && !is_this_video_in_pip,
                         self.description_expanded,
                         self.chat_collapsed,
                         &self.description_content,
@@ -8211,6 +8231,12 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
             .height(Length::Fill)
             .clip(true);
 
+        let plane_active = self.player.as_ref().is_some_and(|p| p.is_plane_active())
+            && !is_pip_active
+            && matches!(
+                self.current_view,
+                ViewMode::Watch(_) | ViewMode::VideoFullscreen
+            );
         let base_view: Element<'_, Message> = match &self.current_view {
             ViewMode::Watch(_) if !is_pip_active && self.watch_details.is_some() => {
                 container(
@@ -8228,14 +8254,22 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
                 )
                 .width(Length::Fill)
                 .height(Length::Fill)
-                .style(main_container)
+                .style(if plane_active {
+                    transparent_player_container
+                } else {
+                    main_container
+                })
                 .into()
             }
             ViewMode::VideoFullscreen if !is_pip_active => {
                 container(clipped_content)
                     .width(Length::Fill)
                     .height(Length::Fill)
-                    .style(main_container)
+                    .style(if plane_active {
+                        transparent_player_container
+                    } else {
+                        main_container
+                    })
                     .into()
             }
             _ => {
@@ -8259,7 +8293,18 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
             }
         };
 
-        let mut layers: Vec<Element<'_, Message>> = vec![base_view];
+        let mut layers: Vec<Element<'_, Message>> = Vec::new();
+        if plane_active {
+            // Full-screen opaque backdrop minus the player rect, so the
+            // transparent window only lets the video plane through there.
+            let hole = if matches!(self.current_view, ViewMode::VideoFullscreen) {
+                (0.0, 0.0, self.window_size.0, self.window_size.1)
+            } else {
+                self.get_windowed_player_rect()
+            };
+            layers.push(ui::player_backdrop(hole));
+        }
+        layers.push(base_view);
 
         if let Some(st) = &self.toast_state {
             let elapsed = st.created_at.elapsed().as_secs_f32();
@@ -8751,8 +8796,19 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
     }
 
     pub fn style(&self, _theme: &iced::Theme) -> iced::daemon::Appearance {
+        let plane = self.player.as_ref().is_some_and(|p| p.is_plane_active())
+            && matches!(
+                self.current_view,
+                ViewMode::Watch(_) | ViewMode::VideoFullscreen
+            );
         iced::daemon::Appearance {
-            background_color: ui::theme::color_bg(),
+            // The native video plane lives below the window surface, so the
+            // player hole must be transparent for it to show through.
+            background_color: if plane {
+                iced::Color::TRANSPARENT
+            } else {
+                ui::theme::color_bg()
+            },
             text_color: COLOR_TEXT_PRIMARY,
         }
     }
