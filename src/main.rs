@@ -2297,7 +2297,7 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
     }
 
     fn current_search_bar_width(&self) -> f32 {
-        let is_expanded = self.search_hovered || self.search_input_focused || !self.search_query.is_empty();
+        let is_expanded = self.search_hovered || self.search_input_focused;
         let target_w = if is_expanded { 300.0 } else { 145.0 };
         if let Some((from_w, to_w, inst, dur)) = self.search_anim {
             let elapsed = inst.elapsed().as_secs_f32();
@@ -6882,7 +6882,7 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                                 }
                             } else if !in_suggestions && self.search_input_focused {
                                 self.search_input_focused = false;
-                                let is_expanded = self.search_hovered || !self.search_query.is_empty();
+                                let is_expanded = self.search_hovered;
                                 self.trigger_search_anim(if is_expanded { 300.0 } else { 145.0 });
                                 self.show_suggestions = false;
                             }
@@ -6967,7 +6967,7 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                             } else if self.search_input_focused {
                                 if let Key::Named(Named::Escape) = key {
                                     self.search_input_focused = false;
-                                    let is_expanded = self.search_hovered || !self.search_query.is_empty();
+                                    let is_expanded = self.search_hovered;
                                     self.trigger_search_anim(if is_expanded { 300.0 } else { 145.0 });
                                     self.show_suggestions = false;
                                     return Task::none();
@@ -6983,7 +6983,7 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                                     }
                                     Key::Named(Named::Escape) if self.search_input_focused => {
                                         self.search_input_focused = false;
-                                        let is_expanded = self.search_hovered || !self.search_query.is_empty();
+                                        let is_expanded = self.search_hovered;
                                         self.trigger_search_anim(if is_expanded { 300.0 } else { 145.0 });
                                         self.show_suggestions = false;
                                         return Task::none();
@@ -7383,7 +7383,7 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                         self.search_hovered = true;
                     }
                 } else if self.search_hovered {
-                    let is_expanded = self.search_input_focused || !self.search_query.is_empty();
+                    let is_expanded = self.search_input_focused;
                     self.trigger_search_anim(if is_expanded { 300.0 } else { 145.0 });
                     self.search_hovered = false;
                 }

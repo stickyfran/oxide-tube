@@ -156,7 +156,7 @@ pub fn tab_display_title(title: &str) -> String {
 
 pub fn estimate_tab_width(title: &str, is_playing: bool) -> f32 {
     let char_count = tab_display_title(title).chars().count() as f32;
-    (char_count * 7.2 + if is_playing { 62.0 } else { 46.0 }).clamp(132.0, 248.0)
+    (char_count * 7.2 + if is_playing { 62.0 } else { 46.0 }).clamp(158.4, 248.0)
 }
 
 /// Horizontal space available to the tab strip, excluding navigation, search,
@@ -405,13 +405,42 @@ pub fn view_header_bar<'a, Message: Clone + 'static>(
         "Buscar..."
     };
 
+    let clear_search_msg = on_search_input(String::new());
+    let has_search_text = !search_query.is_empty();
+
     let search_input_widget = text_input(search_placeholder, search_query)
         .id(iced::widget::text_input::Id::new("main_search_input"))
         .on_input(on_search_input)
         .on_submit(on_search_submit.clone())
         .style(animated_search_input(search_focus_glow))
-        .padding([7, 12])
+        .padding(iced::Padding {
+            top: 7.0,
+            right: if has_search_text { 30.0 } else { 12.0 },
+            bottom: 7.0,
+            left: 12.0,
+        })
         .width(Length::Fixed(search_bar_width));
+
+    let search_field: Element<'a, Message> = if has_search_text {
+        let clear_btn = button(icon_close(12.0))
+            .style(ghost_button)
+            .padding([4, 6])
+            .on_press(clear_search_msg);
+        let clear_overlay = container(clear_btn)
+            .width(Length::Fixed(search_bar_width))
+            .height(Length::Fill)
+            .padding(iced::Padding {
+                top: 0.0,
+                right: 4.0,
+                bottom: 0.0,
+                left: 0.0,
+            })
+            .align_x(iced::alignment::Horizontal::Right)
+            .align_y(iced::alignment::Vertical::Center);
+        stack![search_input_widget, clear_overlay].into()
+    } else {
+        search_input_widget.into()
+    };
 
     let search_btn = button(icon_search(14.0))
         .style(secondary_button)
@@ -419,7 +448,7 @@ pub fn view_header_bar<'a, Message: Clone + 'static>(
         .on_press(on_search_submit);
 
     let search_bar_compound = mouse_area(
-        row![search_input_widget, search_btn]
+        row![search_field, search_btn]
             .spacing(4)
             .align_y(Alignment::Center)
     )
