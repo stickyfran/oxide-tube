@@ -165,18 +165,53 @@ pub struct StorageInfo {
 pub fn storage_info() -> StorageInfo {
     let dir = video_cache_dir();
     let _ = fs::create_dir_all(&dir);
-    let Ok(path) = std::ffi::CString::new(dir.to_string_lossy().as_bytes()) else {
-        return StorageInfo::default();
-    };
-    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
-    if unsafe { libc::statvfs(path.as_ptr(), &mut stat) } != 0 {
-        return StorageInfo::default();
+
+    #[cfg(unix)]
+    {
+        let Ok(path) = std::ffi::CString::new(dir.to_string_lossy().as_bytes()) else {
+            return StorageInfo::default();
+        };
+        let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+        if unsafe { libc::statvfs(path.as_ptr(), &mut stat) } != 0 {
+            return StorageInfo::default();
+        }
+        let block = stat.f_frsize as u64;
+        StorageInfo {
+            total: (stat.f_blocks as u64).saturating_mul(block),
+            free: (stat.f_bfree as u64).saturating_mul(block),
+            available: (stat.f_bavail as u64).saturating_mul(block),
+        }
     }
-    let block = stat.f_frsize as u64;
-    StorageInfo {
-        total: (stat.f_blocks as u64).saturating_mul(block),
-        free: (stat.f_bfree as u64).saturating_mul(block),
-        available: (stat.f_bavail as u64).saturating_mul(block),
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+
+        let wide: Vec<u16> = dir
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut available: u64 = 0;
+        let mut total: u64 = 0;
+        let mut free: u64 = 0;
+        let ok = unsafe {
+            GetDiskFreeSpaceExW(wide.as_ptr(), &mut available, &mut total, &mut free)
+        };
+        if ok == 0 {
+            return StorageInfo::default();
+        }
+        StorageInfo {
+            total,
+            available,
+            free,
+        }
+    }
+
+    #[cfg(not(any(unix, target_os = "windows")))]
+    {
+        StorageInfo::default()
     }
 }
 
