@@ -2579,6 +2579,7 @@ pub fn view_account_dropdown<'a, Message: Clone + 'static>(
     anchor_right: f32,
     top: f32,
     on_select: impl Fn(String) -> Message + Copy + 'static,
+    on_delete: impl Fn(String) -> Message + Copy + 'static,
     on_login: Message,
     on_add: Message,
     on_logout: Message,
@@ -2677,12 +2678,21 @@ pub fn view_account_dropdown<'a, Message: Clone + 'static>(
         .spacing(10)
         .align_y(Alignment::Center);
 
+        let select_btn = button(row)
+            .width(Length::Fill)
+            .padding([6, 8])
+            .style(menu_row_style)
+            .on_press(on_select(account.id.clone()));
+
+        let delete_btn = button(icon_close(12.0))
+            .padding([6, 7])
+            .style(ghost_button)
+            .on_press(on_delete(account.id.clone()));
+
         rows = rows.push(
-            button(row)
-                .width(Length::Fill)
-                .padding([6, 8])
-                .style(menu_row_style)
-                .on_press(on_select(account.id.clone())),
+            row![select_btn, delete_btn]
+                .spacing(2)
+                .align_y(Alignment::Center),
         );
     }
 
@@ -2793,6 +2803,86 @@ pub fn view_account_dropdown<'a, Message: Clone + 'static>(
     .height(Length::Fill);
 
     stack![scrim, positioned]
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
+}
+
+/// Confirmation dialog for logging out of an account and deleting its data.
+pub fn view_delete_account_confirm<'a, Message: Clone + 'static>(
+    account_name: &'a str,
+    on_confirm: Message,
+    on_cancel: Message,
+) -> Element<'a, Message> {
+    let scrim = mouse_area(
+        container(Space::new(Length::Fill, Length::Fill))
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .style(|_t| container::Style {
+                background: Some(iced::Color::from_rgba(0.0, 0.0, 0.0, 0.7).into()),
+                ..container::Style::default()
+            }),
+    )
+    .on_press(on_cancel.clone());
+
+    let card = container(
+        column![
+            text(format!("¿Cerrar sesión de \"{account_name}\"?"))
+                .size(16)
+                .color(COLOR_TEXT_PRIMARY),
+            text("Se eliminarán las pestañas, el historial y la sesión guardada de esta cuenta. Esta acción no se puede deshacer.")
+                .size(11.5)
+                .color(COLOR_TEXT_SECONDARY),
+            text("Las descargas compartidas no se eliminan.")
+                .size(10.5)
+                .color(COLOR_TEXT_SECONDARY),
+            row![
+                Space::with_width(Length::Fill),
+                button(text("Cancelar").size(12).color(COLOR_TEXT_PRIMARY))
+                    .padding([7, 14])
+                    .style(secondary_button)
+                    .on_press(on_cancel),
+                button(
+                    text("Cerrar sesión y borrar")
+                        .size(12)
+                        .color(iced::Color::WHITE),
+                )
+                .padding([7, 14])
+                .style(|_t, status| button::Style {
+                    background: Some(
+                        if status == button::Status::Hovered {
+                            iced::Color::from_rgb8(0xd4, 0x3f, 0x3f)
+                        } else {
+                            iced::Color::from_rgb8(0xb9, 0x2f, 0x2f)
+                        }
+                        .into(),
+                    ),
+                    border: iced::border::rounded(8),
+                    text_color: iced::Color::WHITE,
+                    ..button::Style::default()
+                })
+                .on_press(on_confirm),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
+        ]
+        .spacing(12),
+    )
+    .width(Length::Fixed(420.0))
+    .padding(20)
+    .style(|_t| container::Style {
+        background: Some(COLOR_BG.into()),
+        border: iced::border::rounded(14).color(COLOR_BORDER).width(1.0),
+        ..container::Style::default()
+    });
+
+    let centered = container(card)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .align_x(iced::alignment::Horizontal::Center)
+        .align_y(iced::alignment::Vertical::Center);
+
+    stack![scrim, centered]
         .width(Length::Fill)
         .height(Length::Fill)
         .into()

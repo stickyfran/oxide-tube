@@ -231,6 +231,9 @@ pub enum Message {
     OpenSettings,
     OpenLogin,
     CloseSettings,
+    RequestDeleteAccount(String),
+    CancelDeleteAccount,
+    ConfirmDeleteAccount,
 }
 
 #[derive(Debug, Clone)]
@@ -328,6 +331,7 @@ pub struct MitubApp {
     accounts_manifest: crate::accounts::AccountsManifest,
     account_avatar_handles: HashMap<String, image::Handle>,
     logged_in_accounts: std::collections::HashSet<String>,
+    pending_account_delete: Option<(String, String)>,
     selected_settings_tab: ui::SettingsCategory,
     auth_cookie_input: String,
     auth_status: String,
@@ -1487,19 +1491,50 @@ impl MitubApp {
     }
 
     fn restart_for_account(&self, open_login: bool) -> Task<Message> {
+        self.restart_for_account_with_toast(open_login, None)
+    }
+
+    fn restart_for_account_with_toast(
+        &self,
+        open_login: bool,
+        toast: Option<&str>,
+    ) -> Task<Message> {
         if let Ok(exe) = std::env::current_exe() {
             let mut command = std::process::Command::new(exe);
             // Never leak the previous instance's one-shot flags into the child:
             // otherwise every future switch keeps reopening the login modal.
             command
                 .env("MITUB_NEW_INSTANCE", "1")
-                .env_remove("MITUB_OPEN_LOGIN");
+                .env_remove("MITUB_OPEN_LOGIN")
+                .env_remove("MITUB_STARTUP_TOAST");
             if open_login {
                 command.env("MITUB_OPEN_LOGIN", "1");
+            }
+            if let Some(toast) = toast {
+                command.env("MITUB_STARTUP_TOAST", toast);
             }
             let _ = command.spawn();
         }
         std::process::exit(0);
+    }
+
+    /// Detects two profiles that logged into the same YouTube account and
+    /// merges them, keeping the oldest profile (its tabs/history) and the
+    /// freshest cookies. Returns a restart task when the active profile was
+    /// the duplicate that got removed.
+    fn merge_duplicate_accounts(&mut self) -> Option<Task<Message>> {
+        let (keep, remove) = crate::accounts::find_duplicate_accounts()?;
+        let active = crate::accounts::active_id();
+        crate::accounts::merge_accounts(&keep.id, &remove.id);
+        self.accounts_manifest = crate::accounts::manifest();
+        if remove.id == active {
+            Some(self.restart_for_account_with_toast(
+                false,
+                Some("Esa cuenta ya existía: se reutilizó el perfil guardado"),
+            ))
+        } else {
+            None
+        }
     }
 
     fn auto_delete_task(&self) -> Task<Message> {
@@ -1545,6 +1580,13 @@ impl MitubApp {
     }
 
     pub fn new() -> (Self, Task<Message>) {
+        // Collapse duplicate profiles before resolving the active account, so
+        // the whole startup loads the surviving profile.
+        let merged_duplicate = match crate::accounts::find_duplicate_accounts() {
+            Some((keep, remove)) => crate::accounts::merge_accounts(&keep.id, &remove.id),
+            None => false,
+        };
+
         // Fast launch: load saved session from disk cache without blocking on Firefox SQLite
         let initial_session = AuthSession::load_from_disk().unwrap_or_else(|_| AuthSession::new());
         let is_authed = initial_session.is_authenticated();
@@ -1663,6 +1705,7 @@ impl MitubApp {
             accounts_manifest: crate::accounts::manifest(),
             account_avatar_handles: HashMap::new(),
             logged_in_accounts: std::collections::HashSet::new(),
+            pending_account_delete: None,
             selected_settings_tab: ui::SettingsCategory::Playback,
             auth_cookie_input: String::new(),
             session_expired: false,
@@ -1993,10 +2036,28 @@ impl MitubApp {
             app.show_auth_modal = true;
             app.selected_settings_tab = ui::SettingsCategory::Account;
         }
+        if merged_duplicate {
+            app.toast_state = Some(ToastState {
+                icon: ToastIcon::Check,
+                text: "Se unificaron dos perfiles de la misma cuenta".to_string(),
+                created_at: std::time::Instant::now(),
+            });
+        }
+        if let Some(message) = std::env::var_os("MITUB_STARTUP_TOAST")
+            .and_then(|value| value.into_string().ok())
+            .filter(|message| !message.is_empty())
+        {
+            app.toast_state = Some(ToastState {
+                icon: ToastIcon::Check,
+                text: message,
+                created_at: std::time::Instant::now(),
+            });
+        }
         // Consume the one-shot launch flags so child instances do not inherit
         // them and reopen the login modal on every account switch.
         std::env::remove_var("MITUB_OPEN_LOGIN");
         std::env::remove_var("MITUB_NEW_INSTANCE");
+        std::env::remove_var("MITUB_STARTUP_TOAST");
 
         (app, Task::batch(initial_tasks))
     }
@@ -5390,6 +5451,9 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                     crate::accounts::update_active_profile(&name, url_opt.as_deref());
                     self.accounts_manifest = crate::accounts::manifest();
                     self.config.save_async();
+                    if let Some(task) = self.merge_duplicate_accounts() {
+                        return task;
+                    }
                 }
                 if let Some(url) = url_opt {
                     self.user_avatar_url = Some(url.clone());
@@ -5400,6 +5464,9 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                     );
                     self.accounts_manifest = crate::accounts::manifest();
                     self.config.save_async();
+                    if let Some(task) = self.merge_duplicate_accounts() {
+                        return task;
+                    }
                     let it = self.innertube.clone();
                     return Task::perform(
                         async move {
@@ -6698,6 +6765,49 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
             Message::CloseSettings => {
                 self.show_auth_modal = false;
                 Task::none()
+            }
+
+            Message::RequestDeleteAccount(id) => {
+                let name = self
+                    .accounts_manifest
+                    .accounts
+                    .iter()
+                    .find(|account| account.id == id)
+                    .map(|account| account.name.clone())
+                    .unwrap_or_else(|| "esta cuenta".to_string());
+                self.pending_account_delete = Some((id, name));
+                self.show_account_switcher = false;
+                Task::none()
+            }
+
+            Message::CancelDeleteAccount => {
+                self.pending_account_delete = None;
+                self.show_account_switcher = true;
+                Task::none()
+            }
+
+            Message::ConfirmDeleteAccount => {
+                let Some((id, _name)) = self.pending_account_delete.take() else {
+                    return Task::none();
+                };
+                let was_active = id == crate::accounts::active_id();
+                if was_active {
+                    let next = crate::accounts::delete_account(&id);
+                    let needs_login = next
+                        .as_deref()
+                        .map(|next| !crate::accounts::has_saved_session(next))
+                        .unwrap_or(true);
+                    self.restart_for_account_with_toast(
+                        needs_login,
+                        Some("Cuenta eliminada"),
+                    )
+                } else {
+                    crate::accounts::delete_account(&id);
+                    self.accounts_manifest = crate::accounts::manifest();
+                    self.logged_in_accounts.remove(&id);
+                    self.show_account_switcher = true;
+                    Task::none()
+                }
             }
 
             Message::SwitchAccount(id) => {
@@ -8999,11 +9109,20 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
                 anchor_right,
                 self.header_height() + 6.0,
                 |id| Message::SwitchAccount(id),
+                |id| Message::RequestDeleteAccount(id),
                 Message::OpenLogin,
                 Message::AddAccount,
                 Message::LogoutAccount,
                 Message::OpenSettings,
                 Message::ToggleAccountSwitcher,
+            ));
+        }
+
+        if let Some((_, name)) = &self.pending_account_delete {
+            layers.push(ui::view_delete_account_confirm(
+                name,
+                Message::ConfirmDeleteAccount,
+                Message::CancelDeleteAccount,
             ));
         }
 
