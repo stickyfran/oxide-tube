@@ -88,7 +88,7 @@ pub enum Message {
     SubscriptionsLoaded(Result<Vec<VideoCard>, String>),
     OpenHistory,
     OpenDownloads,
-    DownloadsScanned(Vec<(String, String, u64)>),
+    DownloadsScanned(Vec<(String, String, u64, i64)>),
     SearchHoverChanged(bool),
     ProfileHoverChanged(bool),
     HistoryLoaded(Result<Vec<VideoCard>, String>),
@@ -232,6 +232,7 @@ pub struct BufferDownloadState {
     pub is_complete: bool,
     pub video_path: Option<PathBuf>,
     pub audio_path: Option<PathBuf>,
+    pub started_at: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -275,7 +276,7 @@ pub struct MitubApp {
     auth_session: Arc<RwLock<AuthSession>>,
     innertube: Arc<InnerTubeClient>,
     buffer_downloads: HashMap<String, BufferDownloadState>,
-    cached_videos: Vec<(String, String, u64)>,
+    cached_videos: Vec<(String, String, u64, i64)>,
     search_hovered: bool,
     power_manager: Arc<PowerManager>,
     power_profile: PowerProfile,
@@ -392,6 +393,13 @@ pub struct MitubApp {
     last_header_click: Option<std::time::Instant>,
     header_drag_pending: Option<(std::time::Instant, iced::Point)>,
     tab_drag: Option<TabDragState>,
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 fn get_ipc_port() -> u16 {
@@ -3335,6 +3343,7 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                             is_complete: true,
                             video_path: Some(v_file.clone()),
                             audio_path: if a_file.is_file() { Some(a_file.clone()) } else { None },
+                            started_at: unix_now(),
                         },
                     );
                     self.osd_state.is_fully_buffered = true;
@@ -7278,6 +7287,7 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                         is_complete: false,
                         video_path: None,
                         audio_path: None,
+                        started_at: unix_now(),
                     },
                 );
 
@@ -7316,6 +7326,7 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                     is_complete: false,
                     video_path: None,
                     audio_path: None,
+                    started_at: unix_now(),
                 });
                 state.percent = pct;
                 state.downloaded_bytes = done;
@@ -7341,6 +7352,7 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                         is_complete: true,
                         video_path: Some(v_path.clone()),
                         audio_path: a_path.clone(),
+                        started_at: unix_now(),
                     },
                 );
 
@@ -7392,7 +7404,7 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
 
             Message::DeleteDownloadedVideo(video_id) => {
                 self.buffer_downloads.remove(&video_id);
-                self.cached_videos.retain(|(id, _, _)| id != &video_id);
+                self.cached_videos.retain(|(id, _, _, _)| id != &video_id);
                 let vid = video_id.clone();
                 Task::perform(
                     async move {
@@ -8360,11 +8372,12 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
                             total_bytes: st.total_bytes,
                             speed_bytes_per_sec: st.speed_bytes_per_sec,
                             is_complete: false,
+                            cached_at: st.started_at,
                         });
                     }
                 }
                 items.sort_by(|a, b| a.video_id.cmp(&b.video_id));
-                for (id, disk_title, size) in &self.cached_videos {
+                for (id, disk_title, size, cached_at) in &self.cached_videos {
                     if items.iter().any(|i| &i.video_id == id) {
                         continue;
                     }
@@ -8376,6 +8389,7 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
                         total_bytes: *size,
                         speed_bytes_per_sec: 0,
                         is_complete: true,
+                        cached_at: *cached_at,
                     });
                 }
                 for (id, st) in &self.buffer_downloads {
@@ -8388,6 +8402,7 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
                             total_bytes: st.total_bytes,
                             speed_bytes_per_sec: 0,
                             is_complete: true,
+                            cached_at: st.started_at,
                         });
                     }
                 }

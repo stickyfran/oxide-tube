@@ -121,25 +121,63 @@ pub fn format_size(bytes: u64) -> String {
     }
 }
 
-/// Lists fully cached videos as (video_id, total bytes of video + audio files).
-pub fn list_cached_videos() -> Vec<(String, String, u64)> {
+/// Lists fully cached videos as (video_id, title, total bytes, downloaded_at).
+pub fn list_cached_videos() -> Vec<(String, String, u64, i64)> {
     let mut out = Vec::new();
     let dir = video_cache_dir();
     if let Ok(entries) = fs::read_dir(&dir) {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
             if let Some(id) = name.strip_suffix("_video.mp4") {
-                let mut size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                let video_meta = entry.metadata().ok();
+                let mut size = video_meta.as_ref().map(|m| m.len()).unwrap_or(0);
+                let mut modified = video_meta
+                    .as_ref()
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
                 if let Ok(m) = fs::metadata(dir.join(format!("{id}_audio.mp4"))) {
                     size += m.len();
+                    if let Ok(t) = m.modified() {
+                        if let Ok(d) = t.duration_since(std::time::UNIX_EPOCH) {
+                            modified = modified.max(d.as_secs() as i64);
+                        }
+                    }
                 }
                 let title = get_video_title(id).unwrap_or_else(|| id.to_string());
-                out.push((id.to_string(), title, size));
+                out.push((id.to_string(), title, size, modified));
             }
         }
     }
-    out.sort_by(|a, b| a.1.cmp(&b.1));
+    out.sort_by(|a, b| b.3.cmp(&a.3));
     out
+}
+
+#[derive(Clone, Copy, Default)]
+pub struct StorageInfo {
+    pub total: u64,
+    pub available: u64,
+    pub free: u64,
+}
+
+/// Filesystem capacity for the downloads/cache volume.
+pub fn storage_info() -> StorageInfo {
+    let dir = video_cache_dir();
+    let _ = fs::create_dir_all(&dir);
+    let Ok(path) = std::ffi::CString::new(dir.to_string_lossy().as_bytes()) else {
+        return StorageInfo::default();
+    };
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(path.as_ptr(), &mut stat) } != 0 {
+        return StorageInfo::default();
+    }
+    let block = stat.f_frsize as u64;
+    StorageInfo {
+        total: (stat.f_blocks as u64).saturating_mul(block),
+        free: (stat.f_bfree as u64).saturating_mul(block),
+        available: (stat.f_bavail as u64).saturating_mul(block),
+    }
 }
 
 /// Prunes the video cache (oldest first) down to 90% of `max_bytes`.

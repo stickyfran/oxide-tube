@@ -2275,17 +2275,41 @@ pub struct DownloadItem {
     pub total_bytes: u64,
     pub speed_bytes_per_sec: u64,
     pub is_complete: bool,
+    pub cached_at: i64,
 }
 
 pub fn view_downloads<'a, Message: Clone + 'static>(
-    items: Vec<DownloadItem>,
+    mut items: Vec<DownloadItem>,
     on_open: impl Fn(String) -> Message + Copy + 'static,
     on_delete: impl Fn(String) -> Message + Copy + 'static,
 ) -> Element<'a, Message> {
-    let mut list = Column::new().spacing(8).padding([16, 24]);
+    // Newest first so the history groups appear in chronological order.
+    items.sort_by(|a, b| b.cached_at.cmp(&a.cached_at));
+
+    let total_items = items.len();
+    let completed = items.iter().filter(|item| item.is_complete).count();
+    let used: u64 = items.iter().map(|item| item.downloaded_bytes).sum();
+
+    use chrono::Datelike;
+    let now = chrono::Local::now();
+    let today = now.date_naive();
+    let week_start = today
+        - chrono::Duration::days(today.weekday().num_days_from_monday() as i64);
+
+    let mut groups: Vec<(String, Vec<DownloadItem>)> = Vec::new();
+    for item in items {
+        let label = download_group_label(item.cached_at, today, week_start);
+        if let Some((_, bucket)) = groups.iter_mut().find(|(name, _)| name == &label) {
+            bucket.push(item);
+        } else {
+            groups.push((label, vec![item]));
+        }
+    }
+
+    let mut list = Column::new().spacing(10).padding([8, 0]);
     list = list.push(text("Descargas").size(22).color(COLOR_TEXT_PRIMARY));
 
-    if items.is_empty() {
+    if groups.is_empty() {
         list = list.push(
             text("No hay videos descargados ni bufferizados localmente.")
                 .size(13)
@@ -2293,104 +2317,216 @@ pub fn view_downloads<'a, Message: Clone + 'static>(
         );
     }
 
-    for item in items {
-        let speed_str = crate::cache_manager::format_speed(item.speed_bytes_per_sec);
-        let status_row: Element<'a, Message> = if item.is_complete {
-            row![
-                icon_check_circle(12.0),
-                text(format!("Descargado · {}", format_size(item.downloaded_bytes)))
-                    .size(12)
-                    .color(iced::Color::from_rgb8(0x2b, 0xa6, 0x40)),
-            ]
-            .spacing(5)
-            .align_y(Alignment::Center)
-            .into()
-        } else {
-            let status_text = if item.total_bytes > 0 {
-                if !speed_str.is_empty() {
-                    format!(
-                        "Descargando {}% · {} / {} · {}",
-                        item.percent,
-                        format_size(item.downloaded_bytes),
-                        format_size(item.total_bytes),
-                        speed_str
-                    )
-                } else {
-                    format!(
-                        "Descargando {}% · {} / {}",
-                        item.percent,
-                        format_size(item.downloaded_bytes),
-                        format_size(item.total_bytes)
-                    )
-                }
-            } else if !speed_str.is_empty() {
-                format!("Descargando {}% · {}", item.percent, speed_str)
-            } else {
-                format!("Descargando {}%", item.percent)
-            };
-            text(status_text).size(12).color(COLOR_TEXT_SECONDARY).into()
-        };
-        let bar_color = if item.is_complete {
-            iced::Color::from_rgb8(0x2b, 0xa6, 0x40)
-        } else {
-            iced::Color::from_rgb8(0x3e, 0xa6, 0xff)
-        };
-        let content = column![
-            text(item.title).size(14).color(COLOR_TEXT_PRIMARY),
-            iced::widget::progress_bar(0.0..=100.0, item.percent as f32)
-                .height(6)
-                .style(move |_t: &Theme| iced::widget::progress_bar::Style {
-                    background: COLOR_SURFACE_HOVER.into(),
-                    bar: bar_color.into(),
-                    border: iced::border::rounded(3),
-                }),
-            status_row,
-        ]
-        .spacing(6);
-
-        let open_btn = button(content)
-            .style(secondary_button)
-            .padding([10, 14])
-            .width(Length::Fill)
-            .on_press(on_open(item.video_id.clone()));
-
-        let delete_btn = button(
-            row![
-                icon_trash(14.0),
-                text("Eliminar").size(12).color(iced::Color::from_rgb8(0xff, 0x66, 0x66)),
-            ]
-            .spacing(6)
-            .align_y(Alignment::Center),
-        )
-        .style(move |_theme, status| {
-            let bg = match status {
-                button::Status::Hovered => iced::Color::from_rgb8(0x5a, 0x1a, 0x1a),
-                button::Status::Pressed => iced::Color::from_rgb8(0x7a, 0x20, 0x20),
-                _ => COLOR_SURFACE,
-            };
-            let border_col = if status == button::Status::Hovered {
-                iced::Color::from_rgb8(0xff, 0x44, 0x44)
-            } else {
-                COLOR_BORDER
-            };
-            button::Style {
-                background: Some(bg.into()),
-                border: iced::border::rounded(10).color(border_col).width(1.0),
-                ..button::Style::default()
-            }
-        })
-        .padding([10, 14])
-        .on_press(on_delete(item.video_id));
-
+    for (label, bucket) in groups {
         list = list.push(
-            row![open_btn, delete_btn]
-                .spacing(8)
-                .align_y(Alignment::Center)
-                .width(Length::Fill),
+            row![
+                container(Space::new(Length::Fixed(3.0), Length::Fixed(16.0)))
+                    .style(|_t| container::Style {
+                        background: Some(iced::Color::from_rgb8(0x3e, 0xa6, 0xff).into()),
+                        border: iced::border::rounded(2),
+                        ..container::Style::default()
+                    }),
+                text(label).size(13).color(COLOR_TEXT_PRIMARY),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center)
         );
+
+        for item in bucket {
+            let speed_str = crate::cache_manager::format_speed(item.speed_bytes_per_sec);
+            let status_row: Element<'a, Message> = if item.is_complete {
+                row![
+                    icon_check_circle(12.0),
+                    text(format!("Descargado · {}", format_size(item.downloaded_bytes)))
+                        .size(12)
+                        .color(iced::Color::from_rgb8(0x2b, 0xa6, 0x40)),
+                ]
+                .spacing(5)
+                .align_y(Alignment::Center)
+                .into()
+            } else {
+                let status_text = if item.total_bytes > 0 {
+                    if !speed_str.is_empty() {
+                        format!(
+                            "Descargando {}% · {} / {} · {}",
+                            item.percent,
+                            format_size(item.downloaded_bytes),
+                            format_size(item.total_bytes),
+                            speed_str
+                        )
+                    } else {
+                        format!(
+                            "Descargando {}% · {} / {}",
+                            item.percent,
+                            format_size(item.downloaded_bytes),
+                            format_size(item.total_bytes)
+                        )
+                    }
+                } else if !speed_str.is_empty() {
+                    format!("Descargando {}% · {}", item.percent, speed_str)
+                } else {
+                    format!("Descargando {}%", item.percent)
+                };
+                text(status_text).size(12).color(COLOR_TEXT_SECONDARY).into()
+            };
+            let bar_color = if item.is_complete {
+                iced::Color::from_rgb8(0x2b, 0xa6, 0x40)
+            } else {
+                iced::Color::from_rgb8(0x3e, 0xa6, 0xff)
+            };
+            let content = column![
+                text(item.title).size(14).color(COLOR_TEXT_PRIMARY),
+                iced::widget::progress_bar(0.0..=100.0, item.percent as f32)
+                    .height(6)
+                    .style(move |_t: &Theme| iced::widget::progress_bar::Style {
+                        background: COLOR_SURFACE_HOVER.into(),
+                        bar: bar_color.into(),
+                        border: iced::border::rounded(3),
+                    }),
+                status_row,
+            ]
+            .spacing(6);
+
+            let open_btn = button(content)
+                .style(secondary_button)
+                .padding([10, 14])
+                .width(Length::Fill)
+                .on_press(on_open(item.video_id.clone()));
+
+            let delete_btn = button(
+                row![
+                    icon_trash(14.0),
+                    text("Eliminar").size(12).color(iced::Color::from_rgb8(0xff, 0x66, 0x66)),
+                ]
+                .spacing(6)
+                .align_y(Alignment::Center),
+            )
+            .style(move |_theme, status| {
+                let bg = match status {
+                    button::Status::Hovered => iced::Color::from_rgb8(0x5a, 0x1a, 0x1a),
+                    button::Status::Pressed => iced::Color::from_rgb8(0x7a, 0x20, 0x20),
+                    _ => COLOR_SURFACE,
+                };
+                let border_col = if status == button::Status::Hovered {
+                    iced::Color::from_rgb8(0xff, 0x44, 0x44)
+                } else {
+                    COLOR_BORDER
+                };
+                button::Style {
+                    background: Some(bg.into()),
+                    border: iced::border::rounded(10).color(border_col).width(1.0),
+                    ..button::Style::default()
+                }
+            })
+            .padding([10, 14])
+            .on_press(on_delete(item.video_id));
+
+            list = list.push(
+                row![open_btn, delete_btn]
+                    .spacing(8)
+                    .align_y(Alignment::Center)
+                    .width(Length::Fill),
+            );
+        }
     }
 
-    scrollable(list).width(Length::Fill).height(Length::Fill).into()
+    let storage = crate::cache_manager::storage_info();
+    let stat = |label: &'static str, value: String| -> Element<'a, Message> {
+        row![
+            text(label).size(12).color(COLOR_TEXT_SECONDARY),
+            Space::with_width(Length::Fill),
+            text(value).size(12).color(COLOR_TEXT_PRIMARY),
+        ]
+        .align_y(Alignment::Center)
+        .into()
+    };
+    let disk_fraction = if storage.total > 0 {
+        (used as f32 / storage.total as f32).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let storage_panel: Element<'a, Message> = container(
+        column![
+            text("Almacenamiento").size(16).color(COLOR_TEXT_PRIMARY),
+            stat("Videos", completed.to_string()),
+            stat("En curso", (total_items - completed).to_string()),
+            stat("Ocupado por descargas", format_size(used)),
+            stat(
+                "Usado en disco",
+                format_size(storage.total.saturating_sub(storage.free)),
+            ),
+            stat("Espacio disponible", format_size(storage.available)),
+            iced::widget::progress_bar(0.0..=100.0, disk_fraction * 100.0)
+                .height(7)
+                .style(|_t: &Theme| iced::widget::progress_bar::Style {
+                    background: COLOR_SURFACE_HOVER.into(),
+                    bar: iced::Color::from_rgb8(0x3e, 0xa6, 0xff).into(),
+                    border: iced::border::rounded(4),
+                }),
+            stat("Disco total", format_size(storage.total)),
+        ]
+        .spacing(10),
+    )
+    .padding(16)
+    .width(Length::Fixed(320.0))
+    .style(|_t| container::Style {
+        background: Some(COLOR_SURFACE.into()),
+        border: iced::border::rounded(12).color(COLOR_BORDER).width(1.0),
+        ..container::Style::default()
+    })
+    .into();
+
+    row![
+        scrollable(list).width(Length::Fill).height(Length::Fill),
+        storage_panel
+    ]
+    .spacing(16)
+    .padding(16)
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .into()
+}
+
+fn download_group_label(ts: i64, today: chrono::NaiveDate, week_start: chrono::NaiveDate) -> String {
+    use chrono::{Datelike, TimeZone};
+    if ts <= 0 {
+        return "Anteriores".to_string();
+    }
+    let Some(date) = chrono::Local
+        .timestamp_opt(ts, 0)
+        .single()
+        .map(|dt| dt.date_naive())
+    else {
+        return "Anteriores".to_string();
+    };
+    if date >= today {
+        "Hoy".to_string()
+    } else if date == today - chrono::Duration::days(1) {
+        "Ayer".to_string()
+    } else if date >= week_start {
+        "Esta semana".to_string()
+    } else if date.year() == today.year() && date.month() == today.month() {
+        "Este mes".to_string()
+    } else {
+        format!("{} {}", download_month_name(date.month()), date.year())
+    }
+}
+
+fn download_month_name(month: u32) -> &'static str {
+    match month {
+        1 => "Enero",
+        2 => "Febrero",
+        3 => "Marzo",
+        4 => "Abril",
+        5 => "Mayo",
+        6 => "Junio",
+        7 => "Julio",
+        8 => "Agosto",
+        9 => "Septiembre",
+        10 => "Octubre",
+        11 => "Noviembre",
+        _ => "Diciembre",
+    }
 }
 
 #[cfg(test)]
