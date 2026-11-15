@@ -204,6 +204,29 @@ pub fn delete_cached_video(video_id: &str) -> u64 {
     freed
 }
 
+/// Deletes completed cached videos whose file is older than `max_age_secs`.
+/// Returns (deleted_videos, freed_bytes). Protected ids are kept.
+pub fn delete_videos_older_than(max_age_secs: u64, protected_ids: &[String]) -> (usize, u64) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let cutoff = now.saturating_sub(max_age_secs as i64);
+    let mut deleted = 0usize;
+    let mut freed = 0u64;
+    for (id, _title, size, modified) in list_cached_videos() {
+        if protected_ids.iter().any(|protected| protected == &id) {
+            continue;
+        }
+        if modified > 0 && modified < cutoff {
+            let released = delete_cached_video(&id);
+            deleted += 1;
+            freed = freed.saturating_add(released.max(size));
+        }
+    }
+    (deleted, freed)
+}
+
 pub fn prune_cache_if_needed(max_bytes: u64, protected_ids: &[String]) -> u64 {
     if max_bytes == u64::MAX {
         return 0;

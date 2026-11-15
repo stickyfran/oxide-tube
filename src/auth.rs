@@ -326,14 +326,7 @@ impl AuthSession {
     }
 
     fn config_path() -> Option<PathBuf> {
-        #[cfg(target_os = "windows")]
-        {
-            if let Some(app_data) = dirs::data_dir() {
-                return Some(app_data.join("mitub/cookies.json"));
-            }
-        }
-        let home = dirs::home_dir()?;
-        Some(home.join(".config/mitub/cookies.json"))
+        Some(crate::accounts::active_cookies_path())
     }
 
     pub fn save_to_disk(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {

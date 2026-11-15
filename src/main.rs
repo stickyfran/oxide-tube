@@ -1,3 +1,4 @@
+mod accounts;
 mod auth;
 mod cache_manager;
 mod config;
@@ -158,6 +159,10 @@ pub enum Message {
     ScrollTabsRight,
     OpenEmptyTab,
     ToggleLoginModal,
+    ToggleAccountSwitcher,
+    SwitchAccount(String),
+    AddAccount,
+    LogoutAccount,
     SelectSettingsCategory(ui::SettingsCategory),
     CookieInputChanged(String),
     SaveRawCookie,
@@ -220,6 +225,8 @@ pub enum Message {
     StartMainWindowResize(PipResizeEdge),
     ToggleCustomTitlebar,
     ToggleTabTwoRows,
+    SetAutoDeletePeriod(crate::config::AutoDeletePeriod),
+    AutoDeleteFinished(usize, u64),
 }
 
 #[derive(Debug, Clone)]
@@ -313,6 +320,8 @@ pub struct MitubApp {
     is_ctrl_pressed: bool,
     chat_collapsed: bool,
     show_auth_modal: bool,
+    show_account_switcher: bool,
+    accounts_manifest: crate::accounts::AccountsManifest,
     selected_settings_tab: ui::SettingsCategory,
     auth_cookie_input: String,
     auth_status: String,
@@ -1410,6 +1419,48 @@ fn start_full_buffer_task(
 }
 
 impl MitubApp {
+    fn protected_video_ids(&self) -> Vec<String> {
+        let mut protected: Vec<String> = self.tabs.iter().map(|t| t.video_id.clone()).collect();
+        if let Some(v) = &self.playing_video_id {
+            protected.push(v.clone());
+        }
+        for (id, st) in &self.buffer_downloads {
+            if !st.is_complete && st.percent > 0 {
+                protected.push(id.clone());
+            }
+        }
+        protected
+    }
+
+    fn restart_for_account(&self, open_login: bool) -> Task<Message> {
+        if let Ok(exe) = std::env::current_exe() {
+            let mut command = std::process::Command::new(exe);
+            command.env("MITUB_NEW_INSTANCE", "1");
+            if open_login {
+                command.env("MITUB_OPEN_LOGIN", "1");
+            }
+            let _ = command.spawn();
+        }
+        std::process::exit(0);
+    }
+
+    fn auto_delete_task(&self) -> Task<Message> {
+        let Some(max_age_secs) = self.config.auto_delete_downloads.threshold_secs() else {
+            return Task::none();
+        };
+        let protected = self.protected_video_ids();
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    crate::cache_manager::delete_videos_older_than(max_age_secs, &protected)
+                })
+                .await
+                .unwrap_or((0, 0))
+            },
+            |(deleted, freed)| Message::AutoDeleteFinished(deleted, freed),
+        )
+    }
+
     /// Prunes the video cache to the configured limit (protecting open tabs and the playing video) and re-measures it.
     fn prune_and_refresh_cache_task(&self) -> Task<Message> {
         let max_bytes = self.config.max_cache_size_bytes;
@@ -1550,6 +1601,8 @@ impl MitubApp {
             is_ctrl_pressed: false,
             chat_collapsed: false,
             show_auth_modal: false,
+            show_account_switcher: false,
+            accounts_manifest: crate::accounts::manifest(),
             selected_settings_tab: ui::SettingsCategory::Playback,
             auth_cookie_input: String::new(),
             session_expired: false,
@@ -1720,7 +1773,23 @@ impl MitubApp {
             Message::CacheSizeRefreshed,
         );
 
-        let mut initial_tasks = vec![open_task, home_task, handle_task, profile_task, auth_task, cache_task];
+        let auto_delete_task = if let Some(max_age_secs) = app.config.auto_delete_downloads.threshold_secs() {
+            let protected: Vec<String> = app.config.saved_tabs.iter().map(|tab| tab.video_id.clone()).collect();
+            Task::perform(
+                async move {
+                    tokio::task::spawn_blocking(move || {
+                        crate::cache_manager::delete_videos_older_than(max_age_secs, &protected)
+                    })
+                    .await
+                    .unwrap_or((0, 0))
+                },
+                |(deleted, freed)| Message::AutoDeleteFinished(deleted, freed),
+            )
+        } else {
+            Task::none()
+        };
+
+        let mut initial_tasks = vec![open_task, home_task, handle_task, profile_task, auth_task, cache_task, auto_delete_task];
         if let Some(cached_avatar) = &app.config.cached_avatar_url {
             let it = innertube.clone();
             let url = cached_avatar.clone();
@@ -1850,6 +1919,10 @@ impl MitubApp {
             if let Some(poster_task) = app.queue_thumbnail_download(&poster_url) {
                 initial_tasks.push(poster_task);
             }
+        }
+
+        if std::env::var_os("MITUB_OPEN_LOGIN").is_some() {
+            app.show_auth_modal = true;
         }
 
         (app, Task::batch(initial_tasks))
@@ -2705,7 +2778,7 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                     }
                 }
 
-                if let Some(st) = &self.toast_state {
+        if let Some(st) = &self.toast_state {
                     let max_d = if matches!(st.icon, ToastIcon::VolumeHigh | ToastIcon::VolumeLow | ToastIcon::VolumeMute) { 1.4 } else { 2.5 };
                     if st.created_at.elapsed().as_secs_f32() >= max_d {
                         self.toast_state = None;
@@ -5240,12 +5313,19 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                 if let Some(name) = name_opt {
                     self.session_expired = false;
                     self.user_display_name = Some(name.clone());
-                    self.config.cached_user_name = Some(name);
+                    self.config.cached_user_name = Some(name.clone());
+                    crate::accounts::update_active_profile(&name, url_opt.as_deref());
+                    self.accounts_manifest = crate::accounts::manifest();
                     self.config.save_async();
                 }
                 if let Some(url) = url_opt {
                     self.user_avatar_url = Some(url.clone());
                     self.config.cached_avatar_url = Some(url.clone());
+                    crate::accounts::update_active_profile(
+                        self.user_display_name.as_deref().unwrap_or(""),
+                        Some(&url),
+                    );
+                    self.accounts_manifest = crate::accounts::manifest();
                     self.config.save_async();
                     let it = self.innertube.clone();
                     return Task::perform(
@@ -6511,6 +6591,50 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                 )
             }
 
+            Message::ToggleAccountSwitcher => {
+                let authed = self
+                    .auth_session
+                    .try_read()
+                    .map(|session| session.is_authenticated())
+                    .unwrap_or(false);
+                if authed {
+                    self.accounts_manifest = crate::accounts::manifest();
+                    self.show_account_switcher = !self.show_account_switcher;
+                    self.show_auth_modal = false;
+                } else {
+                    self.show_auth_modal = !self.show_auth_modal;
+                    self.show_account_switcher = false;
+                }
+                Task::none()
+            }
+
+            Message::SwitchAccount(id) => {
+                self.config.save();
+                if let Ok(session) = self.auth_session.try_read() {
+                    let _ = session.save_to_disk();
+                }
+                crate::accounts::set_active(&id);
+                self.restart_for_account(false)
+            }
+
+            Message::AddAccount => {
+                self.config.save();
+                if let Ok(session) = self.auth_session.try_read() {
+                    let _ = session.save_to_disk();
+                }
+                let count = crate::accounts::manifest().accounts.len() + 1;
+                crate::accounts::create_account(&format!("Cuenta {count}"));
+                self.restart_for_account(true)
+            }
+
+            Message::LogoutAccount => {
+                crate::accounts::clear_active_session();
+                self.config.cached_user_name = None;
+                self.config.cached_avatar_url = None;
+                self.config.save();
+                self.restart_for_account(true)
+            }
+
             Message::AuthValidated(valid) => {
                 if valid {
                     self.session_expired = false;
@@ -7536,6 +7660,33 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                 Task::none()
             }
 
+            Message::SetAutoDeletePeriod(period) => {
+                self.config.auto_delete_downloads = period;
+                self.config.save_async();
+                let task = self.auto_delete_task();
+                self.toast_state = Some(ToastState {
+                    icon: ToastIcon::None,
+                    text: format!("Auto-eliminar descargas: {}", period.label()),
+                    created_at: std::time::Instant::now(),
+                });
+                task
+            }
+
+            Message::AutoDeleteFinished(deleted, freed) => {
+                if deleted > 0 {
+                    self.toast_state = Some(ToastState {
+                        icon: ToastIcon::Check,
+                        text: format!(
+                            "Se eliminaron {} descargas antiguas ({})",
+                            deleted,
+                            crate::cache_manager::format_size(freed)
+                        ),
+                        created_at: std::time::Instant::now(),
+                    });
+                }
+                Task::none()
+            }
+
             Message::CacheSizeRefreshed(new_size) => {
                 self.current_cache_size_bytes = new_size;
                 // Drop buffer entries whose files were pruned from disk
@@ -8312,7 +8463,7 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
             Message::OpenSubscriptions,
             Message::OpenHistory,
             Message::OpenDownloads,
-            Message::ToggleLoginModal,
+            Message::ToggleAccountSwitcher,
             Message::ProfileHoverChanged,
             Message::ReloadFeed,
             Message::SelectTab,
@@ -8419,7 +8570,13 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
                         });
                     }
                 }
-                ui::view_downloads(items, Message::OpenVideo, Message::DeleteDownloadedVideo)
+                ui::view_downloads(
+                    items,
+                    self.config.auto_delete_downloads,
+                    |period| Message::SetAutoDeletePeriod(period),
+                    Message::OpenVideo,
+                    Message::DeleteDownloadedVideo,
+                )
             }
             ViewMode::Playlists => view_home_grid(
                 &self.home_videos,
@@ -8711,6 +8868,17 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
             layers.push(ui::player_backdrop(hole));
         }
         layers.push(base_view);
+
+        if self.show_account_switcher {
+            layers.push(ui::view_account_switcher(
+                &self.accounts_manifest.accounts,
+                &self.accounts_manifest.active,
+                |id| Message::SwitchAccount(id),
+                Message::AddAccount,
+                Message::LogoutAccount,
+                Message::ToggleAccountSwitcher,
+            ));
+        }
 
         if self.session_expired {
             let banner = container(
@@ -9420,7 +9588,8 @@ fn main() -> iced::Result {
 
     // Check if an argument (e.g. YouTube URL or RESTORE) was passed and an existing instance is already running
     let arg = std::env::args().nth(1).unwrap_or_else(|| "RESTORE".to_string());
-    if try_send_to_existing_instance(&arg) {
+    let fresh_instance = std::env::var_os("MITUB_NEW_INSTANCE").is_some();
+    if !fresh_instance && try_send_to_existing_instance(&arg) {
         println!("[Tube-oxide IPC] Sent command/URL to existing instance successfully: {arg}");
         return Ok(());
     }

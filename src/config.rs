@@ -124,6 +124,46 @@ pub enum GridColumnsConfig {
     Cols6,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum AutoDeletePeriod {
+    #[default]
+    Never,
+    OneWeek,
+    OneMonth,
+    ThreeMonths,
+    SixMonths,
+}
+
+impl AutoDeletePeriod {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Never => "Nunca",
+            Self::OneWeek => "1 semana",
+            Self::OneMonth => "1 mes",
+            Self::ThreeMonths => "3 meses",
+            Self::SixMonths => "6 meses",
+        }
+    }
+
+    pub fn threshold_secs(self) -> Option<u64> {
+        match self {
+            Self::Never => None,
+            Self::OneWeek => Some(7 * 24 * 60 * 60),
+            Self::OneMonth => Some(30 * 24 * 60 * 60),
+            Self::ThreeMonths => Some(90 * 24 * 60 * 60),
+            Self::SixMonths => Some(180 * 24 * 60 * 60),
+        }
+    }
+
+    pub const ALL: [Self; 5] = [
+        Self::Never,
+        Self::OneWeek,
+        Self::OneMonth,
+        Self::ThreeMonths,
+        Self::SixMonths,
+    ];
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     pub preferred_resolution: PreferredResolution,
@@ -164,6 +204,8 @@ pub struct AppConfig {
     pub cached_avatar_url: Option<String>,
     #[serde(default = "crate::cache_manager::default_cache_limit")]
     pub max_cache_size_bytes: u64,
+    #[serde(default)]
+    pub auto_delete_downloads: AutoDeletePeriod,
     #[serde(default = "default_true")]
     pub close_to_tray: bool,
     #[serde(default)]
@@ -209,6 +251,7 @@ impl Default for AppConfig {
             cached_user_name: None,
             cached_avatar_url: None,
             max_cache_size_bytes: crate::cache_manager::default_cache_limit(),
+            auto_delete_downloads: AutoDeletePeriod::default(),
             close_to_tray: true,
             card_style: CardStyle::Squircle,
             home_columns: GridColumnsConfig::Cols4,
@@ -222,8 +265,7 @@ impl Default for AppConfig {
 
 impl AppConfig {
     pub fn file_path() -> Option<PathBuf> {
-        let home = dirs::home_dir()?;
-        Some(home.join(".config/mitub/config.json"))
+        Some(crate::accounts::active_config_path())
     }
 
     pub fn load() -> Self {

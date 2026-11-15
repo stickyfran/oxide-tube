@@ -7,6 +7,7 @@ pub mod video_widget;
 pub mod watch_view;
 
 use crate::cache_manager::{format_size, limit_to_index, CACHE_LIMIT_LABELS};
+use crate::config::AutoDeletePeriod;
 use crate::config::{PreferredAudioLanguage, PreferredCodec, PreferredResolution};
 use crate::power_manager::PowerProfile;
 use crate::ui::icons::*;
@@ -2280,6 +2281,8 @@ pub struct DownloadItem {
 
 pub fn view_downloads<'a, Message: Clone + 'static>(
     mut items: Vec<DownloadItem>,
+    auto_delete: AutoDeletePeriod,
+    on_auto_delete: impl Fn(AutoDeletePeriod) -> Message + Copy + 'static,
     on_open: impl Fn(String) -> Message + Copy + 'static,
     on_delete: impl Fn(String) -> Message + Copy + 'static,
 ) -> Element<'a, Message> {
@@ -2440,6 +2443,35 @@ pub fn view_downloads<'a, Message: Clone + 'static>(
         .align_y(Alignment::Center)
         .into()
     };
+    let mut periods = row![].spacing(4);
+    for period in AutoDeletePeriod::ALL {
+        let selected = period == auto_delete;
+        let period_label = period.label();
+        periods = periods.push(
+            button(text(period_label).size(10.5).color(if selected {
+                iced::Color::from_rgb8(0x0f, 0x0f, 0x12)
+            } else {
+                COLOR_TEXT_PRIMARY
+            }))
+            .style(move |_theme, status| {
+                let bg = if selected {
+                    iced::Color::from_rgb8(0x8b, 0x5c, 0xf6)
+                } else if status == button::Status::Hovered {
+                    COLOR_SURFACE_HOVER
+                } else {
+                    COLOR_SURFACE
+                };
+                button::Style {
+                    background: Some(bg.into()),
+                    border: iced::border::rounded(8).color(COLOR_BORDER).width(1.0),
+                    ..button::Style::default()
+                }
+            })
+            .padding([5, 7])
+            .on_press(on_auto_delete(period)),
+        );
+    }
+
     let disk_fraction = if storage.total > 0 {
         (used as f32 / storage.total as f32).clamp(0.0, 1.0)
     } else {
@@ -2464,6 +2496,14 @@ pub fn view_downloads<'a, Message: Clone + 'static>(
                     border: iced::border::rounded(4),
                 }),
             stat("Disco total", format_size(storage.total)),
+            container(Space::new(Length::Fill, Length::Fixed(1.0)))
+                .style(|_t| container::Style {
+                    background: Some(COLOR_BORDER.into()),
+                    ..container::Style::default()
+                }),
+            text("Auto-eliminar descargas").size(12).color(COLOR_TEXT_PRIMARY),
+            text("Borra archivos más viejos que:").size(10.5).color(COLOR_TEXT_SECONDARY),
+            periods,
         ]
         .spacing(10),
     )
@@ -2527,6 +2567,175 @@ fn download_month_name(month: u32) -> &'static str {
         11 => "Noviembre",
         _ => "Diciembre",
     }
+}
+
+/// Google-style account picker. Each row selects an account; the app reloads
+/// with that account's config/session.
+pub fn view_account_switcher<'a, Message: Clone + 'static>(
+    accounts: &'a [crate::accounts::AccountEntry],
+    active_id: &'a str,
+    on_select: impl Fn(String) -> Message + Copy + 'static,
+    on_add: Message,
+    on_logout: Message,
+    on_close: Message,
+) -> Element<'a, Message> {
+    let scrim = mouse_area(
+        container(Space::new(Length::Fill, Length::Fill))
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .style(|_t| container::Style {
+                background: Some(iced::Color::from_rgba(0.0, 0.0, 0.0, 0.62).into()),
+                ..container::Style::default()
+            }),
+    )
+    .on_press(on_close.clone());
+
+    let mut rows = Column::new().spacing(6);
+    for account in accounts {
+        let is_active = account.id == active_id;
+        let initial = account
+            .name
+            .chars()
+            .next()
+            .unwrap_or('?')
+            .to_uppercase()
+            .to_string();
+        let avatar = container(
+            text(initial).size(17).color(iced::Color::WHITE),
+        )
+        .width(Length::Fixed(40.0))
+        .height(Length::Fixed(40.0))
+        .align_x(iced::alignment::Horizontal::Center)
+        .align_y(iced::alignment::Vertical::Center)
+        .style(|_t| container::Style {
+            background: Some(iced::Color::from_rgb8(0x8b, 0x5c, 0xf6).into()),
+            border: iced::border::rounded(20),
+            ..container::Style::default()
+        });
+
+        let label = if is_active {
+            "Cuenta activa · click para recargar"
+        } else {
+            "Cambiar a esta cuenta"
+        };
+        let row = row![
+            avatar,
+            column![
+                text(account.name.clone()).size(14).color(COLOR_TEXT_PRIMARY),
+                text(label).size(10.5).color(COLOR_TEXT_SECONDARY),
+            ]
+            .spacing(2),
+            Space::with_width(Length::Fill),
+            if is_active {
+                text("✓").size(16).color(iced::Color::from_rgb8(0x8b, 0x5c, 0xf6))
+            } else {
+                text("").size(1.0)
+            },
+        ]
+        .spacing(12)
+        .align_y(Alignment::Center);
+
+        rows = rows.push(
+            button(row)
+                .width(Length::Fill)
+                .padding([8, 10])
+                .style(|_t, status| button::Style {
+                    background: Some(
+                        if status == button::Status::Hovered {
+                            COLOR_SURFACE_HOVER
+                        } else {
+                            COLOR_SURFACE
+                        }
+                        .into(),
+                    ),
+                    border: iced::border::rounded(10).color(COLOR_BORDER).width(1.0),
+                    ..button::Style::default()
+                })
+                .on_press(on_select(account.id.clone())),
+        );
+    }
+
+    let card = container(
+        column![
+            text("Cuentas").size(19).color(COLOR_TEXT_PRIMARY),
+            text("Elegí una cuenta para cambiar de perfil, pestañas e historial.")
+                .size(11.5)
+                .color(COLOR_TEXT_SECONDARY),
+            rows,
+            button(
+                row![
+                    text("＋").size(18).color(COLOR_TEXT_PRIMARY),
+                    text("Agregar cuenta").size(13).color(COLOR_TEXT_PRIMARY),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center),
+            )
+            .width(Length::Fill)
+            .padding([9, 10])
+            .style(|_t, status| button::Style {
+                background: Some(
+                    if status == button::Status::Hovered {
+                        COLOR_SURFACE_HOVER
+                    } else {
+                        COLOR_SURFACE
+                    }
+                    .into(),
+                ),
+                border: iced::border::rounded(10).color(COLOR_BORDER).width(1.0),
+                ..button::Style::default()
+            })
+            .on_press(on_add),
+            button(text("Cerrar sesión de esta cuenta").size(12).color(iced::Color::from_rgb8(0xff, 0x77, 0x77)))
+                .width(Length::Fill)
+                .padding([8, 10])
+                .style(|_t, status| button::Style {
+                    background: Some(
+                        if status == button::Status::Hovered {
+                            iced::Color::from_rgb8(0x3a, 0x1a, 0x1a)
+                        } else {
+                            COLOR_SURFACE
+                        }
+                        .into(),
+                    ),
+                    border: iced::border::rounded(10)
+                        .color(iced::Color::from_rgb8(0x7a, 0x30, 0x30))
+                        .width(1.0),
+                    ..button::Style::default()
+                })
+                .on_press(on_logout),
+            button(text("Cancelar").size(12).color(COLOR_TEXT_SECONDARY))
+                .width(Length::Fill)
+                .padding([6, 10])
+                .style(|_t, status| button::Style {
+                    background: Some(
+                        if status == button::Status::Hovered {
+                            COLOR_SURFACE_HOVER
+                        } else {
+                            iced::Color::TRANSPARENT
+                        }
+                        .into(),
+                    ),
+                    ..button::Style::default()
+                })
+                .on_press(on_close),
+        ]
+        .spacing(10),
+    )
+    .width(Length::Fixed(410.0))
+    .padding(20)
+    .style(|_t| container::Style {
+        background: Some(COLOR_BG.into()),
+        border: iced::border::rounded(16).color(COLOR_BORDER).width(1.0),
+        ..container::Style::default()
+    });
+
+    let centered = container(card)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .align_x(iced::alignment::Horizontal::Center)
+        .align_y(iced::alignment::Vertical::Center);
+
+    stack![scrim, centered].width(Length::Fill).height(Length::Fill).into()
 }
 
 #[cfg(test)]
