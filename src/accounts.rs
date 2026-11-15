@@ -223,3 +223,50 @@ pub fn clear_active_session() {
     let path = active_cookies_path();
     let _ = fs::remove_file(path);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn migrates_legacy_single_account_and_supports_switching() {
+        let tmp = std::env::temp_dir().join(format!("mitub-accounts-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(tmp.join(".config/mitub")).unwrap();
+        fs::write(
+            tmp.join(".config/mitub/config.json"),
+            r#"{"cached_user_name":"Alice","cached_avatar_url":"https://example.com/a.png"}"#,
+        )
+        .unwrap();
+        fs::write(tmp.join(".config/mitub/cookies.json"), "cookies").unwrap();
+
+        let previous_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", &tmp);
+
+        ensure_initialized();
+        assert!(tmp.join(".config/mitub/accounts/default/config.json").exists());
+        assert!(tmp.join(".config/mitub/accounts/default/cookies.json").exists());
+        assert!(!tmp.join(".config/mitub/config.json").exists());
+        let first = manifest();
+        assert_eq!(first.active, "default");
+        assert_eq!(first.accounts.len(), 1);
+        assert_eq!(first.accounts[0].name, "Alice");
+
+        let second = create_account("Cuenta 2");
+        assert_eq!(active_id(), second.id);
+        assert!(accounts_root().join(&second.id).exists());
+        set_active("default");
+        assert_eq!(active_id(), "default");
+        ensure_initialized();
+        assert_eq!(manifest().accounts.len(), 2);
+
+        clear_active_session();
+        assert!(!tmp.join(".config/mitub/accounts/default/cookies.json").exists());
+
+        match previous_home {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+        let _ = fs::remove_dir_all(&tmp);
+    }
+}

@@ -6609,6 +6609,7 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
             }
 
             Message::SwitchAccount(id) => {
+                self.save_session();
                 self.config.save();
                 if let Ok(session) = self.auth_session.try_read() {
                     let _ = session.save_to_disk();
@@ -6618,6 +6619,7 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
             }
 
             Message::AddAccount => {
+                self.save_session();
                 self.config.save();
                 if let Ok(session) = self.auth_session.try_read() {
                     let _ = session.save_to_disk();
@@ -6628,6 +6630,7 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
             }
 
             Message::LogoutAccount => {
+                self.save_session();
                 crate::accounts::clear_active_session();
                 self.config.cached_user_name = None;
                 self.config.cached_avatar_url = None;
