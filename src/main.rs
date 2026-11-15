@@ -316,6 +316,7 @@ pub struct MitubApp {
     selected_settings_tab: ui::SettingsCategory,
     auth_cookie_input: String,
     auth_status: String,
+    session_expired: bool,
     user_avatar_url: Option<String>,
     user_avatar_handle: Option<image::Handle>,
     user_display_name: Option<String>,
@@ -1551,6 +1552,7 @@ impl MitubApp {
             show_auth_modal: false,
             selected_settings_tab: ui::SettingsCategory::Playback,
             auth_cookie_input: String::new(),
+            session_expired: false,
             auth_status: if is_authed {
                 "[OK] Sesion activa de YouTube".to_string()
             } else {
@@ -1707,16 +1709,13 @@ impl MitubApp {
             Message::BackgroundAuthRefreshed,
         );
 
-        // Asynchronously prune excess cache (and orphan .part files) and calculate cache size
-        let cache_limit = app.config.max_cache_size_bytes;
+        // Measure the cache at startup. Never prune here: startup eviction was
+        // silently deleting old downloads when the cache exceeded the limit.
         let cache_task = Task::perform(
             async move {
-                tokio::task::spawn_blocking(move || {
-                    crate::cache_manager::prune_cache_if_needed(cache_limit, &[]);
-                    crate::cache_manager::get_cache_size_bytes()
-                })
-                .await
-                .unwrap_or(0)
+                tokio::task::spawn_blocking(crate::cache_manager::get_cache_size_bytes)
+                    .await
+                    .unwrap_or(0)
             },
             Message::CacheSizeRefreshed,
         );
@@ -2484,6 +2483,7 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                         *guard = new_session.clone();
                     }
                     self.innertube.set_session(new_session);
+                    self.session_expired = false;
                     self.auth_status = "[OK] Sesion activa de YouTube".to_string();
                 }
                 Task::none()
@@ -4010,6 +4010,7 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                 self.trigger_unblur_transition();
                 if let Ok(r) = self.auth_session.try_read() {
                     if r.is_authenticated() {
+                        self.session_expired = false;
                         self.auth_status = "[OK] Sesion activa de YouTube".to_string();
                     }
                 }
@@ -4979,6 +4980,7 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                 }
                 match res {
                     Ok(videos) => {
+                        self.session_expired = false;
                         self.auth_status = "[OK] Sesión activa de YouTube".to_string();
                         self.subscriptions_loaded_at = Some(std::time::Instant::now());
                         self.cached_subscriptions = videos.clone();
@@ -5069,6 +5071,7 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                 }
                 match res {
                     Ok(mut videos) => {
+                        self.session_expired = false;
                         self.auth_status = "[OK] Sesión activa de YouTube".to_string();
                         // Merge recent local history items at the top if not yet indexed by YouTube FEhistory
                         let mut prepended = Vec::new();
@@ -5182,6 +5185,7 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                 self.trigger_unblur_transition();
                 match res {
                     Ok(videos) => {
+                        self.session_expired = false;
                         self.auth_status = "[OK] Sesión activa de YouTube".to_string();
                         if !matches!(self.current_view, ViewMode::Playlists) {
                             return Task::none();
@@ -5234,6 +5238,7 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                     return Task::none();
                 }
                 if let Some(name) = name_opt {
+                    self.session_expired = false;
                     self.user_display_name = Some(name.clone());
                     self.config.cached_user_name = Some(name);
                     self.config.save_async();
@@ -6440,6 +6445,7 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
             Message::SaveRawCookie => {
                 let session = AuthSession::from_raw_cookie_header(&self.auth_cookie_input);
                 if session.is_authenticated() {
+                    self.session_expired = false;
                     self.auth_status = "[OK] Autenticado con exito".to_string();
                     self.innertube.set_session(session);
                     self.show_auth_modal = false;
@@ -6507,6 +6513,8 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
 
             Message::AuthValidated(valid) => {
                 if valid {
+                    self.session_expired = false;
+                    self.session_expired = false;
                     self.auth_status = "[OK] Sesion activa de YouTube".to_string();
                     return Task::none();
                 }
@@ -6525,7 +6533,10 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                 let _ = AuthSession::clear_from_disk();
                 let guest_session = AuthSession::default();
                 self.innertube.set_session(guest_session);
-                self.auth_status = "Sesión no iniciada (Modo invitado)".to_string();
+                self.session_expired = true;
+                self.auth_status =
+                    "Sesión expirada. Iniciá sesión desde tu perfil (arriba a la derecha)."
+                        .to_string();
                 self.user_display_name = None;
                 self.user_avatar_handle = None;
                 self.user_avatar_url = None;
@@ -6540,7 +6551,7 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                 self.profile_anim = None;
                 self.toast_state = Some(ToastState {
                     icon: ToastIcon::None,
-                    text: "Tu sesión de Google expiró. Has pasado a Modo Invitado.".to_string(),
+                    text: "Tu sesión de YouTube expiró. Iniciá sesión desde el icono de perfil (arriba a la derecha).".to_string(),
                     created_at: std::time::Instant::now(),
                 });
                 Task::none()
@@ -6562,6 +6573,7 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
             Message::FirefoxCookiesImported(res) => {
                 match res {
                     Ok(session) => {
+                        self.session_expired = false;
                         self.auth_status = "[OK] Sesión importada desde Firefox exitosamente".to_string();
                         self.innertube.set_session(session);
                         self.show_auth_modal = false;
@@ -6595,6 +6607,7 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
             Message::ChromeCookiesImported(res) => {
                 match res {
                     Ok(session) => {
+                        self.session_expired = false;
                         self.auth_status = "[OK] Sesión importada desde Chrome exitosamente".to_string();
                         self.innertube.set_session(session);
                         self.show_auth_modal = false;
@@ -8698,6 +8711,42 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
             layers.push(ui::player_backdrop(hole));
         }
         layers.push(base_view);
+
+        if self.session_expired {
+            let banner = container(
+                row![
+                    text("Tu sesión de YouTube expiró. Iniciá sesión desde tu perfil (arriba a la derecha).")
+                        .size(13)
+                        .color(COLOR_TEXT_PRIMARY),
+                    Space::with_width(Length::Fill),
+                    iced::widget::button(text("Iniciar sesión").size(12))
+                        .style(primary_button)
+                        .padding([6, 14])
+                        .on_press(Message::ToggleLoginModal),
+                ]
+                .spacing(12)
+                .align_y(Alignment::Center),
+            )
+            .width(Length::Fill)
+            .padding([8, 16])
+            .style(|_t| container::Style {
+                background: Some(iced::Color::from_rgb8(0x3a, 0x24, 0x12).into()),
+                border: iced::border::rounded(10)
+                    .color(iced::Color::from_rgb8(0xd9, 0x8b, 0x2b))
+                    .width(1.0),
+                ..container::Style::default()
+            });
+            layers.push(
+                column![
+                    Space::with_height(Length::Fixed(self.header_height())),
+                    banner,
+                    Space::with_height(Length::Fill),
+                ]
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into(),
+            );
+        }
 
         if let Some(st) = &self.toast_state {
             let elapsed = st.created_at.elapsed().as_secs_f32();
