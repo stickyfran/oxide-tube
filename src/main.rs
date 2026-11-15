@@ -227,6 +227,8 @@ pub enum Message {
     ToggleTabTwoRows,
     SetAutoDeletePeriod(crate::config::AutoDeletePeriod),
     AutoDeleteFinished(usize, u64),
+    AccountAvatarLoaded(String, image::Handle),
+    OpenSettings,
 }
 
 #[derive(Debug, Clone)]
@@ -322,6 +324,7 @@ pub struct MitubApp {
     show_auth_modal: bool,
     show_account_switcher: bool,
     accounts_manifest: crate::accounts::AccountsManifest,
+    account_avatar_handles: HashMap<String, image::Handle>,
     selected_settings_tab: ui::SettingsCategory,
     auth_cookie_input: String,
     auth_status: String,
@@ -1432,6 +1435,40 @@ impl MitubApp {
         protected
     }
 
+    fn account_avatar_tasks(&self) -> Task<Message> {
+        let mut tasks: Vec<Task<Message>> = Vec::new();
+        for account in &self.accounts_manifest.accounts {
+            let Some(url) = account.avatar_url.clone() else {
+                continue;
+            };
+            if url.is_empty() || self.account_avatar_handles.contains_key(&url) {
+                continue;
+            }
+            let it = self.innertube.clone();
+            let task_url = url.clone();
+            tasks.push(Task::perform(
+                async move {
+                    let bytes = it.fetch_thumbnail_bytes(&url).await?;
+                    tokio::task::spawn_blocking(move || {
+                        let img = image_crate::load_from_memory(&bytes).ok()?;
+                        let resized = img.thumbnail(72, 72);
+                        let rgba = resized.to_rgba8();
+                        let (w, h) = rgba.dimensions();
+                        Some(image::Handle::from_rgba(w, h, rgba.into_raw()))
+                    })
+                    .await
+                    .ok()
+                    .flatten()
+                },
+                move |handle| match handle {
+                    Some(handle) => Message::AccountAvatarLoaded(task_url.clone(), handle),
+                    None => Message::NoOp,
+                },
+            ));
+        }
+        Task::batch(tasks)
+    }
+
     fn restart_for_account(&self, open_login: bool) -> Task<Message> {
         if let Ok(exe) = std::env::current_exe() {
             let mut command = std::process::Command::new(exe);
@@ -1603,6 +1640,7 @@ impl MitubApp {
             show_auth_modal: false,
             show_account_switcher: false,
             accounts_manifest: crate::accounts::manifest(),
+            account_avatar_handles: HashMap::new(),
             selected_settings_tab: ui::SettingsCategory::Playback,
             auth_cookie_input: String::new(),
             session_expired: false,
@@ -1738,8 +1776,15 @@ impl MitubApp {
             |(url, name)| Message::UserProfileLoaded(url, name),
         );
 
-        // Asynchronously sync live browser cookies if available (in background, never blocking startup)
-        let auth_task = Task::perform(
+        // Only import a browser session on a first run without saved cookies.
+        // Auto-importing on every start would hijack the selected account (or
+        // silently log a brand-new account into the browser's account).
+        let skip_browser_sync = std::env::var_os("MITUB_OPEN_LOGIN").is_some()
+            || crate::accounts::active_cookies_path().exists();
+        let auth_task = if skip_browser_sync {
+            Task::none()
+        } else {
+            Task::perform(
             async move {
                 tokio::task::spawn_blocking(|| {
                     if let Ok(ff) = AuthSession::from_firefox() {
@@ -1760,7 +1805,8 @@ impl MitubApp {
                 .flatten()
             },
             Message::BackgroundAuthRefreshed,
-        );
+            )
+        };
 
         // Measure the cache at startup. Never prune here: startup eviction was
         // silently deleting old downloads when the cache exceeded the limit.
@@ -6601,11 +6647,26 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                     self.accounts_manifest = crate::accounts::manifest();
                     self.show_account_switcher = !self.show_account_switcher;
                     self.show_auth_modal = false;
+                    return self.account_avatar_tasks();
                 } else {
                     self.show_auth_modal = !self.show_auth_modal;
                     self.show_account_switcher = false;
                 }
                 Task::none()
+            }
+
+            Message::AccountAvatarLoaded(url, handle) => {
+                self.account_avatar_handles.insert(url, handle);
+                Task::none()
+            }
+
+            Message::OpenSettings => {
+                self.show_account_switcher = false;
+                if self.show_auth_modal {
+                    Task::none()
+                } else {
+                    self.update(Message::ToggleLoginModal)
+                }
             }
 
             Message::SwitchAccount(id) => {
@@ -8873,12 +8934,26 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
         layers.push(base_view);
 
         if self.show_account_switcher {
-            layers.push(ui::view_account_switcher(
+            let win_controls_w = if self.config.custom_titlebar {
+                if self.is_maximized {
+                    8.0 + 44.0 + 44.0 + 46.0
+                } else {
+                    8.0 + 40.0 + 40.0 + 40.0 + 4.0 + 8.0
+                }
+            } else {
+                14.0
+            };
+            let anchor_right = (self.window_size.0 - win_controls_w - 40.0).max(0.0);
+            layers.push(ui::view_account_dropdown(
                 &self.accounts_manifest.accounts,
                 &self.accounts_manifest.active,
+                &self.account_avatar_handles,
+                anchor_right,
+                self.header_height() + 6.0,
                 |id| Message::SwitchAccount(id),
                 Message::AddAccount,
                 Message::LogoutAccount,
+                Message::OpenSettings,
                 Message::ToggleAccountSwitcher,
             ));
         }
