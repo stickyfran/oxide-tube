@@ -162,6 +162,11 @@ pub fn active_cookies_path() -> PathBuf {
     active_dir().join("cookies.json")
 }
 
+/// Whether the account has a saved YouTube session on disk.
+pub fn has_saved_session(id: &str) -> bool {
+    accounts_root().join(id).join("cookies.json").is_file()
+}
+
 pub fn set_active(id: &str) {
     let mut manifest = manifest();
     if manifest.accounts.iter().any(|account| account.id == id) {

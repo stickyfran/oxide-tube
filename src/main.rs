@@ -229,6 +229,8 @@ pub enum Message {
     AutoDeleteFinished(usize, u64),
     AccountAvatarLoaded(String, image::Handle),
     OpenSettings,
+    OpenLogin,
+    CloseSettings,
 }
 
 #[derive(Debug, Clone)]
@@ -325,6 +327,7 @@ pub struct MitubApp {
     show_account_switcher: bool,
     accounts_manifest: crate::accounts::AccountsManifest,
     account_avatar_handles: HashMap<String, image::Handle>,
+    logged_in_accounts: std::collections::HashSet<String>,
     selected_settings_tab: ui::SettingsCategory,
     auth_cookie_input: String,
     auth_status: String,
@@ -1435,6 +1438,20 @@ impl MitubApp {
         protected
     }
 
+    fn open_settings_modal(&mut self, category: ui::SettingsCategory) -> Task<Message> {
+        self.show_account_switcher = false;
+        self.selected_settings_tab = category;
+        self.show_auth_modal = true;
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(crate::cache_manager::get_cache_size_bytes)
+                    .await
+                    .unwrap_or(0)
+            },
+            Message::CacheSizeRefreshed,
+        )
+    }
+
     fn account_avatar_tasks(&self) -> Task<Message> {
         let mut tasks: Vec<Task<Message>> = Vec::new();
         for account in &self.accounts_manifest.accounts {
@@ -1472,7 +1489,11 @@ impl MitubApp {
     fn restart_for_account(&self, open_login: bool) -> Task<Message> {
         if let Ok(exe) = std::env::current_exe() {
             let mut command = std::process::Command::new(exe);
-            command.env("MITUB_NEW_INSTANCE", "1");
+            // Never leak the previous instance's one-shot flags into the child:
+            // otherwise every future switch keeps reopening the login modal.
+            command
+                .env("MITUB_NEW_INSTANCE", "1")
+                .env_remove("MITUB_OPEN_LOGIN");
             if open_login {
                 command.env("MITUB_OPEN_LOGIN", "1");
             }
@@ -1641,6 +1662,7 @@ impl MitubApp {
             show_account_switcher: false,
             accounts_manifest: crate::accounts::manifest(),
             account_avatar_handles: HashMap::new(),
+            logged_in_accounts: std::collections::HashSet::new(),
             selected_settings_tab: ui::SettingsCategory::Playback,
             auth_cookie_input: String::new(),
             session_expired: false,
@@ -1969,7 +1991,12 @@ impl MitubApp {
 
         if std::env::var_os("MITUB_OPEN_LOGIN").is_some() {
             app.show_auth_modal = true;
+            app.selected_settings_tab = ui::SettingsCategory::Account;
         }
+        // Consume the one-shot launch flags so child instances do not inherit
+        // them and reopen the login modal on every account switch.
+        std::env::remove_var("MITUB_OPEN_LOGIN");
+        std::env::remove_var("MITUB_NEW_INSTANCE");
 
         (app, Task::batch(initial_tasks))
     }
@@ -6638,19 +6665,21 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
             }
 
             Message::ToggleAccountSwitcher => {
-                let authed = self
-                    .auth_session
-                    .try_read()
-                    .map(|session| session.is_authenticated())
-                    .unwrap_or(false);
-                if authed {
-                    self.accounts_manifest = crate::accounts::manifest();
-                    self.show_account_switcher = !self.show_account_switcher;
-                    self.show_auth_modal = false;
+                // Always use the account menu (like Google). Even when the
+                // active account has no session, the menu is the entry point
+                // for logging in or picking another account.
+                self.accounts_manifest = crate::accounts::manifest();
+                self.logged_in_accounts = self
+                    .accounts_manifest
+                    .accounts
+                    .iter()
+                    .filter(|account| crate::accounts::has_saved_session(&account.id))
+                    .map(|account| account.id.clone())
+                    .collect();
+                self.show_account_switcher = !self.show_account_switcher;
+                self.show_auth_modal = false;
+                if self.show_account_switcher {
                     return self.account_avatar_tasks();
-                } else {
-                    self.show_auth_modal = !self.show_auth_modal;
-                    self.show_account_switcher = false;
                 }
                 Task::none()
             }
@@ -6661,22 +6690,35 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
             }
 
             Message::OpenSettings => {
-                self.show_account_switcher = false;
-                if self.show_auth_modal {
-                    Task::none()
-                } else {
-                    self.update(Message::ToggleLoginModal)
-                }
+                self.open_settings_modal(self.selected_settings_tab)
+            }
+
+            Message::OpenLogin => self.open_settings_modal(ui::SettingsCategory::Account),
+
+            Message::CloseSettings => {
+                self.show_auth_modal = false;
+                Task::none()
             }
 
             Message::SwitchAccount(id) => {
+                let is_active = id == crate::accounts::active_id();
+                if is_active {
+                    self.show_account_switcher = false;
+                    let has_session = crate::accounts::has_saved_session(&id);
+                    if has_session {
+                        return Task::none();
+                    }
+                    return self.open_settings_modal(ui::SettingsCategory::Account);
+                }
+                let target_has_session = crate::accounts::has_saved_session(&id);
                 self.save_session();
                 self.config.save();
                 if let Ok(session) = self.auth_session.try_read() {
                     let _ = session.save_to_disk();
                 }
                 crate::accounts::set_active(&id);
-                self.restart_for_account(false)
+                // A logged-out profile lands directly on the login screen.
+                self.restart_for_account(!target_has_session)
             }
 
             Message::AddAccount => {
@@ -6701,7 +6743,6 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
 
             Message::AuthValidated(valid) => {
                 if valid {
-                    self.session_expired = false;
                     self.session_expired = false;
                     self.auth_status = "[OK] Sesion activa de YouTube".to_string();
                     return Task::none();
@@ -8944,13 +8985,21 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
                 14.0
             };
             let anchor_right = (self.window_size.0 - win_controls_w - 40.0).max(0.0);
+            let active_authenticated = self
+                .auth_session
+                .try_read()
+                .map(|session| session.is_authenticated())
+                .unwrap_or(false);
             layers.push(ui::view_account_dropdown(
                 &self.accounts_manifest.accounts,
                 &self.accounts_manifest.active,
+                active_authenticated,
+                &self.logged_in_accounts,
                 &self.account_avatar_handles,
                 anchor_right,
                 self.header_height() + 6.0,
                 |id| Message::SwitchAccount(id),
+                Message::OpenLogin,
                 Message::AddAccount,
                 Message::LogoutAccount,
                 Message::OpenSettings,
@@ -8968,7 +9017,7 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
                     iced::widget::button(text("Iniciar sesión").size(12))
                         .style(primary_button)
                         .padding([6, 14])
-                        .on_press(Message::ToggleLoginModal),
+                        .on_press(Message::OpenLogin),
                 ]
                 .spacing(12)
                 .align_y(Alignment::Center),
@@ -9209,7 +9258,7 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
                 Message::SetCacheLimitIndex,
                 Message::ClearCache,
                 Message::NoOp,
-                Message::ToggleLoginModal,
+                Message::CloseSettings,
             ));
         }
 

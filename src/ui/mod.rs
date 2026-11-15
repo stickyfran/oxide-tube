@@ -2573,10 +2573,13 @@ fn download_month_name(month: u32) -> &'static str {
 pub fn view_account_dropdown<'a, Message: Clone + 'static>(
     accounts: &'a [crate::accounts::AccountEntry],
     active_id: &'a str,
+    active_authenticated: bool,
+    logged_in_ids: &'a std::collections::HashSet<String>,
     avatar_handles: &'a std::collections::HashMap<String, iced::widget::image::Handle>,
     anchor_right: f32,
     top: f32,
     on_select: impl Fn(String) -> Message + Copy + 'static,
+    on_login: Message,
     on_add: Message,
     on_logout: Message,
     on_settings: Message,
@@ -2649,21 +2652,23 @@ pub fn view_account_dropdown<'a, Message: Clone + 'static>(
     let mut rows = Column::new().spacing(2);
     for account in accounts {
         let is_active = account.id == active_id;
+        let has_session = logged_in_ids.contains(&account.id);
+        let subtitle = if is_active && active_authenticated {
+            "Cuenta activa"
+        } else if has_session {
+            "Cambiar a esta cuenta"
+        } else {
+            "Sesión cerrada · click para iniciar sesión"
+        };
         let row = row![
             avatar_for(account),
             column![
                 text(account.name.clone()).size(13).color(COLOR_TEXT_PRIMARY),
-                text(if is_active {
-                    "Cuenta activa"
-                } else {
-                    "Cambiar a esta cuenta"
-                })
-                .size(10.5)
-                .color(COLOR_TEXT_SECONDARY),
+                text(subtitle).size(10.5).color(COLOR_TEXT_SECONDARY),
             ]
             .spacing(1),
             Space::with_width(Length::Fill),
-            if is_active {
+            if is_active && active_authenticated {
                 text("✓").size(14).color(COLOR_TEXT_SECONDARY)
             } else {
                 text("").size(1.0)
@@ -2701,41 +2706,75 @@ pub fn view_account_dropdown<'a, Message: Clone + 'static>(
         .align_y(Alignment::Center)
     };
 
-    let card = container(
-        column![
-            rows,
-            divider(),
-            button(action_row(icon_user(14.0), "Agregar cuenta", false))
-                .width(Length::Fill)
-                .padding([7, 8])
-                .style(menu_row_style)
-                .on_press(on_add),
-            button(action_row(icon_settings(14.0), "Ajustes", false))
-                .width(Length::Fill)
-                .padding([7, 8])
-                .style(menu_row_style)
-                .on_press(on_settings),
-            divider(),
+    let mut menu = Column::new().spacing(2);
+    if !active_authenticated {
+        menu = menu.push(
+            button(
+                row![
+                    icon_user(14.0),
+                    text("Iniciar sesión en esta cuenta").size(12.5).color(iced::Color::WHITE),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center),
+            )
+            .width(Length::Fill)
+            .padding([8, 8])
+            .style(|_t, status| button::Style {
+                background: Some(
+                    if status == button::Status::Hovered {
+                        iced::Color::from_rgb8(0x7a, 0x4d, 0xe0)
+                    } else {
+                        iced::Color::from_rgb8(0x8b, 0x5c, 0xf6)
+                    }
+                    .into(),
+                ),
+                border: iced::border::rounded(8),
+                text_color: iced::Color::WHITE,
+                ..button::Style::default()
+            })
+            .on_press(on_login),
+        );
+    }
+    menu = menu.push(rows);
+    menu = menu.push(divider());
+    menu = menu.push(
+        button(action_row(icon_user(14.0), "Agregar cuenta", false))
+            .width(Length::Fill)
+            .padding([7, 8])
+            .style(menu_row_style)
+            .on_press(on_add),
+    );
+    menu = menu.push(
+        button(action_row(icon_settings(14.0), "Ajustes", false))
+            .width(Length::Fill)
+            .padding([7, 8])
+            .style(menu_row_style)
+            .on_press(on_settings),
+    );
+    if active_authenticated {
+        menu = menu.push(divider());
+        menu = menu.push(
             button(action_row(icon_logout(14.0), "Cerrar sesión de esta cuenta", true))
                 .width(Length::Fill)
                 .padding([7, 8])
                 .style(menu_row_style)
                 .on_press(on_logout),
-        ]
-        .spacing(2),
-    )
-    .width(Length::Fixed(CARD_W))
-    .padding(6)
-    .style(|_t| container::Style {
-        background: Some(COLOR_BG.into()),
-        border: iced::border::rounded(12).color(COLOR_BORDER).width(1.0),
-        shadow: iced::Shadow {
-            color: iced::Color::from_rgba(0.0, 0.0, 0.0, 0.45),
-            offset: iced::Vector::new(0.0, 6.0),
-            blur_radius: 22.0,
-        },
-        ..container::Style::default()
-    });
+        );
+    }
+
+    let card = container(menu)
+        .width(Length::Fixed(CARD_W))
+        .padding(6)
+        .style(|_t| container::Style {
+            background: Some(COLOR_BG.into()),
+            border: iced::border::rounded(12).color(COLOR_BORDER).width(1.0),
+            shadow: iced::Shadow {
+                color: iced::Color::from_rgba(0.0, 0.0, 0.0, 0.45),
+                offset: iced::Vector::new(0.0, 6.0),
+                blur_radius: 22.0,
+            },
+            ..container::Style::default()
+        });
 
     let x = (anchor_right - CARD_W).max(GAP);
 
