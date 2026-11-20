@@ -215,9 +215,10 @@ impl PowerManager {
         Ok(())
     }
 
-    /// Trims memory and activates power-saving policies without restricting foreground render workers.
+    /// Trims memory and pins process threads to efficiency cores on battery.
     pub fn apply_battery_profile() {
-        println!("[PowerManager] Switching to BATTERY mode: Codec priority AV1/VP9, memory trims active.");
+        println!("[PowerManager] Switching to BATTERY mode: pinning threads to efficiency cores, memory trims active.");
+        pin_to_lp_ecores();
         trim_process_memory();
     }
 
@@ -228,43 +229,79 @@ impl PowerManager {
     }
 }
 
-/// Safely pins background execution to power-efficient cores
-/// based on dynamic topology detection.
-pub fn pin_to_lp_ecores() {
-    #[cfg(target_os = "linux")]
-    unsafe {
-        let num_cpus = libc::sysconf(libc::_SC_NPROCESSORS_ONLN) as usize;
-        let mut set: libc::cpu_set_t = std::mem::zeroed();
-        libc::CPU_ZERO(&mut set);
-
-        // For multi-core systems, target the highest-index efficiency cores.
-        if num_cpus >= 8 {
-            libc::CPU_SET(num_cpus - 2, &mut set);
-            libc::CPU_SET(num_cpus - 1, &mut set);
-        } else {
-            // Low core count: do not restrict
-            for i in 0..num_cpus {
-                libc::CPU_SET(i, &mut set);
+#[cfg(target_os = "linux")]
+fn parse_cpu_list(spec: &str) -> Vec<usize> {
+    let mut cpus = Vec::new();
+    for part in spec.trim().split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        if let Some((start, end)) = part.split_once('-') {
+            if let (Ok(s), Ok(e)) = (start.trim().parse::<usize>(), end.trim().parse::<usize>()) {
+                for cpu in s..=e.min(1023) {
+                    cpus.push(cpu);
+                }
+            }
+        } else if let Ok(cpu) = part.parse::<usize>() {
+            if cpu < 1024 {
+                cpus.push(cpu);
             }
         }
+    }
+    cpus
+}
 
-        let ret = libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set);
-        if ret != 0 {
-            if let Some(core_ids) = core_affinity::get_core_ids() {
-                if core_ids.len() >= 2 {
-                    let _ = core_affinity::set_for_current(core_ids[core_ids.len() - 1]);
+#[cfg(target_os = "linux")]
+fn detect_efficiency_cores() -> Vec<usize> {
+    // Only pin on hybrid CPUs that expose both P-cores (cpu_core) and E-cores (cpu_atom).
+    if !std::path::Path::new("/sys/devices/cpu_core/cpus").exists() {
+        return Vec::new();
+    }
+    if let Ok(spec) = std::fs::read_to_string("/sys/devices/cpu_atom/cpus") {
+        return parse_cpu_list(&spec);
+    }
+    Vec::new()
+}
+
+#[cfg(target_os = "linux")]
+unsafe fn apply_affinity_to_all_threads(set: &libc::cpu_set_t) {
+    let size = std::mem::size_of::<libc::cpu_set_t>();
+    let mut applied_any = false;
+    if let Ok(entries) = std::fs::read_dir("/proc/self/task") {
+        for entry in entries.flatten() {
+            if let Some(tid) = entry.file_name().to_str().and_then(|s| s.parse::<libc::pid_t>().ok()) {
+                if libc::sched_setaffinity(tid, size, set) == 0 {
+                    applied_any = true;
                 }
             }
         }
     }
+    if !applied_any {
+        let _ = libc::sched_setaffinity(0, size, set);
+    }
+}
+
+/// Safely pins process execution to power-efficient cores
+/// based on dynamic Linux sysfs topology detection.
+pub fn pin_to_lp_ecores() {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        let ecores = detect_efficiency_cores();
+        if ecores.is_empty() {
+            return;
+        }
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        libc::CPU_ZERO(&mut set);
+        for cpu in ecores {
+            libc::CPU_SET(cpu, &mut set);
+        }
+        apply_affinity_to_all_threads(&set);
+    }
 
     #[cfg(not(target_os = "linux"))]
     {
-        if let Some(core_ids) = core_affinity::get_core_ids() {
-            if core_ids.len() >= 2 {
-                let _ = core_affinity::set_for_current(core_ids[core_ids.len() - 1]);
-            }
-        }
+        // No hybrid E-core topology detection on this platform; leave OS scheduler unrestricted.
     }
 }
 
@@ -278,7 +315,7 @@ pub fn unpin_all_cores() {
         for i in 0..num_cpus.min(1024) {
             libc::CPU_SET(i, &mut set);
         }
-        libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set);
+        apply_affinity_to_all_threads(&set);
     }
 
     #[cfg(not(target_os = "linux"))]
