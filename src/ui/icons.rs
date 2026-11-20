@@ -17,6 +17,30 @@ fn render_cached_svg<'a, Message: 'static>(
         .into()
 }
 
+pub fn icon_check<'a, Message: 'static>(size: f32) -> Element<'a, Message> {
+    static HANDLE: OnceLock<svg::Handle> = OnceLock::new();
+    const SVG: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#4ade80" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>"##;
+    render_cached_svg(&HANDLE, SVG, size)
+}
+
+pub fn icon_user_dark<'a, Message: 'static>(size: f32) -> Element<'a, Message> {
+    static HANDLE: OnceLock<svg::Handle> = OnceLock::new();
+    const SVG: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#0f0f0f" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>"##;
+    render_cached_svg(&HANDLE, SVG, size)
+}
+
+pub fn icon_reload_dark<'a, Message: 'static>(size: f32) -> Element<'a, Message> {
+    static HANDLE: OnceLock<svg::Handle> = OnceLock::new();
+    const SVG: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#0f0f0f" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/></svg>"##;
+    render_cached_svg(&HANDLE, SVG, size)
+}
+
+pub fn icon_pip_dark<'a, Message: 'static>(size: f32) -> Element<'a, Message> {
+    static HANDLE: OnceLock<svg::Handle> = OnceLock::new();
+    const SVG: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#0f0f0f" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="20" height="16" rx="2"/><rect x="12" y="11" width="8" height="6" rx="1" fill="#0f0f0f"/></svg>"##;
+    render_cached_svg(&HANDLE, SVG, size)
+}
+
 pub fn icon_back<'a, Message: 'static>(size: f32) -> Element<'a, Message> {
     static HANDLE: OnceLock<svg::Handle> = OnceLock::new();
     const SVG: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#f1f1f1" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 12H5"/><path d="M12 19l-7-7 7-7"/></svg>"##;

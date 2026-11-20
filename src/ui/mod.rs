@@ -1168,7 +1168,7 @@ pub fn view_header_bar<'a, Message: Clone + 'static>(
             .into()
     } else {
         button(
-            row![icon_user(14.0), text("Iniciar Sesión").size(12)]
+            row![icon_user_dark(14.0), text("Iniciar Sesión").size(12)]
                 .spacing(6)
                 .align_y(Alignment::Center),
         )
@@ -1511,6 +1511,10 @@ pub fn view_auth_modal<'a, Message: Clone + 'static>(
     on_clear_cache: Message,
     on_modal_click_trap: Message,
     on_close_modal: Message,
+    anim_progress: f32,
+    win_w: f32,
+    win_h: f32,
+    header_h: f32,
 ) -> Element<'a, Message> {
     // 1. Profile Header Banner
     let display_name = user_name.unwrap_or("Usuario de YouTube");
@@ -2057,8 +2061,8 @@ pub fn view_auth_modal<'a, Message: Clone + 'static>(
             } else {
                 let browser_login_btn = button(
                     row![
-                        icon_user(14.0),
-                        text("1. Abrir inicio de sesión en Navegador").size(12).color(iced::Color::WHITE),
+                        icon_user_dark(14.0),
+                        text("1. Abrir inicio de sesión en Navegador").size(12),
                     ]
                     .spacing(6)
                     .align_y(Alignment::Center),
@@ -2241,22 +2245,47 @@ pub fn view_auth_modal<'a, Message: Clone + 'static>(
     .spacing(12)
     .height(Length::Fill);
 
+    let t = anim_progress.clamp(0.0, 1.0);
+    let ease = 1.0 - (1.0 - t).powi(3);
+
+    let target_w = 760.0_f32.min((win_w - 32.0).max(320.0));
+    let target_h = 520.0_f32.min((win_h - 80.0).max(260.0));
+    let cur_w = 220.0 + (target_w - 220.0) * ease;
+    let cur_h = 120.0 + (target_h - 120.0) * ease;
+
+    // Emerge from the top-right Settings button (near right=16, top=header_h+6)
+    // and smoothly expand to the centered position.
+    let start_top = header_h + 6.0;
+    let start_right = 16.0_f32;
+    let end_top = ((win_h - target_h) * 0.5).max(start_top);
+    let end_right = ((win_w - target_w) * 0.5).max(16.0);
+    let cur_top = start_top + (end_top - start_top) * ease;
+    let cur_right = start_right + (end_right - start_right) * ease;
+
     let modal_box = container(modal_content)
         .style(card_container)
         .padding(20)
-        .width(Length::Fixed(760.0))
-        .height(Length::Fixed(520.0));
+        .width(Length::Fixed(cur_w))
+        .height(Length::Fixed(cur_h))
+        .clip(true);
 
     let clickable_modal = mouse_area(modal_box).on_press(on_modal_click_trap);
 
+    let backdrop_alpha = 0.7 * ease;
     let backdrop = mouse_area(
         container(clickable_modal)
             .width(Length::Fill)
             .height(Length::Fill)
-            .align_x(iced::alignment::Horizontal::Center)
-            .align_y(iced::alignment::Vertical::Center)
-            .style(|_t| container::Style {
-                background: Some(iced::Color::from_rgba(0.0, 0.0, 0.0, 0.7).into()),
+            .align_x(iced::alignment::Horizontal::Right)
+            .align_y(iced::alignment::Vertical::Top)
+            .padding(iced::Padding {
+                top: cur_top,
+                right: cur_right,
+                bottom: 0.0,
+                left: 0.0,
+            })
+            .style(move |_t| container::Style {
+                background: Some(iced::Color::from_rgba(0.0, 0.0, 0.0, backdrop_alpha).into()),
                 ..container::Style::default()
             })
     )
@@ -2670,9 +2699,9 @@ pub fn view_account_dropdown<'a, Message: Clone + 'static>(
             .spacing(1),
             Space::with_width(Length::Fill),
             if is_active && active_authenticated {
-                text("✓").size(14).color(COLOR_TEXT_SECONDARY)
+                icon_check(15.0)
             } else {
-                text("").size(1.0)
+                Space::with_width(Length::Fixed(0.0)).into()
             },
         ]
         .spacing(10)

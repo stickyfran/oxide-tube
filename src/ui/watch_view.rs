@@ -276,7 +276,7 @@ pub fn view_watch_page<'a, Message: Clone + 'static>(
                                     .color(COLOR_TEXT_PRIMARY),
                                 button(
                                     row![
-                                        icon_reload(12.0),
+                                        icon_reload_dark(12.0),
                                         text("Reintentar reproducción").size(12),
                                     ]
                                     .spacing(6)
@@ -392,8 +392,8 @@ pub fn view_watch_page<'a, Message: Clone + 'static>(
                                 Space::with_width(Length::Fill),
                                 button(
                                     row![
-                                        icon_pip(15.0),
-                                        text("Reacoplar video aquí").size(13).color(COLOR_TEXT_PRIMARY),
+                                        icon_pip_dark(15.0),
+                                        text("Reacoplar video aquí").size(13),
                                     ]
                                     .spacing(8)
                                     .align_y(Alignment::Center)

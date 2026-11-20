@@ -866,6 +866,7 @@ impl WaylandZeroCopyPlayer {
                     let _ = pool_tx.send(Vec::new());
                 }
                 let mut frame_seq: u64 = 0;
+                let mut last_notified_dims: (u32, u32) = (0, 0);
                 let mut plane: Option<WaylandPlane> = None;
                 let mut plane_surface: usize = 0;
                 // On Wayland the native plane is the default; the readback
@@ -910,6 +911,15 @@ impl WaylandZeroCopyPlayer {
                                 let hdr = matches!(gamma.as_deref(), Some("pq") | Some("hlg"))
                                     || matches!(primaries.as_deref(), Some("bt.2020"));
                                 hdr_content.store(hdr, Ordering::SeqCst);
+                                {
+                                    let hw = unsafe { mpv_string_property(ctx, b"hwdec-current\0") };
+                                    let codec = unsafe { mpv_string_property(ctx, b"video-codec\0") };
+                                    eprintln!(
+                                        "[mitub-mpv] hwdec-current={} codec={}",
+                                        hw.as_deref().unwrap_or("no"),
+                                        codec.as_deref().unwrap_or("?")
+                                    );
+                                }
                                 has_error.store(false, Ordering::SeqCst);
                                 *last_error.safe_lock() = None;
                                 let mut is_paused: i32 = 0;
@@ -1075,19 +1085,21 @@ impl WaylandZeroCopyPlayer {
                             FRAME_NOTIFY.notify_one();
                         }
                         plane_hdr.store(false, Ordering::SeqCst);
-                        let mut skip: i32 = 1;
-                        let render_params = [
-                            MpvRenderParam {
-                                type_: MPV_RENDER_PARAM_SKIP_RENDERING,
-                                data: &mut skip as *mut i32 as *mut std::ffi::c_void,
-                            },
-                            MpvRenderParam {
-                                type_: MPV_RENDER_PARAM_INVALID,
-                                data: std::ptr::null_mut(),
-                            },
-                        ];
-                        unsafe {
-                            mpv_render_context_render(r_ctx, render_params.as_ptr());
+                        if unsafe { mpv_render_context_update(r_ctx) } & MPV_RENDER_UPDATE_FRAME != 0 {
+                            let mut skip: i32 = 1;
+                            let render_params = [
+                                MpvRenderParam {
+                                    type_: MPV_RENDER_PARAM_SKIP_RENDERING,
+                                    data: &mut skip as *mut i32 as *mut std::ffi::c_void,
+                                },
+                                MpvRenderParam {
+                                    type_: MPV_RENDER_PARAM_INVALID,
+                                    data: std::ptr::null_mut(),
+                                },
+                            ];
+                            unsafe {
+                                mpv_render_context_render(r_ctx, render_params.as_ptr());
+                            }
                         }
                     }
 
@@ -1343,10 +1355,19 @@ impl WaylandZeroCopyPlayer {
 
                         if render_ok {
                             frame_seq += 1;
+                            let was_first = !first_frame_rendered.swap(true, Ordering::SeqCst);
+                            let dims_changed = (vid_w, vid_h) != last_notified_dims && vid_w > 0 && vid_h > 0;
+                            if dims_changed {
+                                last_notified_dims = (vid_w, vid_h);
+                            }
                             if plane_active.load(Ordering::SeqCst) && target_vec.is_empty() {
-                                // Presented natively: tell the UI a frame is
-                                // ready without copying pixels into iced.
+                                // Presented natively via Wayland subsurface: only wake the iced UI
+                                // on the first frame or when video dimensions change (avoiding
+                                // 30-60 full wgpu UI redraws per second).
                                 *current_frame.safe_lock() = None;
+                                if was_first || dims_changed {
+                                    FRAME_NOTIFY.notify_one();
+                                }
                             } else {
                                 let owner = RecycledBuf {
                                     buf: target_vec,
@@ -1360,14 +1381,13 @@ impl WaylandZeroCopyPlayer {
                                     data: byte_buf,
                                 };
                                 *current_frame.safe_lock() = Some(v_frame);
+                                FRAME_NOTIFY.notify_one();
                             }
-                            FRAME_NOTIFY.notify_one();
-                            first_frame_rendered.store(true, Ordering::SeqCst);
                         }
                     }
 
                     // 4. Reactive sleep: wakes immediately on MPV core events or new render frame notification
-                    let timeout_ms = if is_playing.load(Ordering::Relaxed) { 30 } else { 80 };
+                    let timeout_ms = if is_playing.load(Ordering::Relaxed) { 100 } else { 500 };
                     #[cfg(unix)]
                     {
                         let mut pfds = [

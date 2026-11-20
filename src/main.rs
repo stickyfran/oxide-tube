@@ -327,6 +327,7 @@ pub struct MitubApp {
     is_ctrl_pressed: bool,
     chat_collapsed: bool,
     show_auth_modal: bool,
+    settings_modal_anim: Option<std::time::Instant>,
     show_account_switcher: bool,
     accounts_manifest: crate::accounts::AccountsManifest,
     account_avatar_handles: HashMap<String, image::Handle>,
@@ -1448,6 +1449,7 @@ impl MitubApp {
         self.show_account_switcher = false;
         self.selected_settings_tab = category;
         self.show_auth_modal = true;
+        self.settings_modal_anim = Some(std::time::Instant::now());
         Task::perform(
             async move {
                 tokio::task::spawn_blocking(crate::cache_manager::get_cache_size_bytes)
@@ -1703,6 +1705,7 @@ impl MitubApp {
             is_ctrl_pressed: false,
             chat_collapsed: false,
             show_auth_modal: false,
+            settings_modal_anim: None,
             show_account_switcher: false,
             accounts_manifest: crate::accounts::manifest(),
             account_avatar_handles: HashMap::new(),
@@ -9505,6 +9508,12 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
                 Message::ClearCache,
                 Message::NoOp,
                 Message::CloseSettings,
+                self.settings_modal_anim
+                    .map(|t| (t.elapsed().as_secs_f32() / 0.22).clamp(0.0, 1.0))
+                    .unwrap_or(1.0),
+                self.window_size.0,
+                self.window_size.1,
+                self.header_height(),
             ));
         }
 
@@ -9732,6 +9741,11 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
         let is_profile_animating = self.profile_anim
             .map(|(_, _, t, dur)| t.elapsed().as_secs_f32() < dur)
             .unwrap_or(false);
+        let is_settings_modal_animating = self.show_auth_modal
+            && self
+                .settings_modal_anim
+                .map(|t| t.elapsed().as_secs_f32() < 0.24)
+                .unwrap_or(false);
         let target_glow = if self.search_input_focused { 1.0 } else { 0.0 };
         let is_search_glow_animating = (self.search_focus_glow - target_glow).abs() > 0.005;
 
@@ -9750,22 +9764,31 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
             || is_tab_hover_animating
             || is_search_animating
             || is_profile_animating
+            || is_settings_modal_animating
             || is_search_glow_animating
             || is_tab_rows_animating;
 
         let has_playing_tab_glow = self.osd_state.is_playing
             && self.playing_video_id.is_some()
-            && !self.is_window_minimized
-            && !self.is_fullscreen;
+            && is_window_visible
+            && self.is_window_focused
+            && !self.is_fullscreen
+            && self.power_profile == PowerProfile::Ac;
 
-        if has_active_animation && (is_window_visible || is_pip) {
-            subs.push(iced::time::every(Duration::from_millis(16)).map(|_| Message::Tick));
+        if has_active_animation && ((is_window_visible && self.is_window_focused) || is_pip) {
+            let anim_ms = match self.power_profile {
+                PowerProfile::Battery => 33, // ~30 FPS UI animations on battery
+                PowerProfile::Ac => 16,      // ~60 FPS UI animations on AC
+            };
+            subs.push(iced::time::every(Duration::from_millis(anim_ms)).map(|_| Message::Tick));
         } else if has_playing_tab_glow {
-            // Smooth ~31 FPS cadence for perimeter glow on playing tab, even when idle or unfocused
-            subs.push(iced::time::every(Duration::from_millis(32)).map(|_| Message::Tick));
+            // ~15 FPS cadence on AC for perimeter glow (avoids constant 31 FPS full-window wgpu redraws)
+            subs.push(iced::time::every(Duration::from_millis(66)).map(|_| Message::Tick));
         } else if is_watching || self.osd_state.is_playing {
             let tick_rate = if !is_window_visible && !is_pip {
                 Duration::from_secs(2)
+            } else if !self.is_window_focused && !is_pip {
+                Duration::from_secs(1)
             } else {
                 match self.power_profile {
                     PowerProfile::Battery => Duration::from_millis(400),
