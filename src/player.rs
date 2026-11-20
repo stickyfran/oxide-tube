@@ -420,10 +420,32 @@ pub struct WaylandZeroCopyPlayer {
     force_frame_refresh: Arc<AtomicBool>,
     underlay_mode: Arc<AtomicBool>,
     plane_active: Arc<AtomicBool>,
+    plane_active_surface: Arc<AtomicUsize>,
+    plane_bound_surface: Arc<AtomicUsize>,
     plane_hdr: Arc<AtomicBool>,
     hdr_content: Arc<AtomicBool>,
     wakeup_tx: Arc<AtomicI32>,
     is_running: Arc<AtomicBool>,
+}
+
+/// Computes the largest aspect-preserving rectangle for `(vid_w, vid_h)`
+/// centered inside `(rx, ry, rw, rh)`.
+pub fn fit_video_in_rect(
+    (rx, ry, rw, rh): (i32, i32, i32, i32),
+    (vid_w, vid_h): (u32, u32),
+) -> (i32, i32, u32, u32) {
+    if rw <= 0 || rh <= 0 {
+        return (rx, ry, 0, 0);
+    }
+    if vid_w == 0 || vid_h == 0 {
+        return (rx, ry, rw as u32, rh as u32);
+    }
+    let fit = (rw as f32 / vid_w as f32).min(rh as f32 / vid_h as f32);
+    let dw = (vid_w as f32 * fit).round().clamp(1.0, rw as f32) as i32;
+    let dh = (vid_h as f32 * fit).round().clamp(1.0, rh as f32) as i32;
+    let dx = rx + (rw - dw) / 2;
+    let dy = ry + (rh - dh) / 2;
+    (dx, dy, dw as u32, dh as u32)
 }
 
 /// Signalled by the render thread each time a new video frame is ready, so the UI can redraw
@@ -489,6 +511,8 @@ impl WaylandZeroCopyPlayer {
             force_frame_refresh: Arc::new(AtomicBool::new(false)),
             underlay_mode: Arc::new(AtomicBool::new(true)),
             plane_active: Arc::new(AtomicBool::new(false)),
+            plane_active_surface: Arc::new(AtomicUsize::new(0)),
+            plane_bound_surface: Arc::new(AtomicUsize::new(0)),
             plane_hdr: Arc::new(AtomicBool::new(false)),
             hdr_content: Arc::new(AtomicBool::new(false)),
             wakeup_tx: Arc::new(AtomicI32::new(-1)),
@@ -586,6 +610,8 @@ impl WaylandZeroCopyPlayer {
         let display_addr = self.display_addr.clone();
         let surface_addr = self.surface_addr.clone();
         let plane_active = self.plane_active.clone();
+        let plane_active_surface = self.plane_active_surface.clone();
+        let plane_bound_surface = self.plane_bound_surface.clone();
         let plane_hdr = self.plane_hdr.clone();
         let hdr_content = self.hdr_content.clone();
         let current_pos_ms = self.current_pos_ms.clone();
@@ -845,7 +871,7 @@ impl WaylandZeroCopyPlayer {
                 // On Wayland the native plane is the default; the readback
                 // path remains as the automatic fallback and can be forced
                 // with MITUB_NATIVE_PLANE=0.
-                let mut plane_unavailable = {
+                let plane_unavailable = {
                     let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some();
                     let enabled = std::env::var("MITUB_NATIVE_PLANE")
                         .map(|value| value != "0")
@@ -983,7 +1009,54 @@ impl WaylandZeroCopyPlayer {
                         }
                     }
 
-                    // 2. Skip GPU work entirely when the video is not visible.
+                    // 2. Rebind or drop the native plane whenever the target
+                    // surface changes. Runs before `should_skip` / `set_rect`
+                    // so a closing window's subsurface is always destroyed
+                    // before its parent wl_surface closes.
+                    #[cfg(target_os = "linux")]
+                    if is_opengl {
+                        let target_surface = surface_addr.load(Ordering::SeqCst);
+                        let target_display = display_addr.load(Ordering::SeqCst);
+                        if target_surface != plane_surface {
+                            plane = None;
+                            plane_active.store(false, Ordering::SeqCst);
+                            plane_active_surface.store(0, Ordering::SeqCst);
+                            plane_hdr.store(false, Ordering::SeqCst);
+                            plane_rect = (0, 0, 0, 0);
+                            hdr_applied = false;
+
+                            if target_surface == 0 || plane_unavailable || target_display == 0 {
+                                plane_surface = target_surface;
+                                plane_bound_surface.store(target_surface, Ordering::SeqCst);
+                            } else {
+                                match WaylandPlane::new(
+                                    target_display as *mut std::ffi::c_void,
+                                    target_surface as *mut std::ffi::c_void,
+                                    1.0,
+                                ) {
+                                    Ok(created) => {
+                                        println!(
+                                            "[mitub-plane] native video plane attached to surface 0x{target_surface:x} hdr={}",
+                                            created.supports_hdr()
+                                        );
+                                        plane = Some(created);
+                                        plane_surface = target_surface;
+                                        plane_bound_surface.store(target_surface, Ordering::SeqCst);
+                                        force_frame_refresh_atom.store(true, Ordering::SeqCst);
+                                    }
+                                    Err(error) => {
+                                        eprintln!("[mitub-plane] unavailable on 0x{target_surface:x}, keeping readback path: {error}");
+                                        plane_surface = target_surface;
+                                        plane_bound_surface.store(target_surface, Ordering::SeqCst);
+                                        force_frame_refresh_atom.store(true, Ordering::SeqCst);
+                                    }
+                                }
+                            }
+                            FRAME_NOTIFY.notify_one();
+                        }
+                    }
+
+                    // 3. Skip GPU work entirely when the video is not visible.
                     // This runs on every iteration, so a plane left over from
                     // an inactive/minimized view cannot keep the window
                     // transparent after playback stops producing frames.
@@ -997,7 +1070,10 @@ impl WaylandZeroCopyPlayer {
                         if let Some(active_plane) = plane.as_mut() {
                             active_plane.hide();
                         }
-                        plane_active.store(false, Ordering::SeqCst);
+                        if plane_active.swap(false, Ordering::SeqCst) {
+                            plane_active_surface.store(0, Ordering::SeqCst);
+                            FRAME_NOTIFY.notify_one();
+                        }
                         plane_hdr.store(false, Ordering::SeqCst);
                         let mut skip: i32 = 1;
                         let render_params = [
@@ -1015,13 +1091,13 @@ impl WaylandZeroCopyPlayer {
                         }
                     }
 
-                    // Keep the plane glued to the player rect even when no new
-                    // frames arrive (paused playback while scrolling). Without
-                    // this, the last frame stays at its old position and looks
-                    // like it is being dragged behind the page.
+                    // Keep the plane glued to the fitted video rect even when
+                    // no new frames arrive (paused playback while scrolling or
+                    // resizing).
                     if !should_skip {
                         if let Some(active_plane) = plane.as_mut() {
-                            let rect = (vp_x, vp_y, vp_w.max(1) as u32, vp_h.max(1) as u32);
+                            let dims = *video_dims.safe_lock();
+                            let rect = fit_video_in_rect((vp_x, vp_y, vp_w, vp_h), dims);
                             if rect != plane_rect {
                                 active_plane.set_rect(rect.0, rect.1, rect.2, rect.3);
                                 plane_rect = rect;
@@ -1029,7 +1105,7 @@ impl WaylandZeroCopyPlayer {
                         }
                     }
 
-                    // 3. Check for new video frame to render. When the video is
+                    // 4. Check for new video frame to render. When the video is
                     // hidden we still fall through to the reactive sleep below
                     // instead of busy-looping.
                     let flags = if should_skip {
@@ -1041,66 +1117,22 @@ impl WaylandZeroCopyPlayer {
                         && force_frame_refresh_atom.swap(false, Ordering::SeqCst)
                         && first_frame_rendered.load(Ordering::Relaxed);
                     if !should_skip && ((flags & MPV_RENDER_UPDATE_FRAME != 0) || force_refresh) {
-                        // Lazily bind the native plane to the current window
-                        // surface. When the window moves to another surface
-                        // (main <-> PiP) the old plane is dropped and rebuilt.
-                        #[cfg(target_os = "linux")]
-                        if is_opengl && !plane_unavailable {
-                            let target_surface = surface_addr.load(Ordering::SeqCst);
-                            let target_display = display_addr.load(Ordering::SeqCst);
-                            if target_surface == 0 {
-                                if plane.take().is_some() {
-                                    plane_active.store(false, Ordering::SeqCst);
-                                }
-                                plane_surface = 0;
-                            } else if target_surface != plane_surface && target_display != 0 {
-                                plane = None;
-                                plane_active.store(false, Ordering::SeqCst);
-                                plane_rect = (0, 0, 0, 0);
-                                match WaylandPlane::new(
-                                    target_display as *mut std::ffi::c_void,
-                                    target_surface as *mut std::ffi::c_void,
-                                    1.0,
-                                ) {
-                                    Ok(created) => {
-                                        println!(
-                                            "[mitub-plane] native video plane attached to surface 0x{target_surface:x} hdr={}",
-                                            created.supports_hdr()
-                                        );
-                                        plane = Some(created);
-                                        plane_surface = target_surface;
-                                    }
-                                    Err(error) => {
-                                        eprintln!("[mitub-plane] unavailable, keeping readback path: {error}");
-                                        plane_unavailable = true;
-                                    }
-                                }
-                            }
-                        }
-
                         let (vid_w, vid_h) = *video_dims.safe_lock();
-                        // Render at the size the video is actually displayed at (x1.15 margin for subpixel sharpness),
-                        // never above the source, while strictly preserving the exact video aspect ratio so libmpv
-                        // never bakes letterbox or pillarbox black bars into the FBO texture.
-                        // Strict 1080p cap to guarantee glReadPixels / SW rasterizer never transfers >8.3MB per frame
+                        // Render at the source aspect-preserving resolution (capped at 1080p) on the
+                        // native plane so resizing never reallocates textures or re-exports DMA-BUFs.
                         let native_plane = plane.is_some() && vp_w > 16 && vp_h > 16 && vid_w > 0 && vid_h > 0;
                         let (target_w, target_h) = if vid_w > 0 && vid_h > 0 {
                             let max_scale = (1920.0 / vid_w as f32).min(1080.0 / vid_h as f32).min(1.0);
                             if native_plane {
-                                // Render the whole player rect (capped at
-                                // 1080p). MPV letterboxes the video inside the
-                                // texture, so the plane covers the full rect
-                                // and there are no transparent bars.
-                                let area_scale = (1920.0 / vp_w as f32)
-                                    .min(1080.0 / vp_h as f32)
-                                    .min(1.0);
-                                let tw = (((vp_w as f32 * area_scale).round() as u32) & !1).max(2);
-                                let th = (((vp_h as f32 * area_scale).round() as u32) & !1).max(2);
+                                let tw = (((vid_w as f32 * max_scale).round() as u32) & !1).max(2);
+                                let th = (((vid_h as f32 * max_scale).round() as u32) & !1).max(2);
                                 (tw, th)
                             } else {
                                 let min_scale = (240.0 / vid_w.max(vid_h) as f32).min(max_scale);
-                                let sx = (vp_w as f32 * 1.15) / vid_w as f32;
-                                let sy = (vp_h as f32 * 1.15) / vid_h as f32;
+                                let qw = ((vp_w.max(64) + 63) & !63) as f32;
+                                let qh = ((vp_h.max(64) + 63) & !63) as f32;
+                                let sx = (qw * 1.15) / vid_w as f32;
+                                let sy = (qh * 1.15) / vid_h as f32;
                                 let vp_scale = sx.max(sy).clamp(min_scale, max_scale);
                                 let tw = (((vid_w as f32 * vp_scale).round() as u32) & !1).max(2);
                                 let th = (((vid_h as f32 * vp_scale).round() as u32) & !1).max(2);
@@ -1208,6 +1240,11 @@ impl WaylandZeroCopyPlayer {
                                 #[cfg(target_os = "linux")]
                                 if native_plane {
                                     if let Some(active_plane) = plane.as_mut() {
+                                        let rect = fit_video_in_rect((vp_x, vp_y, vp_w, vp_h), (vid_w, vid_h));
+                                        if rect != plane_rect {
+                                            active_plane.set_rect(rect.0, rect.1, rect.2, rect.3);
+                                            plane_rect = rect;
+                                        }
                                         // The compositor samples the exported DMA-BUF
                                         // directly; make sure the GPU finished writing
                                         // before handing it over.
@@ -1215,14 +1252,16 @@ impl WaylandZeroCopyPlayer {
                                         match active_plane.present(tex, current_buf_w, current_buf_h) {
                                             Ok(()) => {
                                                 presented = true;
+                                                plane_active_surface.store(plane_surface, Ordering::SeqCst);
                                                 plane_active.store(true, Ordering::SeqCst);
                                             }
                                             Err(error) => {
                                                 eprintln!("[mitub-plane] present failed, falling back: {error}");
                                                 plane.take();
-                                                plane_unavailable = true;
                                                 plane_active.store(false, Ordering::SeqCst);
+                                                plane_active_surface.store(0, Ordering::SeqCst);
                                                 plane_hdr.store(false, Ordering::SeqCst);
+                                                hdr_applied = false;
                                             }
                                         }
                                     }
@@ -1379,6 +1418,8 @@ impl WaylandZeroCopyPlayer {
 
                 // Cleanup OpenGL & EGL resources on thread exit
                 plane_active.store(false, Ordering::SeqCst);
+                plane_active_surface.store(0, Ordering::SeqCst);
+                plane_bound_surface.store(0, Ordering::SeqCst);
                 plane_hdr.store(false, Ordering::SeqCst);
                 drop(plane);
                 wakeup_tx_atomic.store(-1, Ordering::SeqCst);
@@ -1479,10 +1520,11 @@ impl WaylandZeroCopyPlayer {
         self.has_error.store(false, Ordering::SeqCst);
         *self.last_error.safe_lock() = None;
         // Show the buffering spinner immediately while mpv resolves the
-        // manifest and fetches the first segments.
-        self.is_buffering.store(true, Ordering::SeqCst);
+        // manifest and fetches the first segments (skip for local files).
+        let is_local = video_url.starts_with("file://");
+        self.is_buffering.store(!is_local, Ordering::SeqCst);
         self.is_seeking.store(false, Ordering::SeqCst);
-        self.buffering_percent.store(0, Ordering::SeqCst);
+        self.buffering_percent.store(if is_local { 100 } else { 0 }, Ordering::SeqCst);
 
         let ctx_opt = *self.mpv.safe_lock();
         let ctx = match ctx_opt {
@@ -1624,14 +1666,22 @@ impl WaylandZeroCopyPlayer {
         self.stop();
     }
 
+    pub fn is_playing_local(&self) -> bool {
+        self.current_video_url.safe_lock().starts_with("file://")
+    }
+
     pub fn seek_ms(&self, target_ms: u64) -> u64 {
         let cur_ms = self.get_position_ms();
         crate::diagnostics::session_seek_start(cur_ms, target_ms);
         let sec_str = format!("{:.3}", target_ms as f64 / 1000.0);
         // Keep the buffering overlay visible from the moment the seek starts
-        // until mpv reports playback-restart for the new position.
-        self.is_seeking.store(true, Ordering::SeqCst);
-        self.is_buffering.store(true, Ordering::SeqCst);
+        // until mpv reports playback-restart for the new position (only for
+        // remote streams; local files seek instantaneously).
+        let is_local = self.is_playing_local();
+        self.is_seeking.store(!is_local, Ordering::SeqCst);
+        if !is_local {
+            self.is_buffering.store(true, Ordering::SeqCst);
+        }
         if let Some(addr) = *self.mpv.safe_lock() {
             let c_seek = CString::new("seek").unwrap();
             let c_pos = CString::new(sec_str).unwrap();
@@ -1798,8 +1848,35 @@ impl WaylandZeroCopyPlayer {
     pub fn switch_surface(&self, surf_ptr: usize, _explicit_pos_ms: Option<u64>) {
         // The render worker watches `surface_addr` and rebuilds the native
         // subsurface when the video moves between the main and PiP windows.
-        if surf_ptr != 0 {
-            self.surface_addr.store(surf_ptr, Ordering::SeqCst);
+        let prev = self.surface_addr.swap(surf_ptr, Ordering::SeqCst);
+        if prev != surf_ptr {
+            self.plane_active.store(false, Ordering::SeqCst);
+            self.plane_active_surface.store(0, Ordering::SeqCst);
+            self.force_frame_refresh.store(true, Ordering::SeqCst);
+            self.trigger_worker_wakeup();
+        }
+    }
+
+    /// Detaches any subsurface bound to `closing_surf`, transitions the worker
+    /// to `next_surf`, and waits briefly for the worker to drop and flush the
+    /// old `WaylandPlane` before the caller closes `closing_surf`'s window.
+    pub fn detach_surface_sync(&self, closing_surf: usize, next_surf: usize) {
+        self.surface_addr.store(next_surf, Ordering::SeqCst);
+        if closing_surf != 0 && self.plane_active_surface.load(Ordering::SeqCst) == closing_surf {
+            self.plane_active.store(false, Ordering::SeqCst);
+            self.plane_active_surface.store(0, Ordering::SeqCst);
+        }
+        self.force_frame_refresh.store(true, Ordering::SeqCst);
+        self.trigger_worker_wakeup();
+        if closing_surf != 0 && next_surf != closing_surf {
+            let start = std::time::Instant::now();
+            while self.is_running.load(Ordering::Relaxed)
+                && self.plane_bound_surface.load(Ordering::SeqCst) == closing_surf
+                && start.elapsed() < std::time::Duration::from_millis(50)
+            {
+                self.trigger_worker_wakeup();
+                std::thread::sleep(std::time::Duration::from_micros(100));
+            }
         }
     }
 
@@ -1808,7 +1885,7 @@ impl WaylandZeroCopyPlayer {
             self.display_addr.store(disp_ptr, Ordering::SeqCst);
         }
         if surf_ptr != 0 {
-            self.surface_addr.store(surf_ptr, Ordering::SeqCst);
+            self.switch_surface(surf_ptr, None);
         }
     }
 
@@ -1822,6 +1899,13 @@ impl WaylandZeroCopyPlayer {
         self.plane_active.load(Ordering::SeqCst)
     }
 
+    /// True while the native Wayland plane is actively presenting on `surf_ptr`.
+    pub fn is_plane_active_on(&self, surf_ptr: usize) -> bool {
+        surf_ptr != 0
+            && self.plane_active.load(Ordering::SeqCst)
+            && self.plane_active_surface.load(Ordering::SeqCst) == surf_ptr
+    }
+
     /// True when the plane is currently describing PQ/BT.2020 output.
     pub fn is_plane_hdr(&self) -> bool {
         self.plane_hdr.load(Ordering::SeqCst)
@@ -1831,11 +1915,16 @@ impl WaylandZeroCopyPlayer {
         let prev_w = self.vp_w.swap(w, Ordering::Relaxed);
         let prev_h = self.vp_h.swap(h, Ordering::Relaxed);
         let prev_y = self.vp_y.swap(y, Ordering::Relaxed);
-        self.vp_x.store(x, Ordering::Relaxed);
+        let prev_x = self.vp_x.swap(x, Ordering::Relaxed);
         let was_hidden = prev_w <= 16 || prev_h <= 16 || prev_y <= -5000;
         let now_visible = w > 16 && h > 16 && y > -5000;
-        if was_hidden && now_visible && self.rendering_active.load(Ordering::Relaxed) {
-            self.force_frame_refresh.store(true, Ordering::SeqCst);
+        let changed = prev_x != x || prev_y != y || prev_w != w || prev_h != h;
+        if changed && self.rendering_active.load(Ordering::Relaxed) {
+            if (was_hidden && now_visible)
+                || (now_visible && !self.is_plane_active() && (prev_w != w || prev_h != h))
+            {
+                self.force_frame_refresh.store(true, Ordering::SeqCst);
+            }
             self.trigger_worker_wakeup();
         }
     }
@@ -1881,5 +1970,39 @@ impl Drop for WaylandZeroCopyPlayer {
                 mpv_terminate_destroy(ctx as *mut MpvHandle);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fit_video_in_rect;
+
+    #[test]
+    fn fit_video_in_rect_handles_aspect_ratios_and_zeros() {
+        // 16:9 exact match
+        assert_eq!(fit_video_in_rect((24, 68, 960, 540), (1920, 1080)), (24, 68, 960, 540));
+        // 21:9 letterboxed inside 16:9 container
+        let r21 = fit_video_in_rect((0, 0, 1920, 1080), (2560, 1080));
+        assert_eq!(r21.0, 0);
+        assert_eq!(r21.2, 1920);
+        assert_eq!(r21.3, 810);
+        assert_eq!(r21.1, 135);
+        // 4:3 pillarboxed inside 16:9 container
+        let r43 = fit_video_in_rect((0, 0, 1600, 900), (1440, 1080));
+        assert_eq!(r43.1, 0);
+        assert_eq!(r43.3, 900);
+        assert_eq!(r43.2, 1200);
+        assert_eq!(r43.0, 200);
+        // 9:16 vertical inside 16:9 container
+        let r916 = fit_video_in_rect((10, 20, 480, 270), (1080, 1920));
+        assert_eq!(r916.1, 20);
+        assert_eq!(r916.3, 270);
+        assert_eq!(r916.2, 152);
+        assert_eq!(r916.0, 10 + (480 - 152) / 2);
+        // Zero video dims -> fill container
+        assert_eq!(fit_video_in_rect((5, 10, 480, 270), (0, 0)), (5, 10, 480, 270));
+        // Zero/negative container dims -> empty rect
+        assert_eq!(fit_video_in_rect((5, 10, 0, 270), (1920, 1080)), (5, 10, 0, 0));
+        assert_eq!(fit_video_in_rect((5, 10, 480, -1), (1920, 1080)), (5, 10, 0, 0));
     }
 }

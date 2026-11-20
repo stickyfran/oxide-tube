@@ -2988,28 +2988,32 @@ mod tests {
             TestMsg::NoOp,
         );
     }
+
+    #[test]
+    fn backdrops_build_for_fitted_and_clipped_holes() {
+        let _main: Element<'_, TestMsg> = player_backdrop((24.0, -40.0, 960.0, 540.0));
+        let _pip: Element<'_, TestMsg> = pip_backdrop((0.0, 20.0, 640.0, 360.0));
+        let _zero: Element<'_, TestMsg> = pip_backdrop((0.0, 0.0, 0.0, 0.0));
+    }
 }
 
-
-/// Opaque backdrop that covers the whole window except the rectangular hole
-/// where the native Wayland video plane is presented. Built from plain
-/// containers (no canvas) so the compositor always receives fully opaque
-/// pixels around the video.
-pub fn player_backdrop<'a, Message: 'static>(
+fn opaque_backdrop<'a, Message: 'static>(
     hole: (f32, f32, f32, f32),
+    bg: Color,
 ) -> Element<'a, Message> {
     let (x, y, w, h) = hole;
-    let x = x.max(0.0);
-    let w = w.max(0.0);
-    // The player rect scrolls with the page. Clip the hole vertically so a
-    // partially scrolled video does not leave a transparent band below the
-    // content (which would show the desktop through the window).
+    // Clip the hole horizontally and vertically so a partially scrolled or
+    // offscreen player rect never leaves a transparent band at the window edge.
+    let left = x.max(0.0);
+    let right = (x + w).max(0.0);
+    let w = (right - left).max(0.0);
+    let x = left;
     let top = y.max(0.0);
     let bottom = (y + h).max(0.0);
     let h = (bottom - top).max(0.0);
     let y = top;
-    let opaque = |_t: &iced::Theme| container::Style {
-        background: Some(color_bg().into()),
+    let opaque = move |_t: &iced::Theme| container::Style {
+        background: Some(bg.into()),
         ..container::Style::default()
     };
     let bar = |width: Length, height: Length| -> Element<'a, Message> {
@@ -3029,4 +3033,22 @@ pub fn player_backdrop<'a, Message: 'static>(
     .width(Length::Fill)
     .height(Length::Fill)
     .into()
+}
+
+/// Opaque backdrop that covers the whole window except the rectangular hole
+/// where the native Wayland video plane is presented. Built from plain
+/// containers (no canvas) so the compositor always receives fully opaque
+/// pixels around the video.
+pub fn player_backdrop<'a, Message: 'static>(
+    hole: (f32, f32, f32, f32),
+) -> Element<'a, Message> {
+    opaque_backdrop(hole, color_bg())
+}
+
+/// Opaque black backdrop for the PiP window around the aspect-fitted native
+/// video plane hole.
+pub fn pip_backdrop<'a, Message: 'static>(
+    hole: (f32, f32, f32, f32),
+) -> Element<'a, Message> {
+    opaque_backdrop(hole, Color::BLACK)
 }

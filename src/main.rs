@@ -356,8 +356,10 @@ pub struct MitubApp {
     volume_wheel_accum: f32,
     main_window_id: Option<Id>,
     pip_window_id: Option<Id>,
+    pip_surface_handle: usize,
     pip_watch_details: Option<Arc<innertube::WatchDetails>>,
     pip_window_size: (f32, f32),
+    last_pip_video_dims: (u32, u32),
     last_pip_resize_edge: Option<PipResizeEdge>,
     pip_cursor_hovered: bool,
     pip_cursor_pos: Option<iced::Point>,
@@ -1734,8 +1736,10 @@ impl MitubApp {
             volume_wheel_accum: 0.0,
             main_window_id: Some(main_id),
             pip_window_id: None,
+            pip_surface_handle: 0,
             pip_watch_details: None,
             pip_window_size: saved_pip_size.unwrap_or((480.0, 270.0)),
+            last_pip_video_dims: (0, 0),
             last_pip_resize_edge: None,
             pip_cursor_hovered: true,
             pip_cursor_pos: None,
@@ -2707,7 +2711,12 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                 if surf_ptr != 0 {
                     self.main_window_handles = (disp_ptr, surf_ptr);
                     if let Some(player) = &self.player {
-                        player.update_handles(disp_ptr, surf_ptr);
+                        if self.pip_window_id.is_some() {
+                            player.update_handles(disp_ptr, 0);
+                        } else {
+                            player.update_handles(disp_ptr, surf_ptr);
+                            self.sync_player_viewport();
+                        }
                     } else {
                         match WaylandZeroCopyPlayer::new_from_raw(disp_ptr, surf_ptr) {
                             Ok(p) => {
@@ -2750,6 +2759,10 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
 
             Message::PipHandleAcquired(disp_ptr, surf_ptr) => {
                 crate::diagnostics::log_pip("Acquired", surf_ptr, "Wayland surface resolved for PiP window");
+                if self.pip_window_id.is_none() {
+                    return Task::none();
+                }
+                self.pip_surface_handle = surf_ptr;
                 if let Some(player) = &self.player {
                     let (pw, ph) = self.pip_window_size;
                     player.set_underlay(true);
@@ -2757,7 +2770,7 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                     player.set_rendering_active(true);
                     if surf_ptr != 0 {
                         if disp_ptr != 0 {
-                            player.update_handles(disp_ptr, surf_ptr);
+                            player.update_handles(disp_ptr, 0);
                         }
                         let target_pos = if player.get_position_ms() > 0 {
                             player.get_position_ms()
@@ -2779,7 +2792,9 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                 self.last_pip_toggle = Some(std::time::Instant::now());
                 trigger_save_kwin_pip_position();
                 if let Some(pip_id) = self.pip_window_id.take() {
-                    crate::diagnostics::log_pip("Close", 0, "Closing PiP and returning to main window");
+                    self.config.save_async();
+                    let closing_pip_surf = std::mem::replace(&mut self.pip_surface_handle, 0);
+                    crate::diagnostics::log_pip("Close", closing_pip_surf, "Closing PiP and returning to main window");
                     let pip_vid = self.playing_video_id.clone();
                     if was_unfocused_auto {
                         if let Some(details) = self.pip_watch_details.take().or_else(|| self.watch_details.clone()) {
@@ -2801,17 +2816,13 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                         self.pip_watch_details = None;
                     }
                     if let Some(player) = &self.player {
-                        let target_pos = if player.get_position_ms() > 0 {
-                            player.get_position_ms()
-                        } else {
-                            self.osd_state.current_pos_secs * 1000
-                        };
                         let (_main_disp, main_surf) = self.main_window_handles;
-                        if main_surf != 0 {
+                        if main_surf != 0 && self.main_window_id.is_some() {
                             self.sync_player_viewport();
-                            player.switch_surface(main_surf, Some(target_pos));
+                            player.detach_surface_sync(closing_pip_surf, main_surf);
                         } else {
-                            player.shutdown_sync();
+                            player.set_rendering_active(false);
+                            player.detach_surface_sync(closing_pip_surf, 0);
                         }
                     }
                     return window::close(pip_id);
@@ -2828,6 +2839,8 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                     self.is_window_focused = true;
                     tasks.push(window::minimize(main_id, false));
                     tasks.push(window::gain_focus(main_id));
+                } else {
+                    tasks.push(self.update(Message::RestoreFromTray));
                 }
                 tasks.push(self.update(Message::ClosePip));
                 return Task::batch(tasks);
@@ -2842,14 +2855,18 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                     }
                 }
                 if let Some(pip_id) = self.pip_window_id {
-                    let (cur_w, cur_h) = self.pip_window_size;
-                    let (tw, th) = self.compute_pip_aspect_size(cur_w, cur_h, None);
-                    if (cur_w - tw).abs() > 1.5 || (cur_h - th).abs() > 1.5 {
-                        self.pip_window_size = (tw, th);
-                        if let Some(player) = &self.player {
-                            player.set_viewport(0, 0, tw as i32, th as i32);
+                    let cur_dims = self.player.as_ref().map(|p| p.get_video_dims()).unwrap_or((0, 0));
+                    if cur_dims.0 > 0 && cur_dims.1 > 0 && cur_dims != self.last_pip_video_dims {
+                        self.last_pip_video_dims = cur_dims;
+                        let (cur_w, cur_h) = self.pip_window_size;
+                        let (tw, th) = self.compute_pip_aspect_size(cur_w, cur_h, None);
+                        if (cur_w - tw).abs() > 1.5 || (cur_h - th).abs() > 1.5 {
+                            self.pip_window_size = (tw, th);
+                            if let Some(player) = &self.player {
+                                player.set_viewport(0, 0, tw as i32, th as i32);
+                            }
+                            return window::resize(pip_id, Size::new(tw, th));
                         }
-                        return window::resize(pip_id, Size::new(tw, th));
                     }
                 }
                 Task::none()
@@ -3572,12 +3589,12 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
 
                 let mut tasks = vec![watch_task, self.reset_watch_scroll_task()];
                 if let Some(pip_id) = self.pip_window_id.take() {
+                    let closing_pip_surf = std::mem::replace(&mut self.pip_surface_handle, 0);
                     self.pip_watch_details = None;
                     let (_main_disp, main_surf) = self.main_window_handles;
+                    self.sync_player_viewport();
                     if let Some(player) = &self.player {
-                        if main_surf != 0 {
-                            player.update_handles(0, main_surf);
-                        }
+                        player.detach_surface_sync(closing_pip_surf, main_surf);
                     }
                     tasks.push(window::close(pip_id));
                 }
@@ -4508,7 +4525,10 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
 
             Message::PlayPauseToggle => {
                 if let ViewMode::Watch(ref view_vid) = self.current_view {
-                    if self.playing_video_id.as_deref() != Some(view_vid.as_str()) {
+                    if self.playing_video_id.as_deref() != Some(view_vid.as_str())
+                        && (self.pip_window_id.is_none()
+                            || (!self.pip_cursor_hovered && self.focused_window != self.pip_window_id))
+                    {
                         let vid = view_vid.clone();
                         let close_pip_task = if self.pip_window_id.is_some() {
                             self.update(Message::ClosePip)
@@ -4652,20 +4672,29 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                 crate::diagnostics::session_seek_start(self.osd_state.current_pos_secs * 1000, target_secs * 1000);
                 self.osd_state.close_all_menus();
                 if let Some(player) = &self.player {
+                    let target_ms = target_secs * 1000;
                     // Deferred hot-swap: if video finished downloading while playing from web, switch to local seamlessly on seek
-                    if self.osd_state.is_fully_buffered && !self.playing_from_local {
+                    if !player.is_playing_local() {
                         if let Some(vid) = &self.playing_video_id {
                             if let Some(buf_st) = self.buffer_downloads.get(vid) {
-                                if buf_st.is_complete && buf_st.video_path.is_some() {
+                                if buf_st.is_complete
+                                    && buf_st.video_path.as_ref().is_some_and(|p| p.is_file())
+                                {
                                     let v_p = buf_st.video_path.as_ref().unwrap();
                                     let v_str = format!("file://{}", v_p.to_string_lossy());
-                                    let a_str = buf_st.audio_path.as_ref().map(|p| format!("file://{}", p.to_string_lossy()));
+                                    let a_str = buf_st
+                                        .audio_path
+                                        .as_ref()
+                                        .filter(|p| p.is_file())
+                                        .map(|p| format!("file://{}", p.to_string_lossy()));
                                     let is_playing = self.osd_state.is_playing;
                                     self.playing_from_local = true;
+                                    self.osd_state.is_fully_buffered = true;
+                                    self.osd_state.is_buffering = false;
                                     if is_playing {
-                                        let _ = player.play_stream_with_seek(&v_str, a_str.as_deref(), Some(target_secs * 1000));
+                                        let _ = player.play_stream_with_seek(&v_str, a_str.as_deref(), Some(target_ms));
                                     } else {
-                                        let _ = player.play_stream_with_seek_paused(&v_str, a_str.as_deref(), Some(target_secs * 1000));
+                                        let _ = player.play_stream_with_seek_paused(&v_str, a_str.as_deref(), Some(target_ms));
                                     }
                                     self.osd_state.current_pos_secs = target_secs;
                                     self.seek_suppress_until = Some(std::time::Instant::now() + Duration::from_millis(800));
@@ -4675,9 +4704,11 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                         }
                     }
 
-                    player.seek_ms(target_secs * 1000);
+                    player.seek_ms(target_ms);
                     self.osd_state.current_pos_secs = target_secs;
-                    self.osd_state.is_buffering = true;
+                    if !player.is_playing_local() {
+                        self.osd_state.is_buffering = true;
+                    }
                     self.seek_suppress_until = Some(std::time::Instant::now() + Duration::from_millis(800));
                 }
                 Task::none()
@@ -4685,9 +4716,50 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
 
             Message::SeekRelative(delta) => {
                 if let Some(player) = &self.player {
-                    let target_ms = player.seek_relative_secs(delta);
-                    self.osd_state.current_pos_secs = target_ms / 1000;
-                    self.osd_state.is_buffering = true;
+                    let cur_ms = player.get_position_ms();
+                    let target_ms = if delta < 0 {
+                        cur_ms.saturating_sub((-delta as u64) * 1000)
+                    } else {
+                        cur_ms.saturating_add((delta as u64) * 1000)
+                    };
+
+                    // Deferred hot-swap: if video finished downloading while playing from web, switch to local seamlessly on relative seek
+                    if !player.is_playing_local() {
+                        if let Some(vid) = &self.playing_video_id {
+                            if let Some(buf_st) = self.buffer_downloads.get(vid) {
+                                if buf_st.is_complete
+                                    && buf_st.video_path.as_ref().is_some_and(|p| p.is_file())
+                                {
+                                    let v_p = buf_st.video_path.as_ref().unwrap();
+                                    let v_str = format!("file://{}", v_p.to_string_lossy());
+                                    let a_str = buf_st
+                                        .audio_path
+                                        .as_ref()
+                                        .filter(|p| p.is_file())
+                                        .map(|p| format!("file://{}", p.to_string_lossy()));
+                                    let is_playing = self.osd_state.is_playing;
+                                    self.playing_from_local = true;
+                                    self.osd_state.is_fully_buffered = true;
+                                    self.osd_state.is_buffering = false;
+                                    if is_playing {
+                                        let _ = player.play_stream_with_seek(&v_str, a_str.as_deref(), Some(target_ms));
+                                    } else {
+                                        let _ = player.play_stream_with_seek_paused(&v_str, a_str.as_deref(), Some(target_ms));
+                                    }
+                                    self.osd_state.current_pos_secs = target_ms / 1000;
+                                    self.seek_suppress_until = Some(std::time::Instant::now() + Duration::from_millis(800));
+                                    self.osd_state.trigger_seek_feedback(delta);
+                                    return Task::none();
+                                }
+                            }
+                        }
+                    }
+
+                    let actual_ms = player.seek_ms(target_ms);
+                    self.osd_state.current_pos_secs = actual_ms / 1000;
+                    if !player.is_playing_local() {
+                        self.osd_state.is_buffering = true;
+                    }
                     self.seek_suppress_until = Some(std::time::Instant::now() + Duration::from_millis(800));
                     self.osd_state.trigger_seek_feedback(delta);
                 }
@@ -5055,6 +5127,8 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                 };
 
                 self.pip_watch_details = Some(details.clone());
+                self.pip_surface_handle = 0;
+                self.last_pip_video_dims = self.player.as_ref().map(|p| p.get_video_dims()).unwrap_or((0, 0));
                 self.last_pip_resize_edge = None;
 
                 let ratio = self.current_video_aspect_ratio();
@@ -5632,8 +5706,12 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                         if !self.is_fullscreen && self.pip_window_id.is_none() {
                             save_window_state(self.window_size.0, self.window_size.1, self.is_maximized);
                         }
+                        let closing_main_surf = std::mem::replace(&mut self.main_window_handles.1, 0);
                         if let Some(player) = &self.player {
-                            player.set_rendering_active(false);
+                            if self.pip_window_id.is_none() {
+                                player.set_rendering_active(false);
+                                player.detach_surface_sync(closing_main_surf, 0);
+                            }
                         }
                         crate::tray::set_tray_visible(true);
                         return window::close(main_id);
@@ -6548,9 +6626,6 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
 
             Message::WindowMaximized(is_max) => {
                 self.is_maximized = is_max;
-                if !self.is_fullscreen && self.pip_window_id.is_none() {
-                    save_window_state(self.window_size.0, self.window_size.1, is_max);
-                }
                 Task::none()
             }
 
@@ -7414,8 +7489,12 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                                 if !self.is_fullscreen && self.pip_window_id.is_none() {
                                     save_window_state(self.window_size.0, self.window_size.1, self.is_maximized);
                                 }
+                                let closing_main_surf = std::mem::replace(&mut self.main_window_handles.1, 0);
                                 if let Some(player) = &self.player {
-                                    player.set_rendering_active(false);
+                                    if self.pip_window_id.is_none() {
+                                        player.set_rendering_active(false);
+                                        player.detach_surface_sync(closing_main_surf, 0);
+                                    }
                                 }
                                 // Show the tray icon now that we're minimizing to tray
                                 crate::tray::set_tray_visible(true);
@@ -7489,7 +7568,6 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                     iced::Event::Window(iced::window::Event::Moved(p)) => {
                         if Some(win_id) == self.pip_window_id {
                             self.config.pip_position = Some((p.x, p.y));
-                            self.config.save_async();
                         }
                     }
                     iced::Event::Window(iced::window::Event::Resized(size)) => {
@@ -7507,26 +7585,23 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                             self.is_window_minimized = false;
                         }
                         if Some(win_id) == self.pip_window_id {
-                            let (target_w, target_h) =
-                                self.compute_pip_aspect_size(size.width, size.height, self.last_pip_resize_edge);
-                            self.pip_window_size = (target_w, target_h);
-                            self.config.pip_size = Some((target_w, target_h));
-                            self.config.save_async();
+                            self.pip_window_size = (size.width, size.height);
+                            self.config.pip_size = Some((size.width, size.height));
                             if let Some(player) = &self.player {
                                 player.set_underlay(true);
-                                player.set_viewport(0, 0, target_w as i32, target_h as i32);
+                                player.set_viewport(0, 0, size.width as i32, size.height as i32);
                                 player.set_rendering_active(true);
-                            }
-                            if (size.width - target_w).abs() > 1.0 || (size.height - target_h).abs() > 1.0 {
-                                return window::resize(win_id, Size::new(target_w, target_h));
                             }
                             return Task::none();
                         } else if Some(win_id) == self.main_window_id || self.main_window_id.is_none() {
+                            let width_changed = (self.window_size.0 - size.width).abs() > 0.5;
                             self.window_size = (size.width, size.height);
-                            // Tab measurements are relative to the previous width.
-                            self.tabs_max_scroll_x = 0.0;
-                            self.tabs_viewport_width = 0.0;
-                            self.tabs_first_row_width = 0.0;
+                            if width_changed {
+                                // Tab measurements are relative to the previous width.
+                                self.tabs_max_scroll_x = 0.0;
+                                self.tabs_viewport_width = 0.0;
+                                self.tabs_first_row_width = 0.0;
+                            }
                             if self.pip_window_id.is_none() {
                                 self.sync_player_viewport();
                             }
@@ -7933,6 +8008,19 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
         Self::calculate_player_geometry(self.window_size.0, self.window_size.1, self.theater_mode, self.watch_scroll_y, self.header_height())
     }
 
+    fn get_fitted_video_hole(&self, (x, y, w, h): (f32, f32, f32, f32)) -> (f32, f32, f32, f32) {
+        let dims = self
+            .player
+            .as_ref()
+            .map(|p| p.get_video_dims())
+            .unwrap_or((0, 0));
+        let (fx, fy, fw, fh) = crate::player::fit_video_in_rect(
+            (x.round() as i32, y.round() as i32, w.round() as i32, h.round() as i32),
+            dims,
+        );
+        (fx as f32, fy as f32, fw as f32, fh as f32)
+    }
+
     fn sync_player_viewport(&self) {
         if self.pip_window_id.is_some() {
             if let Some(player) = &self.player {
@@ -8326,18 +8414,19 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
             None
         };
         let mut layers: Vec<Element<'_, Message>> = Vec::new();
-        let pip_plane_active = self.player.as_ref().is_some_and(|p| p.is_plane_active());
+        let pip_plane_active = self.pip_surface_handle != 0
+            && self
+                .player
+                .as_ref()
+                .is_some_and(|p| p.is_plane_active_on(self.pip_surface_handle));
 
         if pip_plane_active {
-            // The PiP surface is transparent and the native plane presents the
-            // video below it; keep the window a clean hole for the DMA-BUF.
-            layers.push(
-                container(Space::new(Length::Fill, Length::Fill))
-                    .width(Length::Fill)
-                    .height(Length::Fill)
-                    .style(ui::theme::transparent_player_container)
-                    .into(),
-            );
+            // The PiP surface is transparent inside the aspect-fitted video
+            // hole and opaque black around it (for any letterbox/pillarbox
+            // margins during interactive resize).
+            let (pw, ph) = self.pip_window_size;
+            let hole = self.get_fitted_video_hole((0.0, 0.0, pw, ph));
+            layers.push(ui::pip_backdrop(hole));
         } else if let Some(frame) = video_frame {
             layers.push(
                 crate::ui::video_widget::video_shader_pip(frame),
@@ -8542,7 +8631,16 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
                     &self.inactive_tab_osd_state
                 };
 
-                return view_watch_page(
+                let main_plane_active = !is_pip_active
+                    && is_active_video
+                    && !is_this_video_in_pip
+                    && self.main_window_handles.1 != 0
+                    && self
+                        .player
+                        .as_ref()
+                        .is_some_and(|p| p.is_plane_active_on(self.main_window_handles.1));
+
+                let fs_view = view_watch_page(
                     details,
                     osd_ref,
                     &self.live_messages,
@@ -8557,7 +8655,7 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
                     self.theater_mode,
                     self.is_fullscreen,
                     is_this_video_in_pip,
-                    self.player.as_ref().is_some_and(|p| p.is_plane_active()) && !is_this_video_in_pip,
+                    main_plane_active,
                     self.description_expanded,
                     self.chat_collapsed,
                     &self.description_content,
@@ -8607,6 +8705,14 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
                     Message::DescriptionAction,
                     Message::WatchScrolled,
                 );
+                if main_plane_active {
+                    let hole = self.get_fitted_video_hole((0.0, 0.0, self.window_size.0, self.window_size.1));
+                    return stack![ui::pip_backdrop(hole), fs_view]
+                        .width(Length::Fill)
+                        .height(Length::Fill)
+                        .into();
+                }
+                return fs_view;
             }
         }
 
@@ -8845,6 +8951,15 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
                         &self.inactive_tab_osd_state
                     };
 
+                    let main_plane_active = !is_pip_active
+                        && is_active_video
+                        && !is_this_video_in_pip
+                        && self.main_window_handles.1 != 0
+                        && self
+                            .player
+                            .as_ref()
+                            .is_some_and(|p| p.is_plane_active_on(self.main_window_handles.1));
+
                     view_watch_page(
                         details,
                         osd_ref,
@@ -8860,7 +8975,7 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
                         self.theater_mode,
                         self.is_fullscreen,
                         is_this_video_in_pip,
-                        self.player.as_ref().is_some_and(|p| p.is_plane_active()) && !is_this_video_in_pip,
+                        main_plane_active,
                         self.description_expanded,
                         self.chat_collapsed,
                         &self.description_content,
@@ -9001,12 +9116,18 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
             .height(Length::Fill)
             .clip(true);
 
-        let plane_active = self.player.as_ref().is_some_and(|p| p.is_plane_active())
-            && !is_pip_active
-            && matches!(
-                self.current_view,
-                ViewMode::Watch(_) | ViewMode::VideoFullscreen
-            );
+        let is_showing_playing_video = match &self.current_view {
+            ViewMode::VideoFullscreen => true,
+            ViewMode::Watch(vid) => self.playing_video_id.as_deref() == Some(vid.as_str()),
+            _ => false,
+        };
+        let plane_active = !is_pip_active
+            && is_showing_playing_video
+            && self.main_window_handles.1 != 0
+            && self
+                .player
+                .as_ref()
+                .is_some_and(|p| p.is_plane_active_on(self.main_window_handles.1));
         let base_view: Element<'_, Message> = match &self.current_view {
             ViewMode::Watch(_) if !is_pip_active && self.watch_details.is_some() => {
                 container(
@@ -9072,11 +9193,12 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
             ViewMode::Watch(_) | ViewMode::VideoFullscreen
         ) {
             let hole = if plane_active {
-                if matches!(self.current_view, ViewMode::VideoFullscreen) {
+                let player_rect = if matches!(self.current_view, ViewMode::VideoFullscreen) {
                     (0.0, 0.0, self.window_size.0, self.window_size.1)
                 } else {
                     self.get_windowed_player_rect()
-                }
+                };
+                self.get_fitted_video_hole(player_rect)
             } else {
                 (0.0, 0.0, 0.0, 0.0)
             };
@@ -9588,7 +9710,7 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
 
         let is_window_visible = !self.is_window_minimized && !self.is_window_hidden;
         let is_view_fading = self.view_fade_start.is_some();
-        let is_video_active = is_watching && self.osd_state.is_playing && (is_window_visible || is_pip);
+        let is_video_active = is_watching && (is_window_visible || is_pip);
 
         if is_video_active {
             // Frame-driven presentation: stay continuously subscribed while video is playing on-screen
@@ -9659,15 +9781,29 @@ pub fn calculate_player_geometry(win_w: f32, win_h: f32, theater_mode: bool, scr
     }
 
     pub fn style(&self, _theme: &iced::Theme) -> iced::daemon::Appearance {
-        let plane = self.player.as_ref().is_some_and(|p| p.is_plane_active())
-            && matches!(
-                self.current_view,
-                ViewMode::Watch(_) | ViewMode::VideoFullscreen
-            );
+        let is_pip = self.pip_window_id.is_some();
+        let is_showing_playing_video = match &self.current_view {
+            ViewMode::VideoFullscreen => true,
+            ViewMode::Watch(vid) => self.playing_video_id.as_deref() == Some(vid.as_str()),
+            _ => false,
+        };
+        let main_plane = !is_pip
+            && is_showing_playing_video
+            && self.main_window_handles.1 != 0
+            && self
+                .player
+                .as_ref()
+                .is_some_and(|p| p.is_plane_active_on(self.main_window_handles.1));
+        let pip_plane = is_pip
+            && self.pip_surface_handle != 0
+            && self
+                .player
+                .as_ref()
+                .is_some_and(|p| p.is_plane_active_on(self.pip_surface_handle));
         iced::daemon::Appearance {
             // The native video plane lives below the window surface, so the
             // player hole must be transparent for it to show through.
-            background_color: if plane {
+            background_color: if main_plane || pip_plane {
                 iced::Color::TRANSPARENT
             } else {
                 ui::theme::color_bg()

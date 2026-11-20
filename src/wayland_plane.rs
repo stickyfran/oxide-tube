@@ -54,6 +54,7 @@ mod linux {
         protocol::{
             wl_buffer::WlBuffer,
             wl_compositor::WlCompositor,
+            wl_region::WlRegion,
             wl_registry::WlRegistry,
             wl_subcompositor::WlSubcompositor,
             wl_subsurface::WlSubsurface,
@@ -85,6 +86,7 @@ mod linux {
         connection: Connection,
         queue: EventQueue<PlaneState>,
         state: PlaneState,
+        compositor: WlCompositor,
         // Kept alive for the lifetime of the subsurface; the child surface is
         // what actually receives buffers.
         _parent: WlSurface,
@@ -97,6 +99,9 @@ mod linux {
         buffers: HashMap<u32, PlaneBuffer>,
         width: u32,
         height: u32,
+        buf_w: u32,
+        buf_h: u32,
+        logical_rect: (i32, i32, u32, u32),
         visible: bool,
         hdr: bool,
     }
@@ -116,6 +121,17 @@ mod linux {
             // close the connection on drop.
             let backend = unsafe { Backend::from_foreign_display(display.cast()) };
             let connection = Connection::from_backend(backend);
+
+            // Reconstruct the parent surface immediately before the blocking
+            // registry roundtrip so we never dereference a surface pointer that
+            // was closed concurrently.
+            // SAFETY: `surface` is the live `wl_surface*` of the window and
+            // `WlSurface::interface()` is the matching protocol interface.
+            let surface_id = unsafe { ObjectId::from_ptr(WlSurface::interface(), surface.cast()) }
+                .map_err(|error| format!("invalid wl_surface: {error:?}"))?;
+            let parent = WlSurface::from_id(&connection, surface_id)
+                .map_err(|error| format!("stale wl_surface: {error:?}"))?;
+
             let mut queue = connection.new_event_queue::<PlaneState>();
             let qh = queue.handle();
 
@@ -126,6 +142,9 @@ mod linux {
             queue
                 .roundtrip(&mut state)
                 .map_err(|error| format!("wl_registry roundtrip: {error:?}"))?;
+            if !parent.is_alive() {
+                return Err("parent wl_surface was destroyed during roundtrip".to_owned());
+            }
             let compositor = state
                 .compositor
                 .take()
@@ -143,14 +162,6 @@ mod linux {
                 .take()
                 .ok_or_else(|| "zwp_linux_dmabuf_v1 is not available".to_owned())?;
             let color_manager = state.color_manager.clone();
-
-            // Reconstruct the parent surface on the foreign connection.
-            // SAFETY: `surface` is the live `wl_surface*` of the window and
-            // `WlSurface::interface()` is the matching protocol interface.
-            let surface_id = unsafe { ObjectId::from_ptr(WlSurface::interface(), surface.cast()) }
-                .map_err(|error| format!("invalid wl_surface: {error:?}"))?;
-            let parent = WlSurface::from_id(&connection, surface_id)
-                .map_err(|error| format!("stale wl_surface: {error:?}"))?;
 
             let child = compositor.create_surface(&qh, ());
             let subsurface = subcompositor.get_subsurface(&child, &parent, &qh, ());
@@ -175,6 +186,7 @@ mod linux {
                 connection,
                 queue,
                 state,
+                compositor,
                 _parent: parent,
                 child,
                 subsurface,
@@ -185,6 +197,9 @@ mod linux {
                 buffers: HashMap::new(),
                 width: 0,
                 height: 0,
+                buf_w: 0,
+                buf_h: 0,
+                logical_rect: (0, 0, 0, 0),
                 visible: false,
                 hdr: false,
             })
@@ -197,6 +212,9 @@ mod linux {
         /// Selects the color description the compositor should apply to the
         /// video surface. HDR uses PQ/BT.2020; SDR uses sRGB/BT.709.
         pub fn set_hdr(&mut self, hdr: bool) {
+            if !self._parent.is_alive() || !self.child.is_alive() {
+                return;
+            }
             if self.hdr == hdr && !self.descriptions.is_empty() {
                 return;
             }
@@ -239,20 +257,62 @@ mod linux {
             let _ = self.connection.flush();
         }
 
+        fn apply_geometry(&mut self) -> bool {
+            if !self._parent.is_alive() || !self.child.is_alive() {
+                return false;
+            }
+            let (x, y, width, height) = self.logical_rect;
+            let clip_x = (-x).max(0) as u32;
+            let clip_y = (-y).max(0) as u32;
+            if width == 0 || height == 0 || clip_x >= width || clip_y >= height {
+                return false;
+            }
+            let vis_x = x.max(0);
+            let vis_y = y.max(0);
+            let vis_w = width - clip_x;
+            let vis_h = height - clip_y;
+            self.width = vis_w;
+            self.height = vis_h;
+            self.subsurface.set_position(vis_x, vis_y);
+            if (clip_x > 0 || clip_y > 0) && self.buf_w > 0 && self.buf_h > 0 {
+                let sx = ((clip_x as u64 * self.buf_w as u64) / width as u64)
+                    .min(self.buf_w.saturating_sub(1) as u64) as f64;
+                let sy = ((clip_y as u64 * self.buf_h as u64) / height as u64)
+                    .min(self.buf_h.saturating_sub(1) as u64) as f64;
+                let sw = ((vis_w as u64 * self.buf_w as u64) / width as u64)
+                    .max(1)
+                    .min(self.buf_w as u64 - sx as u64) as f64;
+                let sh = ((vis_h as u64 * self.buf_h as u64) / height as u64)
+                    .max(1)
+                    .min(self.buf_h as u64 - sy as u64) as f64;
+                self.viewport.set_source(sx, sy, sw, sh);
+            } else {
+                self.viewport.set_source(-1.0, -1.0, -1.0, -1.0);
+            }
+            self.viewport.set_destination(vis_w as i32, vis_h as i32);
+            let qh = self.queue.handle();
+            let region = self.compositor.create_region(&qh, ());
+            region.add(0, 0, vis_w as i32, vis_h as i32);
+            self.child.set_opaque_region(Some(&region));
+            region.destroy();
+            true
+        }
+
         /// Positions the plane inside the parent surface using logical
         /// (surface-local) coordinates.
         pub fn set_rect(&mut self, x: i32, y: i32, width: u32, height: u32) {
-            if width == 0 || height == 0 {
+            if !self._parent.is_alive() || !self.child.is_alive() {
+                return;
+            }
+            self.logical_rect = (x, y, width, height);
+            if !self.apply_geometry() {
                 self.hide();
                 return;
             }
-            self.width = width;
-            self.height = height;
-            self.subsurface.set_position(x, y);
-            self.viewport
-                .set_destination(width as i32, height as i32);
-            self.child.commit();
-            let _ = self.connection.flush();
+            if self.visible {
+                self.child.commit();
+                let _ = self.connection.flush();
+            }
         }
 
         pub fn present(
@@ -261,8 +321,20 @@ mod linux {
             width: u32,
             height: u32,
         ) -> Result<(), String> {
-            if width == 0 || height == 0 {
+            if !self._parent.is_alive() || !self.child.is_alive() {
+                return Err("Wayland surface is no longer alive".to_owned());
+            }
+            if width == 0 || height == 0 || self.logical_rect.2 == 0 || self.logical_rect.3 == 0 {
                 return Ok(());
+            }
+            let prev_buf = (self.buf_w, self.buf_h);
+            self.buf_w = width;
+            self.buf_h = height;
+            if prev_buf != (width, height) || !self.visible {
+                if !self.apply_geometry() {
+                    self.hide();
+                    return Ok(());
+                }
             }
             let key = texture;
             // `glTexImage2D` reallocates the texture storage on resize/format
@@ -310,6 +382,8 @@ mod linux {
         /// texture storage is reallocated without changing its dimensions
         /// (for example, switching between 8-bit and 10-bit formats).
         pub fn invalidate_buffers(&mut self) {
+            self.buf_w = 0;
+            self.buf_h = 0;
             for (_, buffer) in self.buffers.drain() {
                 buffer.buffer.destroy();
             }
@@ -320,9 +394,12 @@ mod linux {
                 return;
             }
             self.visible = false;
-            self.child.attach(None, 0, 0);
-            self.child.commit();
-            let _ = self.connection.flush();
+            if self._parent.is_alive() && self.child.is_alive() {
+                self.child.attach(None, 0, 0);
+                self.child.set_opaque_region(None);
+                self.child.commit();
+                let _ = self.connection.flush();
+            }
         }
 
         fn export_buffer(
@@ -332,12 +409,17 @@ mod linux {
             height: u32,
         ) -> Result<PlaneBuffer, String> {
             let export = export_dmabuf(texture)?;
-            if !self.state.supports_format(export.fourcc, export.modifier) {
+            let opaque = opaque_drm_fourcc(export.fourcc);
+            let fourcc = if opaque != export.fourcc && self.state.supports_format(opaque, export.modifier) {
+                opaque
+            } else if self.state.supports_format(export.fourcc, export.modifier) {
+                export.fourcc
+            } else {
                 return Err(format!(
                     "compositor does not advertise fourcc {:#x} modifier {:#x}",
                     export.fourcc, export.modifier
                 ));
-            }
+            };
             let qh = self.queue.handle();
             let params = self.dmabuf.create_params(&qh, ());
             params.add(
@@ -351,7 +433,7 @@ mod linux {
             let buffer = params.create_immed(
                 width as i32,
                 height as i32,
-                export.fourcc,
+                fourcc,
                 Flags::empty(),
                 &qh,
                 (),
@@ -362,6 +444,39 @@ mod linux {
                 height,
                 buffer,
             })
+        }
+    }
+
+    impl Drop for WaylandPlane {
+        fn drop(&mut self) {
+            if self.child.is_alive() {
+                self.child.attach(None, 0, 0);
+                self.child.set_opaque_region(None);
+            }
+            if let Some(color_surface) = self.color_surface.take() {
+                color_surface.destroy();
+            }
+            for description in self.descriptions.drain(..) {
+                description.destroy();
+            }
+            self.viewport.destroy();
+            self.subsurface.destroy();
+            self.child.destroy();
+            for (_, buffer) in self.buffers.drain() {
+                buffer.buffer.destroy();
+            }
+            self.dmabuf.destroy();
+            let _ = self.connection.flush();
+        }
+    }
+
+    fn opaque_drm_fourcc(fourcc: u32) -> u32 {
+        match fourcc {
+            0x30335241 => 0x30335258, // AR30 -> XR30
+            0x30334241 => 0x30334258, // AB30 -> XB30
+            0x34325241 => 0x34325258, // AR24 -> XR24
+            0x34324241 => 0x34324258, // AB24 -> XB24
+            other => other,
         }
     }
 
@@ -419,6 +534,7 @@ mod linux {
 
     ignore_events!(
         WlCompositor,
+        WlRegion,
         WlSubcompositor,
         WlSurface,
         WlSubsurface,
