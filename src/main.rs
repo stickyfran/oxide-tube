@@ -6757,9 +6757,11 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
             }
 
             Message::OpenBrowserLogin => {
-                open_external_url("https://accounts.google.com/ServiceLogin?service=youtube&continue=https%3A%2F%2Fwww.youtube.com%2Fsignin%3Faction_handle_signin%3Dtrue");
-                self.auth_status = "Navegador abierto. Inicia sesión en YouTube y luego pulsa 'Sincronizar sesión de Navegador'.".to_string();
-                Task::none()
+                self.auth_status = "Abriendo ventana de inicio de sesión de Google... Iniciá sesión para sincronizar automáticamente.".to_string();
+                Task::perform(
+                    AuthSession::interactive_browser_login(),
+                    Message::FirefoxCookiesImported,
+                )
             }
 
             Message::SyncBrowserSession => {
@@ -6835,7 +6837,10 @@ fn apply_squircle_mask(rgba: &mut image_crate::RgbaImage, radius: u32) {
                 self.open_settings_modal(self.selected_settings_tab)
             }
 
-            Message::OpenLogin => self.open_settings_modal(ui::SettingsCategory::Account),
+            Message::OpenLogin => {
+                self.show_account_switcher = false;
+                self.update(Message::OpenBrowserLogin)
+            }
 
             Message::CloseSettings => {
                 self.show_auth_modal = false;

@@ -733,6 +733,545 @@ impl AuthSession {
 
         false
     }
+
+    /// Launches a clean browser window (Chromium-based or Firefox-based) at Google's
+    /// YouTube sign-in page, automatically captures the authenticated cookies once
+    /// sign-in completes, closes the temporary window, and cleans up the temp profile.
+    pub async fn interactive_browser_login() -> Result<Self, String> {
+        const LOGIN_URL: &str = "https://accounts.google.com/ServiceLogin?service=youtube&continue=https%3A%2F%2Fwww.youtube.com%2Fsignin%3Faction_handle_signin%3Dtrue";
+
+        let browser = detect_login_browser().ok_or_else(|| {
+            "No se encontró un navegador compatible (Chrome, Chromium, Edge, Brave o Firefox) instalado.".to_string()
+        })?;
+
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let temp_profile = std::env::temp_dir().join(format!(
+            "tube_oxide_login_{}_{}",
+            std::process::id(),
+            ts
+        ));
+        fs::create_dir_all(&temp_profile)
+            .map_err(|e| format!("No se pudo crear el perfil temporal de login: {e}"))?;
+
+        struct TempDirGuard(PathBuf);
+        impl Drop for TempDirGuard {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let _guard = TempDirGuard(temp_profile.clone());
+
+        match browser {
+            LoginBrowser::Chromium(bin) => {
+                login_via_chromium(&bin, &temp_profile, LOGIN_URL).await
+            }
+            LoginBrowser::Firefox(bin) => {
+                login_via_firefox(&bin, &temp_profile, LOGIN_URL).await
+            }
+        }
+    }
+}
+
+enum LoginBrowser {
+    Chromium(PathBuf),
+    Firefox(PathBuf),
+}
+
+#[cfg(unix)]
+fn find_in_path(cmd: &str) -> Option<PathBuf> {
+    let path_var = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path_var) {
+        let candidate = dir.join(cmd);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn detect_login_browser() -> Option<LoginBrowser> {
+    #[cfg(target_os = "linux")]
+    {
+        // 1. Respect system default browser when possible
+        if let Ok(output) = std::process::Command::new("xdg-settings")
+            .args(["get", "default-web-browser"])
+            .output()
+        {
+            if output.status.success() {
+                let desktop = String::from_utf8_lossy(&output.stdout).trim().to_lowercase();
+                if desktop.contains("firefox") {
+                    if let Some(p) = find_in_path("firefox").or_else(|| find_in_path("firefox-esr")) {
+                        return Some(LoginBrowser::Firefox(p));
+                    }
+                } else if desktop.contains("librewolf") {
+                    if let Some(p) = find_in_path("librewolf") {
+                        return Some(LoginBrowser::Firefox(p));
+                    }
+                } else if desktop.contains("zen") {
+                    if let Some(p) = find_in_path("zen-browser").or_else(|| find_in_path("zen")) {
+                        return Some(LoginBrowser::Firefox(p));
+                    }
+                } else if desktop.contains("chrome") {
+                    if let Some(p) = find_in_path("google-chrome").or_else(|| find_in_path("google-chrome-stable")) {
+                        return Some(LoginBrowser::Chromium(p));
+                    }
+                } else if desktop.contains("chromium") {
+                    if let Some(p) = find_in_path("chromium").or_else(|| find_in_path("chromium-browser")) {
+                        return Some(LoginBrowser::Chromium(p));
+                    }
+                } else if desktop.contains("brave") {
+                    if let Some(p) = find_in_path("brave-browser").or_else(|| find_in_path("brave")) {
+                        return Some(LoginBrowser::Chromium(p));
+                    }
+                } else if desktop.contains("edge") {
+                    if let Some(p) = find_in_path("microsoft-edge").or_else(|| find_in_path("microsoft-edge-stable")) {
+                        return Some(LoginBrowser::Chromium(p));
+                    }
+                } else if desktop.contains("vivaldi") {
+                    if let Some(p) = find_in_path("vivaldi").or_else(|| find_in_path("vivaldi-stable")) {
+                        return Some(LoginBrowser::Chromium(p));
+                    }
+                }
+            }
+        }
+
+        // 2. Fallback: probe common installed browsers
+        for bin in [
+            "google-chrome",
+            "google-chrome-stable",
+            "chromium",
+            "chromium-browser",
+            "brave-browser",
+            "brave",
+            "microsoft-edge",
+            "microsoft-edge-stable",
+            "vivaldi",
+            "vivaldi-stable",
+        ] {
+            if let Some(p) = find_in_path(bin) {
+                return Some(LoginBrowser::Chromium(p));
+            }
+        }
+        for bin in ["firefox", "firefox-esr", "librewolf", "zen-browser", "zen"] {
+            if let Some(p) = find_in_path(bin) {
+                return Some(LoginBrowser::Firefox(p));
+            }
+        }
+        None
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let pf = std::env::var("ProgramFiles").unwrap_or_else(|_| r"C:\Program Files".to_string());
+        let pf86 = std::env::var("ProgramFiles(x86)").unwrap_or_else(|_| r"C:\Program Files (x86)".to_string());
+        let local = std::env::var("LOCALAPPDATA").unwrap_or_default();
+
+        let chromium_candidates = [
+            PathBuf::from(&pf).join(r"Google\Chrome\Application\chrome.exe"),
+            PathBuf::from(&pf86).join(r"Google\Chrome\Application\chrome.exe"),
+            PathBuf::from(&local).join(r"Google\Chrome\Application\chrome.exe"),
+            PathBuf::from(&pf86).join(r"Microsoft\Edge\Application\msedge.exe"),
+            PathBuf::from(&pf).join(r"Microsoft\Edge\Application\msedge.exe"),
+            PathBuf::from(&pf).join(r"BraveSoftware\Brave-Browser\Application\brave.exe"),
+            PathBuf::from(&local).join(r"BraveSoftware\Brave-Browser\Application\brave.exe"),
+        ];
+        let firefox_candidates = [
+            PathBuf::from(&pf).join(r"Mozilla Firefox\firefox.exe"),
+            PathBuf::from(&pf86).join(r"Mozilla Firefox\firefox.exe"),
+            PathBuf::from(&pf).join(r"LibreWolf\librewolf.exe"),
+        ];
+
+        // Check default browser ProgId first
+        if let Ok(output) = std::process::Command::new("reg")
+            .args([
+                "query",
+                r"HKCU\Software\Microsoft\Windows\Shell\Associations\UrlAssociations\https\UserChoice",
+                "/v",
+                "ProgId",
+            ])
+            .output()
+        {
+            if output.status.success() {
+                let out = String::from_utf8_lossy(&output.stdout).to_lowercase();
+                if out.contains("firefox") || out.contains("librewolf") {
+                    if let Some(p) = firefox_candidates.iter().find(|p| p.is_file()) {
+                        return Some(LoginBrowser::Firefox(p.clone()));
+                    }
+                }
+            }
+        }
+
+        if let Some(p) = chromium_candidates.iter().find(|p| p.is_file()) {
+            return Some(LoginBrowser::Chromium(p.clone()));
+        }
+        if let Some(p) = firefox_candidates.iter().find(|p| p.is_file()) {
+            return Some(LoginBrowser::Firefox(p.clone()));
+        }
+        None
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    {
+        None
+    }
+}
+
+async fn login_via_chromium(
+    bin: &Path,
+    temp_profile: &Path,
+    login_url: &str,
+) -> Result<AuthSession, String> {
+    let port = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")
+            .map_err(|e| format!("No se pudo reservar un puerto local para CDP: {e}"))?;
+        listener
+            .local_addr()
+            .map_err(|e| format!("Error al obtener puerto local: {e}"))?
+            .port()
+    };
+
+    let mut child = std::process::Command::new(bin)
+        .arg(format!("--app={login_url}"))
+        .arg(format!("--user-data-dir={}", temp_profile.to_string_lossy()))
+        .arg(format!("--remote-debugging-port={port}"))
+        .arg("--no-first-run")
+        .arg("--no-default-browser-check")
+        .arg("--window-size=520,720")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("No se pudo abrir el navegador ({}): {e}", bin.display()))?;
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(3))
+        .build()
+        .unwrap_or_default();
+    let version_url = format!("http://127.0.0.1:{port}/json/version");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+    let mut result: Option<AuthSession> = None;
+
+    while std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(900)).await;
+
+        if let Ok(Some(_)) = child.try_wait() {
+            return Err("Inicio de sesión cancelado (se cerró la ventana del navegador).".to_string());
+        }
+
+        let ws_url = match client.get(&version_url).send().await {
+            Ok(resp) if resp.status().is_success() => resp
+                .json::<serde_json::Value>()
+                .await
+                .ok()
+                .and_then(|v| v.get("webSocketDebuggerUrl").and_then(|u| u.as_str()).map(String::from)),
+            _ => None,
+        };
+
+        if let Some(ws_url) = ws_url {
+            if let Ok((session, has_yt_auth)) = cdp_fetch_youtube_session(&ws_url).await {
+                if has_yt_auth && session.is_authenticated() {
+                    // Brief pause + final read so all YouTube cookies finish settling
+                    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+                    let final_session = cdp_fetch_youtube_session(&ws_url)
+                        .await
+                        .ok()
+                        .map(|(s, _)| s)
+                        .filter(|s| s.is_authenticated())
+                        .unwrap_or(session);
+                    result = Some(final_session);
+                    break;
+                }
+            }
+        }
+    }
+
+    let _ = child.kill();
+    let _ = child.wait();
+
+    if let Some(session) = result {
+        let _ = session.save_to_disk();
+        Ok(session)
+    } else {
+        Err("Tiempo de espera agotado para iniciar sesión en Google.".to_string())
+    }
+}
+
+/// Minimal localhost RFC 6455 WebSocket client to call CDP `Storage.getCookies`.
+async fn cdp_fetch_youtube_session(ws_url: &str) -> Result<(AuthSession, bool), String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let parsed = url::Url::parse(ws_url).map_err(|e| e.to_string())?;
+    let host = parsed.host_str().unwrap_or("127.0.0.1");
+    let port = parsed.port().ok_or("Missing CDP port")?;
+    let path = parsed.path();
+
+    let mut stream = tokio::net::TcpStream::connect((host, port))
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let handshake = format!(
+        "GET {path} HTTP/1.1\r\n\
+         Host: {host}:{port}\r\n\
+         Upgrade: websocket\r\n\
+         Connection: Upgrade\r\n\
+         Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+         Sec-WebSocket-Version: 13\r\n\r\n"
+    );
+    stream
+        .write_all(handshake.as_bytes())
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // Read HTTP 101 response headers
+    let mut header_buf = Vec::with_capacity(512);
+    let mut byte = [0u8; 1];
+    while !header_buf.ends_with(b"\r\n\r\n") {
+        stream.read_exact(&mut byte).await.map_err(|e| e.to_string())?;
+        header_buf.push(byte[0]);
+        if header_buf.len() > 8192 {
+            return Err("CDP handshake header too large".to_string());
+        }
+    }
+    let header_str = String::from_utf8_lossy(&header_buf);
+    if !header_str.contains("101") {
+        return Err(format!("CDP WebSocket upgrade failed: {header_str}"));
+    }
+
+    // Send masked text frame: {"id":1,"method":"Storage.getCookies"}
+    let payload = br#"{"id":1,"method":"Storage.getCookies"}"#;
+    let mask = [0x12u8, 0x34, 0x56, 0x78];
+    let mut frame = Vec::with_capacity(6 + payload.len());
+    frame.push(0x81); // FIN + text opcode
+    frame.push(0x80 | (payload.len() as u8)); // MASK bit + len (<126)
+    frame.extend_from_slice(&mask);
+    for (i, b) in payload.iter().enumerate() {
+        frame.push(b ^ mask[i % 4]);
+    }
+    stream.write_all(&frame).await.map_err(|e| e.to_string())?;
+
+    // Read response frame(s) until we get id == 1
+    let mut full_msg = Vec::new();
+    for _ in 0..8 {
+        let mut hdr = [0u8; 2];
+        stream.read_exact(&mut hdr).await.map_err(|e| e.to_string())?;
+        let fin = (hdr[0] & 0x80) != 0;
+        let opcode = hdr[0] & 0x0F;
+        let masked = (hdr[1] & 0x80) != 0;
+        let len_code = hdr[1] & 0x7F;
+
+        let payload_len: usize = if len_code < 126 {
+            len_code as usize
+        } else if len_code == 126 {
+            let mut ext = [0u8; 2];
+            stream.read_exact(&mut ext).await.map_err(|e| e.to_string())?;
+            u16::from_be_bytes(ext) as usize
+        } else {
+            let mut ext = [0u8; 8];
+            stream.read_exact(&mut ext).await.map_err(|e| e.to_string())?;
+            u64::from_be_bytes(ext) as usize
+        };
+
+        let mut mask_key = [0u8; 4];
+        if masked {
+            stream
+                .read_exact(&mut mask_key)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+
+        let mut data = vec![0u8; payload_len];
+        stream.read_exact(&mut data).await.map_err(|e| e.to_string())?;
+        if masked {
+            for (i, b) in data.iter_mut().enumerate() {
+                *b ^= mask_key[i % 4];
+            }
+        }
+
+        if opcode == 0x08 {
+            break;
+        }
+        if opcode == 0x01 || opcode == 0x00 {
+            full_msg.extend_from_slice(&data);
+            if fin {
+                if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&full_msg) {
+                    if val.get("id").and_then(|v| v.as_u64()) == Some(1) {
+                        let mut google = Vec::new();
+                        let mut youtube = Vec::new();
+                        let mut has_yt_auth = false;
+
+                        if let Some(cookies) = val
+                            .get("result")
+                            .and_then(|r| r.get("cookies"))
+                            .and_then(|c| c.as_array())
+                        {
+                            for c in cookies {
+                                let domain = c.get("domain").and_then(|v| v.as_str()).unwrap_or("");
+                                let name = c.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                                let value = c.get("value").and_then(|v| v.as_str()).unwrap_or("");
+                                if domain.contains("youtube.com") {
+                                    if name == "SAPISID" || name == "__Secure-3PAPISID" {
+                                        has_yt_auth = true;
+                                    }
+                                    youtube.push((name.to_string(), value.to_string()));
+                                } else if domain.contains("google.com") {
+                                    google.push((name.to_string(), value.to_string()));
+                                }
+                            }
+                        }
+
+                        let mut session = AuthSession::new();
+                        for (n, v) in google {
+                            session.set_cookie(&n, &v);
+                        }
+                        for (n, v) in youtube {
+                            session.set_cookie(&n, &v);
+                        }
+                        return Ok((session, has_yt_auth));
+                    }
+                }
+                full_msg.clear();
+            }
+        }
+    }
+
+    Err("No CDP cookie response received".to_string())
+}
+
+async fn login_via_firefox(
+    bin: &Path,
+    temp_profile: &Path,
+    login_url: &str,
+) -> Result<AuthSession, String> {
+    let mut child = std::process::Command::new(bin)
+        .arg("--no-remote")
+        .arg("--profile")
+        .arg(temp_profile)
+        .arg("--new-window")
+        .arg(login_url)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("No se pudo abrir Firefox ({}): {e}", bin.display()))?;
+
+    let cookies_db = temp_profile.join("cookies.sqlite");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+    let mut result: Option<AuthSession> = None;
+
+    while std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+
+        if let Ok(Some(_)) = child.try_wait() {
+            return Err("Inicio de sesión cancelado (se cerró la ventana de Firefox).".to_string());
+        }
+
+        if cookies_db.is_file() {
+            let db_clone = cookies_db.clone();
+            if let Ok(Ok((session, has_yt_auth))) =
+                tokio::task::spawn_blocking(move || read_firefox_temp_cookies(&db_clone)).await
+            {
+                if has_yt_auth && session.is_authenticated() {
+                    // Brief pause + final read so Firefox flushes all cookies
+                    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                    let db_clone2 = cookies_db.clone();
+                    let final_session =
+                        tokio::task::spawn_blocking(move || read_firefox_temp_cookies(&db_clone2))
+                            .await
+                            .ok()
+                            .and_then(|r| r.ok())
+                            .map(|(s, _)| s)
+                            .filter(|s| s.is_authenticated())
+                            .unwrap_or(session);
+                    result = Some(final_session);
+                    break;
+                }
+            }
+        }
+    }
+
+    let _ = child.kill();
+    let _ = child.wait();
+
+    if let Some(session) = result {
+        let _ = session.save_to_disk();
+        Ok(session)
+    } else {
+        Err("Tiempo de espera agotado para iniciar sesión en Google.".to_string())
+    }
+}
+
+fn read_firefox_temp_cookies(db_path: &Path) -> Result<(AuthSession, bool), String> {
+    let snap_dir = std::env::temp_dir().join(format!(
+        "tube_oxide_ff_snap_{}_{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    fs::create_dir_all(&snap_dir).map_err(|e| e.to_string())?;
+    let snap_db = snap_dir.join("cookies.sqlite");
+    fs::copy(db_path, &snap_db).map_err(|e| e.to_string())?;
+
+    let wal = PathBuf::from(format!("{}-wal", db_path.to_string_lossy()));
+    let shm = PathBuf::from(format!("{}-shm", db_path.to_string_lossy()));
+    if wal.exists() {
+        let _ = fs::copy(&wal, snap_dir.join("cookies.sqlite-wal"));
+    }
+    if shm.exists() {
+        let _ = fs::copy(&shm, snap_dir.join("cookies.sqlite-shm"));
+    }
+
+    let conn = Connection::open_with_flags(&snap_db, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|e| e.to_string())?;
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT host, name, value FROM moz_cookies \
+             WHERE host LIKE '%youtube.com%' OR host LIKE '%google.com%'",
+        )
+        .map_err(|e| e.to_string())?;
+
+    let mut google = Vec::new();
+    let mut youtube = Vec::new();
+    let mut has_yt_auth = false;
+
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(|e| e.to_string())?;
+
+    for row in rows.flatten() {
+        let (host, name, value) = row;
+        if host.contains("youtube.com") {
+            if name == "SAPISID" || name == "__Secure-3PAPISID" {
+                has_yt_auth = true;
+            }
+            youtube.push((name, value));
+        } else if host.contains("google.com") {
+            google.push((name, value));
+        }
+    }
+
+    drop(stmt);
+    drop(conn);
+    let _ = fs::remove_dir_all(&snap_dir);
+
+    let mut session = AuthSession::new();
+    for (n, v) in google {
+        session.set_cookie(&n, &v);
+    }
+    for (n, v) in youtube {
+        session.set_cookie(&n, &v);
+    }
+    Ok((session, has_yt_auth))
 }
 
 #[cfg(test)]
